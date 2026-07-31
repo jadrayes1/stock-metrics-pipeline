@@ -13,6 +13,17 @@
 #      get a limited monthly allowance, which a daily multi-hour job would
 #      blow through fast.
 #
+# Failure monitoring: on failure, opens (or comments on, if one's already
+# open) a `pipeline-failure`-labeled issue in this repo — auto-closed the
+# next time the job succeeds. GitHub can also email on scheduled-workflow
+# failure, but that requires Actions notifications to be enabled under
+# github.com/settings/notifications and is easy to miss as a one-off email;
+# an open issue is a persistent, visible signal either way. Note neither of
+# these catches the job never running at all (e.g. GitHub auto-disables
+# schedules after 60 days with zero repo activity, though the daily commit
+# from this workflow itself should prevent that) — an external heartbeat
+# service (e.g. healthchecks.io) would be needed to catch that specific case.
+#
 # One-time setup required (this workflow can't do these for you):
 #   1. Add a repository secret named FINNHUB_API_KEY with your Finnhub key.
 #   2. Add a repository secret named GIST_ID (the target Gist's ID).
@@ -30,6 +41,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   generate:
@@ -53,3 +65,60 @@ jobs:
         run: |
           gh gist edit "${{ secrets.GIST_ID }}" --filename marketMetrics.json src/data/marketMetrics.json || \
           gh gist edit "${{ secrets.GIST_ID }}" --add src/data/marketMetrics.json
+
+      - name: Report failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = 'pipeline-failure';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: label,
+            });
+            if (open.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: open[0].number,
+                body: `Failed again: ${runUrl}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'Sector-metrics pipeline failed',
+                body: `The daily generation run failed.\n\nRun: ${runUrl}\n\nCheck the FINNHUB_API_KEY, GIST_TOKEN, and GIST_ID secrets, and Finnhub's API status.`,
+                labels: [label],
+              });
+            }
+
+      - name: Close failure issue on success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = 'pipeline-failure';
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: label,
+            });
+            for (const issue of open) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: 'Pipeline succeeded again — closing.',
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+              });
+            }
