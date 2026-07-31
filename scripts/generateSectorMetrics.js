@@ -149,27 +149,52 @@ function percentileRank(value, population) {
   return ((below + 0.5 * tied) / valid.length) * 100;
 }
 
-// Mirrors findLowRevenuePeriods in src/utils/metrics.js — keep the
-// threshold in sync. There it's used to flag a single chart quarter; here
-// it's used to exclude a candidate from Industry Leaders entirely if its
-// MOST RECENT quarter is one of these, since profitMargin/fcfMargin (which
-// feed directly into the composite score below) would be unreliable for it
-// right now. Verified live on SPRO (Spero Therapeutics): revenue collapsed
-// to $0.0045/share from ~$0.60 the prior quarter, producing a -2792% net
-// margin and +6149% FCF margin for that one quarter alone — a real
-// calculation, not a meaningful one, and SPRO was winning Biotechnology on
-// the strength of a TTM figure partly built on it.
-const LOW_REVENUE_RATIO_THRESHOLD = 0.2;
+// A metric only counts toward MIN_TOP_METRICS if the ticker's last 3
+// consecutive quarters for it were all positive — its VALUE still counts
+// fully in the composite average either way (see computeIndustryLeaders),
+// this only gates whether it can count as one of the "top" metrics. Verified
+// live why this matters: SPRO (Spero Therapeutics) had a strong TTM
+// profitMargin (24.9%) built on quarters that were mostly negative
+// (-0.12, -1.36, +0.76, -27.92 — that last one from revenue collapsing to
+// $0.0045/share from ~$0.60), so it doesn't reflect 3 consecutive quarters
+// of real, positive performance despite the good-looking trailing number.
+const CONSECUTIVE_QUARTERS_REQUIRED = 3;
 
-function hasRecentRevenueAnomaly(salesPerShareEntries) {
-  const entries = salesPerShareEntries || [];
-  const values = entries.map((e) => e?.v).filter((v) => v != null && v > 0);
-  if (values.length < 4) return false; // not enough history to judge "normal" for this ticker
+// profitMargin/fcfMargin/roic/peRatio/pfcfRatio all have a direct quarterly
+// series field (see QUARTERLY_FIELD_MAP in src/utils/metrics.js) — checks
+// whether its 3 most recent entries are all positive.
+function hasPositiveTrend(quarterlyEntries) {
+  const entries = (quarterlyEntries || []).slice(0, CONSECUTIVE_QUARTERS_REQUIRED);
+  if (entries.length < CONSECUTIVE_QUARTERS_REQUIRED) return false;
+  return entries.every((e) => e?.v != null && e.v > 0);
+}
 
-  const sorted = [...values].sort((a, b) => a - b);
-  const median = sorted[Math.floor(sorted.length / 2)];
-  const mostRecent = entries[0]; // Finnhub returns most-recent-first
-  return mostRecent?.v != null && mostRecent.v < median * LOW_REVENUE_RATIO_THRESHOLD;
+// revenueGrowth has no direct quarterly field — derived from salesPerShare
+// vs. the same quarter a year earlier, same as extractQuarterlyMetricSeries
+// in src/utils/metrics.js, just checking the 3 most recent points are
+// positive instead of building the full chart series.
+function hasPositiveRevenueGrowthTrend(salesPerShareEntries) {
+  const sales = salesPerShareEntries || [];
+  const growthPoints = [];
+  for (let i = 0; i < sales.length - 4 && growthPoints.length < CONSECUTIVE_QUARTERS_REQUIRED; i++) {
+    const thisQuarter = sales[i];
+    const yearAgo = sales[i + 4];
+    growthPoints.push(thisQuarter?.v != null && yearAgo?.v ? (thisQuarter.v - yearAgo.v) / yearAgo.v : null);
+  }
+  if (growthPoints.length < CONSECUTIVE_QUARTERS_REQUIRED) return false;
+  return growthPoints.every((v) => v != null && v > 0);
+}
+
+// Mirrors QUARTERLY_FIELD_MAP in src/utils/metrics.js.
+function computeTrendQualification(quarterly) {
+  return {
+    roic: hasPositiveTrend(quarterly.roicTTM),
+    revenueGrowth: hasPositiveRevenueGrowthTrend(quarterly.salesPerShare),
+    profitMargin: hasPositiveTrend(quarterly.netMargin),
+    fcfMargin: hasPositiveTrend(quarterly.fcfMargin),
+    peRatio: hasPositiveTrend(quarterly.peTTM),
+    pfcfRatio: hasPositiveTrend(quarterly.pfcfTTM),
+  };
 }
 
 // A ticker reporting for less than ~2 years isn't excluded outright (a
@@ -195,15 +220,17 @@ function historyWeight(historyQuarters) {
  *     MIN_TOP_METRICS of those 6, direction-normalized ("goodness" — a low
  *     P/E percentile-ranks as high goodness, same as percentileTone) — not
  *     just a good average across the board, but genuinely excellent in
- *     nearly everything.
- *  3. No recent-quarter revenue anomaly (see hasRecentRevenueAnomaly) — a
- *     candidate whose latest quarter's revenue collapsed relative to its
- *     own history is excluded even if its TTM composite looks fine, since
- *     that TTM figure is partly built on a distorted quarter.
+ *     nearly everything. A metric only counts toward this if it also has
+ *     3 consecutive positive quarters (see computeTrendQualification) — its
+ *     value still counts fully in the composite average regardless, this
+ *     only gates whether it can count as one of the "top" ones. Nothing is
+ *     excluded outright for this; a candidate can still win on its other
+ *     metrics if one is disqualified from counting as "top."
  * Among qualifying candidates, the winner is the highest composite score
- * (the same goodness-averaged score as before), weighted down slightly for
- * thin reporting history (see historyWeight). An industry with no
- * qualifying candidate at all gets no leader, rather than forcing a pick.
+ * (the goodness-averaged score across all 6, unaffected by rule 2's gating),
+ * weighted down slightly for thin reporting history (see historyWeight). An
+ * industry with no qualifying candidate at all gets no leader, rather than
+ * forcing a pick.
  */
 function computeIndustryLeaders(metrics, profiles) {
   const byIndustry = {};
@@ -221,22 +248,19 @@ function computeIndustryLeaders(metrics, profiles) {
       populations[key] = symbols.map((s) => metrics[s][key]);
     }
 
-    const eligible = symbols.filter(
-      (s) =>
-        COMPARABLE_KEYS.every((k) => metrics[s][k] !== null && metrics[s][k] !== undefined) &&
-        !profiles[s]?.hasRecentRevenueAnomaly
-    );
+    const eligible = symbols.filter((s) => COMPARABLE_KEYS.every((k) => metrics[s][k] !== null && metrics[s][k] !== undefined));
 
     let best = null;
     for (const symbol of eligible) {
       const data = metrics[symbol];
+      const trendQualified = profiles[symbol]?.trendQualified || {};
       const goodnessScores = [];
       let topMetricCount = 0;
       for (const key of COMPARABLE_KEYS) {
         const pct = percentileRank(data[key], populations[key]);
         const goodness = LOWER_IS_BETTER.has(key) ? 100 - pct : pct;
-        goodnessScores.push(goodness);
-        if (goodness >= TOP_METRIC_PERCENTILE) topMetricCount++;
+        goodnessScores.push(goodness); // counts toward the composite regardless of the trend check below
+        if (goodness >= TOP_METRIC_PERCENTILE && trendQualified[key]) topMetricCount++;
       }
       if (topMetricCount < MIN_TOP_METRICS) continue;
 
@@ -287,7 +311,7 @@ async function main() {
       profiles[symbol] = {
         ...profile,
         historyQuarters: (quarterly.netMargin || []).length,
-        hasRecentRevenueAnomaly: hasRecentRevenueAnomaly(quarterly.salesPerShare),
+        trendQualified: computeTrendQualification(quarterly),
       };
       metrics[symbol] = { industry: profile.industry, ...extractMetricValues(current, quarterly) };
       ok++;
