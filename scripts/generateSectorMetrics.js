@@ -1,11 +1,18 @@
 // scripts/generateSectorMetrics.js
 //
-// Offline data-generation step for the sector-percentile feature. Fetches
-// fundamentals + industry classification for every NASDAQ/NYSE/NYSE American
-// common stock and REIT from Finnhub, and writes the result to
-// src/data/marketMetrics.json, which the app reads directly at runtime — no
-// live Finnhub calls, no waiting, no rate-limit exposure for the person
-// using the app.
+// Offline data-generation step for the sector-percentile and Industry
+// Leaders features. Fetches fundamentals + industry classification for
+// every NASDAQ/NYSE/NYSE American common stock and REIT from Finnhub, and
+// writes the result to src/data/marketMetrics.json, which the app reads
+// directly at runtime — no live Finnhub calls, no waiting, no rate-limit
+// exposure for the person using the app.
+//
+// Also computes `industryLeaders`: the single top-composite-score ticker in
+// each industry with at least MIN_INDUSTRY_PEERS peers (see
+// computeIndustryLeaders below) — precomputed here rather than on-device so
+// the Home screen's carousel is just reading a small pre-baked list, same
+// "compute once daily, app just reads" philosophy as everything else this
+// pipeline produces.
 //
 // Universe: Finnhub's full US symbol list (`/stock/symbol?exchange=US`),
 // filtered to primary listings on NASDAQ/NYSE/NYSE American (mic codes
@@ -96,11 +103,77 @@ async function fetchMetricsFor(symbol, apiKey) {
   return { current: data?.metric || {}, quarterly: data?.series?.quarterly || {} };
 }
 
-async function fetchIndustryFor(symbol, apiKey) {
+async function fetchProfileFor(symbol, apiKey) {
   const res = await fetch(`https://finnhub.io/api/v1/stock/profile2?symbol=${symbol}&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
-  return data?.finnhubIndustry || null;
+  return { industry: data?.finnhubIndustry || null, name: data?.name || null, logo: data?.logo || null };
+}
+
+const COMPARABLE_KEYS = ['roic', 'revenueGrowth', 'profitMargin', 'fcfMargin', 'peRatio', 'pfcfRatio'];
+const LOWER_IS_BETTER = new Set(['peRatio', 'pfcfRatio']); // mirrors METRIC_DEFS.betterWhen in src/utils/metrics.js
+const MIN_INDUSTRY_PEERS = 100; // narrower industries are excluded — a "top pick" out of a handful of peers isn't statistically meaningful
+
+// Mirrors the percentile-rank + goodness logic in src/utils/metrics.js
+// (percentileRank, percentileTone) — keep in sync if that ever changes.
+function percentileRank(value, population) {
+  const valid = population.filter((v) => v !== null && v !== undefined && !Number.isNaN(v));
+  if (value === null || value === undefined || Number.isNaN(value) || valid.length === 0) return null;
+  const below = valid.filter((v) => v < value).length;
+  const tied = valid.filter((v) => v === value).length;
+  return ((below + 0.5 * tied) / valid.length) * 100;
+}
+
+/**
+ * One "leader" per industry (>= MIN_INDUSTRY_PEERS peers only): the ticker
+ * with the highest composite score, where each of the 6 comparable metrics
+ * is percentile-ranked within the industry, direction-normalized ("goodness"
+ * — a low P/E percentile-ranks as high goodness, same as percentileTone),
+ * then averaged. A ticker missing some metrics is scored on whichever it has.
+ */
+function computeIndustryLeaders(metrics, profiles) {
+  const byIndustry = {};
+  for (const [symbol, data] of Object.entries(metrics)) {
+    if (!data.industry) continue;
+    (byIndustry[data.industry] ||= []).push(symbol);
+  }
+
+  const leaders = [];
+  for (const [industry, symbols] of Object.entries(byIndustry)) {
+    if (symbols.length < MIN_INDUSTRY_PEERS) continue;
+
+    const populations = {};
+    for (const key of COMPARABLE_KEYS) {
+      populations[key] = symbols.map((s) => metrics[s][key]);
+    }
+
+    let best = null;
+    for (const symbol of symbols) {
+      const data = metrics[symbol];
+      const goodnessScores = [];
+      for (const key of COMPARABLE_KEYS) {
+        const pct = percentileRank(data[key], populations[key]);
+        if (pct === null) continue;
+        goodnessScores.push(LOWER_IS_BETTER.has(key) ? 100 - pct : pct);
+      }
+      if (goodnessScores.length === 0) continue;
+      const composite = goodnessScores.reduce((a, b) => a + b, 0) / goodnessScores.length;
+      if (!best || composite > best.composite) best = { symbol, composite };
+    }
+
+    if (best) {
+      leaders.push({
+        symbol: best.symbol,
+        name: profiles[best.symbol]?.name || best.symbol,
+        logo: profiles[best.symbol]?.logo || null,
+        industry,
+        composite: best.composite,
+        peerCount: symbols.length,
+      });
+    }
+  }
+
+  return leaders.sort((a, b) => b.peerCount - a.peerCount);
 }
 
 async function main() {
@@ -113,16 +186,18 @@ async function main() {
   );
 
   const metrics = {};
+  const profiles = {}; // name/logo, kept out of `metrics` to avoid bloating that map — only industryLeaders needs them
   let ok = 0;
   let failed = 0;
 
   for (let i = 0; i < symbols.length; i++) {
     const symbol = symbols[i];
     try {
-      const industry = await fetchIndustryFor(symbol, apiKey);
+      const profile = await fetchProfileFor(symbol, apiKey);
+      profiles[symbol] = profile;
       await sleep(REQUEST_SPACING_MS);
       const { current, quarterly } = await fetchMetricsFor(symbol, apiKey);
-      metrics[symbol] = { industry, ...extractMetricValues(current, quarterly) };
+      metrics[symbol] = { industry: profile.industry, ...extractMetricValues(current, quarterly) };
       ok++;
     } catch (err) {
       failed++;
@@ -136,10 +211,13 @@ async function main() {
     if (i < symbols.length - 1) await sleep(REQUEST_SPACING_MS);
   }
 
-  const output = { generatedAt: new Date().toISOString(), metrics };
+  const industryLeaders = computeIndustryLeaders(metrics, profiles);
+  console.log(`\nComputed ${industryLeaders.length} industry leaders (industries with >= ${MIN_INDUSTRY_PEERS} peers).`);
+
+  const output = { generatedAt: new Date().toISOString(), metrics, industryLeaders };
   fs.mkdirSync(path.dirname(OUTPUT_FILE), { recursive: true }); // works regardless of which repo this script runs in
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(output, null, 2));
-  console.log(`\nWrote ${ok} tickers to ${path.relative(process.cwd(), OUTPUT_FILE)} (${failed} skipped).`);
+  console.log(`Wrote ${ok} tickers to ${path.relative(process.cwd(), OUTPUT_FILE)} (${failed} skipped).`);
 }
 
 main().catch((err) => {
