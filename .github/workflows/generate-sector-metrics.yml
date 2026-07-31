@@ -1,0 +1,55 @@
+# Daily fetch of industry classification + fundamentals for every
+# NASDAQ/NYSE/NYSE American common stock and REIT (~5,145 tickers), published
+# to a public Gist that the stock-analyzer app reads at runtime — see that
+# app's src/api/sectorComparison.js.
+#
+# This lives in its OWN public repo, separate from the app's (private) repo,
+# for two reasons:
+#   1. A Gist's visibility doesn't depend on the repo that updates it, so
+#      the app's source can stay private while this feed stays public.
+#   2. This job takes ~2-3 hours (two Finnhub calls per ticker, rate-limited
+#      to stay under the free-tier 60/min cap). Public repos get unlimited
+#      free GitHub Actions minutes on standard runners; private repos only
+#      get a limited monthly allowance, which a daily multi-hour job would
+#      blow through fast.
+#
+# One-time setup required (this workflow can't do these for you):
+#   1. Add a repository secret named FINNHUB_API_KEY with your Finnhub key.
+#   2. Add a repository secret named GIST_ID (the target Gist's ID).
+#   3. Add a repository secret named GIST_TOKEN — a Personal Access Token
+#      scoped to ONLY "gist", CLASSIC type (not fine-grained — fine-grained
+#      tokens' Gists permission can end up read-only, which fails silently
+#      as an HTTP 404 on the write, not a clear permission error).
+
+name: Generate sector metrics
+
+on:
+  schedule:
+    - cron: '0 6 * * *' # ~01:00 US Eastern — starts early enough that a ~3hr run finishes well before market open
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Generate dataset
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+        run: node scripts/generateSectorMetrics.js
+
+      - name: Publish to gist
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          gh gist edit "${{ secrets.GIST_ID }}" --filename marketMetrics.json src/data/marketMetrics.json || \
+          gh gist edit "${{ secrets.GIST_ID }}" --add src/data/marketMetrics.json
