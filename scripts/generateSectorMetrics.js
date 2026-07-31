@@ -7,12 +7,16 @@
 // directly at runtime — no live Finnhub calls, no waiting, no rate-limit
 // exposure for the person using the app.
 //
-// Also computes `industryLeaders`: the single top-composite-score ticker in
-// each industry with at least MIN_INDUSTRY_PEERS peers (see
-// computeIndustryLeaders below) — precomputed here rather than on-device so
-// the Home screen's carousel is just reading a small pre-baked list, same
-// "compute once daily, app just reads" philosophy as everything else this
-// pipeline produces.
+// Also computes `industryLeaders`: one ticker per industry with at least
+// MIN_INDUSTRY_PEERS peers, required to have all 6 comparable metrics
+// present AND rank top-quintile in at least 5 of them (see
+// computeIndustryLeaders below for why — a ticker with only 1 of 6 metrics
+// present was otherwise winning on a single outlier/likely-erroneous
+// number), lightly biased toward tickers with more reported quarters (see
+// historyWeight). Precomputed here rather than on-device so the Home
+// screen's carousel is just reading a small pre-baked list, same "compute
+// once daily, app just reads" philosophy as everything else this pipeline
+// produces.
 //
 // Universe: Finnhub's full US symbol list (`/stock/symbol?exchange=US`),
 // filtered to primary listings on NASDAQ/NYSE/NYSE American (mic codes
@@ -124,6 +128,16 @@ async function fetchProfileFor(symbol, apiKey) {
 const COMPARABLE_KEYS = ['roic', 'revenueGrowth', 'profitMargin', 'fcfMargin', 'peRatio', 'pfcfRatio'];
 const LOWER_IS_BETTER = new Set(['peRatio', 'pfcfRatio']); // mirrors METRIC_DEFS.betterWhen in src/utils/metrics.js
 const MIN_INDUSTRY_PEERS = 100; // narrower industries are excluded — a "top pick" out of a handful of peers isn't statistically meaningful
+// "top tier" bar for a single metric — top quintile among industry peers.
+// Verified against the live full-universe data before picking this number:
+// a 90th-percentile (top-decile) bar left only 2 of 15 qualifying industries
+// with a leader at all — too strict to be a usable Home screen carousel.
+// 80th percentile leaves 10 of 15, still a genuinely high bar (all 6 metrics
+// present, top-quintile in at least MIN_TOP_METRICS of them).
+const TOP_METRIC_PERCENTILE = 80;
+const MIN_TOP_METRICS = 5; // must be top-tier in at least this many of the 6 metrics, not just a good average
+const HISTORY_QUARTERS_FULL_WEIGHT = 8; // ~2 years — no penalty at or above this
+const HISTORY_QUARTERS_FLOOR = 4; // ~1 year — a steeper penalty below this
 
 // Mirrors the percentile-rank + goodness logic in src/utils/metrics.js
 // (percentileRank, percentileTone) — keep in sync if that ever changes.
@@ -135,12 +149,34 @@ function percentileRank(value, population) {
   return ((below + 0.5 * tied) / valid.length) * 100;
 }
 
+// A ticker reporting for less than ~2 years isn't excluded outright (a
+// genuinely exceptional recent listing shouldn't be disqualified on that
+// alone), but needs a meaningfully higher raw composite to overcome this to
+// win — guards against a thinly-reported IPO/SPAC looking artificially great
+// on a metric or two that hasn't been tested across a full cycle yet.
+function historyWeight(historyQuarters) {
+  if (historyQuarters >= HISTORY_QUARTERS_FULL_WEIGHT) return 1;
+  if (historyQuarters >= HISTORY_QUARTERS_FLOOR) return 0.97;
+  return 0.9;
+}
+
 /**
- * One "leader" per industry (>= MIN_INDUSTRY_PEERS peers only): the ticker
- * with the highest composite score, where each of the 6 comparable metrics
- * is percentile-ranked within the industry, direction-normalized ("goodness"
- * — a low P/E percentile-ranks as high goodness, same as percentileTone),
- * then averaged. A ticker missing some metrics is scored on whichever it has.
+ * One "leader" per industry (>= MIN_INDUSTRY_PEERS peers only). A candidate
+ * must have:
+ *  1. All 6 comparable metrics present — verified live that a ticker with
+ *     only 1 of 6 (e.g. SharonAI/SHAZ: fcfMargin present, everything else
+ *     null, and that one figure a wildly implausible 2065% margin) could
+ *     otherwise "win" an industry on a single outlier/likely-erroneous
+ *     number instead of a genuinely complete picture.
+ *  2. Top-tier (>= TOP_METRIC_PERCENTILE, currently the 80th) in at least
+ *     MIN_TOP_METRICS of those 6, direction-normalized ("goodness" — a low
+ *     P/E percentile-ranks as high goodness, same as percentileTone) — not
+ *     just a good average across the board, but genuinely excellent in
+ *     nearly everything.
+ * Among qualifying candidates, the winner is the highest composite score
+ * (the same goodness-averaged score as before), weighted down slightly for
+ * thin reporting history (see historyWeight). An industry with no
+ * qualifying candidate at all gets no leader, rather than forcing a pick.
  */
 function computeIndustryLeaders(metrics, profiles) {
   const byIndustry = {};
@@ -158,18 +194,24 @@ function computeIndustryLeaders(metrics, profiles) {
       populations[key] = symbols.map((s) => metrics[s][key]);
     }
 
+    const eligible = symbols.filter((s) => COMPARABLE_KEYS.every((k) => metrics[s][k] !== null && metrics[s][k] !== undefined));
+
     let best = null;
-    for (const symbol of symbols) {
+    for (const symbol of eligible) {
       const data = metrics[symbol];
       const goodnessScores = [];
+      let topMetricCount = 0;
       for (const key of COMPARABLE_KEYS) {
         const pct = percentileRank(data[key], populations[key]);
-        if (pct === null) continue;
-        goodnessScores.push(LOWER_IS_BETTER.has(key) ? 100 - pct : pct);
+        const goodness = LOWER_IS_BETTER.has(key) ? 100 - pct : pct;
+        goodnessScores.push(goodness);
+        if (goodness >= TOP_METRIC_PERCENTILE) topMetricCount++;
       }
-      if (goodnessScores.length === 0) continue;
+      if (topMetricCount < MIN_TOP_METRICS) continue;
+
       const composite = goodnessScores.reduce((a, b) => a + b, 0) / goodnessScores.length;
-      if (!best || composite > best.composite) best = { symbol, composite };
+      const adjustedScore = composite * historyWeight(profiles[symbol]?.historyQuarters || 0);
+      if (!best || adjustedScore > best.adjustedScore) best = { symbol, composite, adjustedScore };
     }
 
     if (best) {
@@ -205,9 +247,13 @@ async function main() {
     const symbol = symbols[i];
     try {
       const profile = await fetchProfileFor(symbol, apiKey);
-      profiles[symbol] = profile;
       await sleep(REQUEST_SPACING_MS);
       const { current, quarterly } = await fetchMetricsFor(symbol, apiKey);
+      // netMargin's quarterly series is one of the more consistently-present
+      // fields (see QUARTERLY_FIELD_MAP in src/utils/metrics.js) — used here
+      // purely as a proxy for "how many quarters has Finnhub got on this
+      // ticker," for the Industry Leaders history bias (see historyWeight).
+      profiles[symbol] = { ...profile, historyQuarters: (quarterly.netMargin || []).length };
       metrics[symbol] = { industry: profile.industry, ...extractMetricValues(current, quarterly) };
       ok++;
     } catch (err) {
