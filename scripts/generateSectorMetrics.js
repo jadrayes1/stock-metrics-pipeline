@@ -149,6 +149,29 @@ function percentileRank(value, population) {
   return ((below + 0.5 * tied) / valid.length) * 100;
 }
 
+// Mirrors findLowRevenuePeriods in src/utils/metrics.js — keep the
+// threshold in sync. There it's used to flag a single chart quarter; here
+// it's used to exclude a candidate from Industry Leaders entirely if its
+// MOST RECENT quarter is one of these, since profitMargin/fcfMargin (which
+// feed directly into the composite score below) would be unreliable for it
+// right now. Verified live on SPRO (Spero Therapeutics): revenue collapsed
+// to $0.0045/share from ~$0.60 the prior quarter, producing a -2792% net
+// margin and +6149% FCF margin for that one quarter alone — a real
+// calculation, not a meaningful one, and SPRO was winning Biotechnology on
+// the strength of a TTM figure partly built on it.
+const LOW_REVENUE_RATIO_THRESHOLD = 0.2;
+
+function hasRecentRevenueAnomaly(salesPerShareEntries) {
+  const entries = salesPerShareEntries || [];
+  const values = entries.map((e) => e?.v).filter((v) => v != null && v > 0);
+  if (values.length < 4) return false; // not enough history to judge "normal" for this ticker
+
+  const sorted = [...values].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  const mostRecent = entries[0]; // Finnhub returns most-recent-first
+  return mostRecent?.v != null && mostRecent.v < median * LOW_REVENUE_RATIO_THRESHOLD;
+}
+
 // A ticker reporting for less than ~2 years isn't excluded outright (a
 // genuinely exceptional recent listing shouldn't be disqualified on that
 // alone), but needs a meaningfully higher raw composite to overcome this to
@@ -173,6 +196,10 @@ function historyWeight(historyQuarters) {
  *     P/E percentile-ranks as high goodness, same as percentileTone) — not
  *     just a good average across the board, but genuinely excellent in
  *     nearly everything.
+ *  3. No recent-quarter revenue anomaly (see hasRecentRevenueAnomaly) — a
+ *     candidate whose latest quarter's revenue collapsed relative to its
+ *     own history is excluded even if its TTM composite looks fine, since
+ *     that TTM figure is partly built on a distorted quarter.
  * Among qualifying candidates, the winner is the highest composite score
  * (the same goodness-averaged score as before), weighted down slightly for
  * thin reporting history (see historyWeight). An industry with no
@@ -194,7 +221,11 @@ function computeIndustryLeaders(metrics, profiles) {
       populations[key] = symbols.map((s) => metrics[s][key]);
     }
 
-    const eligible = symbols.filter((s) => COMPARABLE_KEYS.every((k) => metrics[s][k] !== null && metrics[s][k] !== undefined));
+    const eligible = symbols.filter(
+      (s) =>
+        COMPARABLE_KEYS.every((k) => metrics[s][k] !== null && metrics[s][k] !== undefined) &&
+        !profiles[s]?.hasRecentRevenueAnomaly
+    );
 
     let best = null;
     for (const symbol of eligible) {
@@ -253,7 +284,11 @@ async function main() {
       // fields (see QUARTERLY_FIELD_MAP in src/utils/metrics.js) — used here
       // purely as a proxy for "how many quarters has Finnhub got on this
       // ticker," for the Industry Leaders history bias (see historyWeight).
-      profiles[symbol] = { ...profile, historyQuarters: (quarterly.netMargin || []).length };
+      profiles[symbol] = {
+        ...profile,
+        historyQuarters: (quarterly.netMargin || []).length,
+        hasRecentRevenueAnomaly: hasRecentRevenueAnomaly(quarterly.salesPerShare),
+      };
       metrics[symbol] = { industry: profile.industry, ...extractMetricValues(current, quarterly) };
       ok++;
     } catch (err) {
