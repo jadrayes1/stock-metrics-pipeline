@@ -26,10 +26,14 @@
 //
 // Classification is Finnhub's own `finnhubIndustry` (from `/stock/profile2`),
 // not GICS sector — there's no free GICS mapping covering this many tickers
-// the way there was for the S&P 500 alone. This is more granular than GICS
-// sector (e.g. "Airlines" rather than "Industrials"), so peer groups for
-// narrow industries can be small; that's an inherent tradeoff of broader
-// coverage, not a bug.
+// the way there was for the S&P 500 alone. Verified live against the full
+// universe: granularity is inconsistent, not uniformly finer than GICS
+// sector as you might expect — some values are genuinely narrow ("Airlines",
+// 17 tickers) while others are broad catch-alls that read like sector names
+// ("Technology", 358; "Health Care", 304; "Financial Services", 301). Only
+// 46 distinct values across all ~5,145 tickers. Finnhub also returns the
+// literal string "N/A" for some tickers instead of omitting the field —
+// treated as "no industry" (see fetchProfileFor), not a real bucket.
 //
 // This is a plain Node script (not part of the Expo/React Native bundle —
 // nothing under src/ imports it), since it needs `fs` and a longer-running
@@ -107,7 +111,14 @@ async function fetchProfileFor(symbol, apiKey) {
   const res = await fetch(`https://finnhub.io/api/v1/stock/profile2?symbol=${symbol}&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
-  return { industry: data?.finnhubIndustry || null, name: data?.name || null, logo: data?.logo || null };
+  // Verified live: Finnhub returns the literal string "N/A" for some tickers
+  // (SPACs, holding companies, etc.) instead of omitting the field — that's
+  // truthy in JS, so without this check those ~271 tickers (out of ~5,145)
+  // silently got grouped into a meaningless "N/A" industry, once even
+  // producing a nonsensical "industry leader."
+  const rawIndustry = data?.finnhubIndustry;
+  const industry = rawIndustry && rawIndustry.trim().toUpperCase() !== 'N/A' ? rawIndustry : null;
+  return { industry, name: data?.name || null, logo: data?.logo || null };
 }
 
 const COMPARABLE_KEYS = ['roic', 'revenueGrowth', 'profitMargin', 'fcfMargin', 'peRatio', 'pfcfRatio'];
