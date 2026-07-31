@@ -32,5 +32,22 @@ limited free GitHub Actions minutes while public ones don't).
 ```
 scripts/generateSectorMetrics.js   — the actual fetch + rate-limiting logic
 src/data/                            — generation output lands here locally (gitignored)
-.github/workflows/                     — the daily schedule + gist publish
+.github/workflows/                     — the daily schedule + gist publish + failure monitoring
 ```
+
+## Failure monitoring
+
+If a run fails, the workflow opens a `pipeline-failure`-labeled issue in this
+repo (or comments on one that's already open, so repeated failures don't
+spam new issues) — auto-closed the next time a run succeeds. Check
+github.com/settings/notifications to make sure "Issues" notifications are on
+if you want these to actually reach you.
+
+This doesn't catch the job silently never running at all (vs. running and
+failing) — e.g. if GitHub's scheduler itself glitches. GitHub auto-disables
+scheduled workflows after 60 days of zero repo activity, but this workflow's
+own daily commits to the Gist should keep that from ever triggering. If you
+want to also catch "didn't run at all," an external heartbeat/dead-man's-switch
+service (e.g. healthchecks.io's free tier) is the standard way — add a `curl`
+ping as a final step and let the service alert you if it doesn't hear from a
+run within the expected daily window. Not set up here.
