@@ -7,11 +7,13 @@
 # for two reasons:
 #   1. A Gist's visibility doesn't depend on the repo that updates it, so
 #      the app's source can stay private while this feed stays public.
-#   2. This job takes ~2-3 hours (two Finnhub calls per ticker, rate-limited
-#      to stay under the free-tier 60/min cap). Public repos get unlimited
-#      free GitHub Actions minutes on standard runners; private repos only
-#      get a limited monthly allowance, which a daily multi-hour job would
-#      blow through fast.
+#   2. This job takes ~4-5 hours (two or three Finnhub calls per ticker —
+#      the third, for the estimated-fair-value DCF, is skipped for
+#      Banking/Insurance/Financial Services tickers — rate-limited to stay
+#      under the free-tier 60/min cap). Public repos get unlimited free
+#      GitHub Actions minutes on standard runners; private repos only get a
+#      limited monthly allowance, which a daily multi-hour job would blow
+#      through fast.
 #
 # Failure monitoring: on failure, opens (or comments on, if one's already
 # open) a `pipeline-failure`-labeled issue in this repo — auto-closed the
@@ -36,7 +38,7 @@ name: Generate sector metrics
 
 on:
   schedule:
-    - cron: '0 6 * * *' # ~01:00 US Eastern — starts early enough that a ~3hr run finishes well before market open
+    - cron: '0 8 * * *' # ~03:00 US Eastern — starts early enough that a ~4.5-4.8hr run finishes well before market open and before most app usage
   workflow_dispatch: {}
 
 permissions:
@@ -46,7 +48,7 @@ permissions:
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 420
     steps:
       - uses: actions/checkout@v4
 

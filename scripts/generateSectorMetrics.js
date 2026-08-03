@@ -1,11 +1,12 @@
 // scripts/generateSectorMetrics.js
 //
-// Offline data-generation step for the sector-percentile and Industry
-// Leaders features. Fetches fundamentals + industry classification for
-// every NASDAQ/NYSE/NYSE American common stock and REIT from Finnhub, and
-// writes the result to src/data/marketMetrics.json, which the app reads
-// directly at runtime — no live Finnhub calls, no waiting, no rate-limit
-// exposure for the person using the app.
+// Offline data-generation step for the sector-percentile, Industry
+// Leaders, and estimated-fair-value features. Fetches fundamentals +
+// industry classification for every NASDAQ/NYSE/NYSE American common
+// stock and REIT from Finnhub, and writes the result to
+// src/data/marketMetrics.json, which the app reads directly at runtime —
+// no live Finnhub calls, no waiting, no rate-limit exposure for the
+// person using the app.
 //
 // Also computes `industryLeaders`: one ticker per industry with at least
 // MIN_INDUSTRY_PEERS peers, required to have all 6 comparable metrics
@@ -17,6 +18,22 @@
 // screen's carousel is just reading a small pre-baked list, same "compute
 // once daily, app just reads" philosophy as everything else this pipeline
 // produces.
+//
+// Also computes `estimatedFairValue`: a DCF fair-value estimate built from
+// Finnhub's own reported financials (see computeEstimatedFairValue below),
+// used by the app as a fallback ONLY when FMP's own Fair Value can't be
+// fetched (rate-limited or not cached yet) — see src/api/sectorComparison.js
+// and src/screens/ResultsScreen.js. This is deliberately a fallback, not a
+// replacement: sanity-checked against FMP's real numbers for AAPL/MSFT/KO/
+// NVDA during development, it lands within roughly -20% to +25% of FMP's
+// figure for ordinary and high-growth names, which is a genuinely different
+// (not wrong, just independently-derived) number, not a precise match.
+// Skipped entirely for Banking/Insurance/Financial Services tickers — FCF-
+// based DCF is a poor fit for financial institutions (verified live: JPM's
+// own operating cash flow is deeply negative due to loan/trading-asset
+// accounting, not a normal operating cycle), so standard practice values
+// those with a completely different model (dividend discount / excess
+// return on book equity), which is out of scope here.
 //
 // Universe: Finnhub's full US symbol list (`/stock/symbol?exchange=US`),
 // filtered to primary listings on NASDAQ/NYSE/NYSE American (mic codes
@@ -45,31 +62,30 @@
 //
 // Runs in a separate PUBLIC repo (jadrayes1/stock-metrics-pipeline) on a
 // schedule — see that repo's .github/workflows/generate-sector-metrics.yml.
-// It's public (unlike the app's private repo) specifically so this ~2-3hr
-// job doesn't burn paid GitHub Actions minutes. This script itself has no
-// dependency on which repo it runs in, though: `npm run
+// It's public (unlike the app's private repo) specifically so this multi-
+// hour job doesn't burn paid GitHub Actions minutes. This script itself has
+// no dependency on which repo it runs in, though: `npm run
 // generate-sector-metrics` still works locally too, at the same one-time
-// ~2-3hr cost (two Finnhub calls per ticker, rate-limited to stay under the
-// free-tier 60/min cap).
+// cost (two or three Finnhub calls per ticker, rate-limited to stay under
+// the free-tier 60/min cap).
 
 const fs = require('fs');
 const path = require('path');
 
-const CONFIG_FILE = path.join(__dirname, '../src/config.js');
 const OUTPUT_FILE = path.join(__dirname, '../src/data/marketMetrics.json');
 const REQUEST_SPACING_MS = 1100; // ~54/min, under Finnhub's 60/min free-tier cap
 
 const ALLOWED_MICS = new Set(['XNAS', 'XNYS', 'XASE']); // NASDAQ, NYSE, NYSE American
 const ALLOWED_TYPES = new Set(['Common Stock', 'REIT']);
+const FINANCIAL_INDUSTRIES = new Set(['Banking', 'Insurance', 'Financial Services']);
 
 function readFinnhubApiKey() {
+  // This script runs server-side (locally or in the pipeline repo's GitHub
+  // Actions workflow), never bundled into the app, so it reads the key
+  // straight from the environment rather than src/config.js — the app no
+  // longer keeps a real Finnhub key there at all (see src/config.js).
   if (process.env.FINNHUB_API_KEY) return process.env.FINNHUB_API_KEY;
-  const configSource = fs.readFileSync(CONFIG_FILE, 'utf8');
-  const match = configSource.match(/FINNHUB_API_KEY\s*=\s*['"]([^'"]+)['"]/);
-  if (!match) {
-    throw new Error('Could not find FINNHUB_API_KEY in src/config.js, and FINNHUB_API_KEY env var is not set.');
-  }
-  return match[1];
+  throw new Error('FINNHUB_API_KEY env var is not set.');
 }
 
 async function fetchUniverse(apiKey) {
@@ -122,7 +138,225 @@ async function fetchProfileFor(symbol, apiKey) {
   // producing a nonsensical "industry leader."
   const rawIndustry = data?.finnhubIndustry;
   const industry = rawIndustry && rawIndustry.trim().toUpperCase() !== 'N/A' ? rawIndustry : null;
-  return { industry, name: data?.name || null, logo: data?.logo || null };
+  // Finnhub reports this in millions of USD — converted to raw dollars where
+  // it's used (computeEstimatedFairValue), to match financials-reported's
+  // raw-dollar units. Pulled from the profile response specifically so the
+  // DCF estimate doesn't need its own /quote call just for a price.
+  const marketCapitalization = typeof data?.marketCapitalization === 'number' ? data.marketCapitalization * 1e6 : null;
+  return { industry, name: data?.name || null, logo: data?.logo || null, marketCapitalization };
+}
+
+async function fetchReportedFinancialsFor(symbol, apiKey) {
+  const res = await fetch(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${symbol}&freq=annual&token=${apiKey}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data?.data) ? data.data : [];
+}
+
+// ---------------------------------------------------------------------------
+// Estimated Fair Value (DCF) — see the file header for scope/rationale.
+//
+// Finnhub's `financials-reported` mirrors each filer's own XBRL tags and
+// labels, which vary company to company (e.g. "Operating income" for Apple
+// vs. "Operating Income (Loss)" for Microsoft). Matching by XBRL `concept`
+// first (standardized across filers for common line items) with a label-
+// keyword fallback is far more robust across ~4,400 different companies'
+// filings than matching on label text alone.
+// ---------------------------------------------------------------------------
+
+function findByConcept(items, concepts) {
+  for (const concept of concepts) {
+    const match = items.find((i) => i.concept === concept);
+    if (match?.value != null) return match.value;
+  }
+  return null;
+}
+
+function findByLabelKeywords(items, keywords, excludeKeywords = []) {
+  const match = items.find((i) => {
+    const label = (i.label || '').toLowerCase();
+    if (i.value == null) return false;
+    if (excludeKeywords.some((k) => label.includes(k))) return false;
+    return keywords.some((k) => label.includes(k));
+  });
+  return match ? match.value : null;
+}
+
+function sumByLabelKeywords(items, includeKeywords, excludeKeywords) {
+  return items
+    .filter((i) => {
+      const label = (i.label || '').toLowerCase();
+      if (i.value == null) return false;
+      if (excludeKeywords.some((k) => label.includes(k))) return false;
+      return includeKeywords.some((k) => label.includes(k));
+    })
+    .reduce((sum, i) => sum + i.value, 0);
+}
+
+const DEBT_CONCEPTS = [
+  'us-gaap_LongTermDebtNoncurrent',
+  'us-gaap_LongTermDebtCurrent',
+  'us-gaap_LongTermDebt',
+  'us-gaap_ShortTermBorrowings',
+  'us-gaap_CommercialPaper',
+  'us-gaap_DebtCurrent',
+  'us-gaap_SecuredDebtCurrent',
+  'us-gaap_OtherLongTermDebtNoncurrent',
+];
+const DEBT_LABEL_KEYWORDS = ['term debt', 'commercial paper', 'notes payable', 'loans and notes payable', 'current maturities of long-term debt', 'short-term debt', 'short-term borrowings'];
+
+function sumDebt(bsItems) {
+  // Prefer concept-matched line items (dedup by concept so a value isn't
+  // double-counted if it appears more than once in the raw report), falling
+  // back to keyword-matched labels only for items no concept matched.
+  const seenConcepts = new Set();
+  let total = 0;
+  let matchedAny = false;
+  for (const item of bsItems) {
+    if (item.value == null) continue;
+    if (DEBT_CONCEPTS.includes(item.concept) && !seenConcepts.has(item.concept + item.value)) {
+      seenConcepts.add(item.concept + item.value);
+      total += item.value;
+      matchedAny = true;
+    }
+  }
+  if (matchedAny) return total;
+  // Fallback: keyword-matched debt-instrument labels (avoids "Total
+  // liabilities"-style aggregates by requiring specific instrument words).
+  return sumByLabelKeywords(bsItems, DEBT_LABEL_KEYWORDS, ['total']);
+}
+
+// Everything in the cash-flow statement's operating section that ISN'T net
+// income, D&A, or a non-cash reconciling item (stock comp, deferred tax,
+// gains/losses, impairment, equity-method income) is treated as a working-
+// capital change. Deliberately NOT computed as `OCF - NetIncome - D&A` —
+// verified live that Finnhub's structured AAPL data doesn't reconcile that
+// way (components summed to ~$29.8B more than the reported OCF subtotal for
+// FY2025), so that shortcut would silently absorb whatever's causing the
+// discrepancy into this figure. Summing the actual named items sidesteps it.
+const WC_EXCLUDE_KEYWORDS = [
+  'net income',
+  'depreciation',
+  'amortization',
+  'stock-based',
+  'stock based',
+  'share-based',
+  'share based',
+  'deferred income tax',
+  'deferred tax',
+  'impairment',
+  'gain on',
+  'loss on',
+  'gains on',
+  'losses on',
+  'equity method',
+  'equity (income) loss',
+  'noncontrolling',
+  'net cash',
+  'net change in cash',
+];
+
+function extractDcfInputs(reportedFinancials) {
+  if (!reportedFinancials.length) return null;
+  const annual = reportedFinancials.find((r) => r.form === '10-K') || reportedFinancials[0];
+  const { ic, bs, cf } = annual.report || {};
+  if (!ic || !bs || !cf) return null;
+
+  const ebit = findByConcept(ic, ['us-gaap_OperatingIncomeLoss']) ?? findByLabelKeywords(ic, ['operating income', 'income from operations']);
+  const pretaxIncome =
+    findByConcept(ic, [
+      'us-gaap_IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest',
+      'us-gaap_IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments',
+    ]) ?? findByLabelKeywords(ic, ['income before', 'income before provision for income tax']);
+  const taxExpense = findByConcept(ic, ['us-gaap_IncomeTaxExpenseBenefit']) ?? findByLabelKeywords(ic, ['provision for income tax', 'income tax expense']);
+  const dilutedShares =
+    findByConcept(ic, ['us-gaap_WeightedAverageNumberOfDilutedSharesOutstanding']) ?? findByLabelKeywords(ic, ['diluted (in shares)', 'diluted shares', 'weighted average number of shares outstanding, diluted']);
+
+  const da = findByConcept(cf, ['us-gaap_DepreciationDepletionAndAmortization', 'us-gaap_DepreciationAmortizationAndAccretionNet', 'us-gaap_DepreciationAndAmortization']) ?? findByLabelKeywords(cf, ['depreciation and amortization', 'depreciation, amortization']);
+  const capex =
+    findByConcept(cf, ['us-gaap_PaymentsToAcquirePropertyPlantAndEquipment']) ??
+    findByLabelKeywords(cf, ['purchases of property', 'payments for acquisition of property', 'payments to acquire property', 'purchases related to property', 'capital expenditures']);
+  const cash = findByConcept(bs, ['us-gaap_CashAndCashEquivalentsAtCarryingValue', 'us-gaap_CashAndCashEquivalentsAtFairValue', 'us-gaap_Cash']) ?? findByLabelKeywords(bs, ['cash and cash equivalents']);
+  const totalDebt = sumDebt(bs);
+
+  if (ebit == null || da == null || capex == null || dilutedShares == null || cash == null) return null;
+
+  const taxRate = pretaxIncome != null && taxExpense != null && pretaxIncome > 0 ? Math.max(0, Math.min(0.35, taxExpense / pretaxIncome)) : 0.21; // fall back to the US statutory rate if effective rate isn't derivable
+
+  // Sum every cf-section item up to (not including) the operating-activities
+  // subtotal, excluding net income/D&A/non-cash reconciling items — the
+  // remainder is working-capital-ish changes (receivables, payables,
+  // inventory, deferred revenue, and any stray "other" adjustment lines).
+  //
+  // The subtotal is matched by XBRL concept, not label text — verified live
+  // that label wording for this exact line varies by filer (Apple's own
+  // 10-K says "Cash generated by operating activities," not the more common
+  // "Net Cash Provided by (Used in) Operating Activities" that MSFT/KO/NVDA
+  // use), while the underlying concept (NetCashProvidedByUsedInOperating
+  // Activities) is standardized across all of them. Matching on label text
+  // alone missed Apple's subtotal entirely and summed straight through the
+  // rest of the cash-flow statement (investing/financing activities too),
+  // inflating its estimate by 175% before this was caught.
+  const OPERATING_SUBTOTAL_CONCEPTS = ['us-gaap_NetCashProvidedByUsedInOperatingActivities', 'us-gaap_NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'];
+  let wcChangeTotal = 0;
+  for (const item of cf) {
+    if (OPERATING_SUBTOTAL_CONCEPTS.includes(item.concept)) break;
+    if (item.value == null) continue;
+    const label = (item.label || '').toLowerCase();
+    // Fallback in case a filer's subtotal isn't tagged with either concept above.
+    if (label.includes('net cash') && (label.includes('operating activities') || label.includes('investing activities') || label.includes('financing activities'))) break;
+    if (WC_EXCLUDE_KEYWORDS.some((k) => label.includes(k))) continue;
+    wcChangeTotal += item.value;
+  }
+
+  return { ebit, taxRate, da, capex, wcChange: wcChangeTotal, totalDebt, cash, dilutedShares, netDebt: totalDebt - cash };
+}
+
+const RF = 0.047; // 10-year Treasury yield — update periodically, doesn't need to be exact to the day
+const ERP = 0.0445; // Damodaran's published implied US equity risk premium — update periodically
+const TERMINAL_GROWTH = 0.025; // long-run nominal GDP growth convention
+const DEBT_SPREAD = 0.015; // assumed spread over Rf for cost of debt (no per-ticker interest-expense data)
+const GROWTH_CAP = 0.5; // caps near-term growth input — see file header; validated against FMP on AAPL/MSFT/KO/NVDA
+const PROJECTION_YEARS = 10;
+
+/**
+ * Estimated Fair Value per share via a two-stage FCFF DCF: NOPAT + D&A +
+ * working-capital change - CapEx, projected forward with growth fading
+ * linearly from a capped near-term rate to TERMINAL_GROWTH, discounted at a
+ * market-cap-weighted, CAPM-based WACC, then bridged from enterprise value
+ * to equity value by subtracting net debt. See the file header for the
+ * validation numbers and known limitations (still a materially different
+ * estimate than FMP's own DCF, not a replica of it).
+ */
+function computeEstimatedFairValue(dcfInputs, current, marketCap) {
+  const { ebit, taxRate, da, capex, wcChange, netDebt, dilutedShares } = dcfInputs;
+  const beta = current.beta;
+  if (beta == null || marketCap == null || dilutedShares <= 0) return null;
+
+  const weightDebt = dcfInputs.totalDebt / (marketCap + dcfInputs.totalDebt);
+  const weightEquity = 1 - weightDebt;
+  const costOfEquity = RF + beta * ERP;
+  const costOfDebtAfterTax = (RF + DEBT_SPREAD) * (1 - taxRate);
+  const wacc = weightEquity * costOfEquity + weightDebt * costOfDebtAfterTax;
+  if (wacc - TERMINAL_GROWTH < 0.02) return null; // guard against a degenerate/blown-up terminal value
+
+  const growthCandidates = [current.revenueGrowth3Y, current.focfCagr5Y].filter((v) => v != null).map((v) => v / 100);
+  let g1 = growthCandidates.length ? growthCandidates.reduce((a, b) => a + b, 0) / growthCandidates.length : TERMINAL_GROWTH;
+  g1 = Math.max(-0.1, Math.min(GROWTH_CAP, g1));
+
+  const nopat0 = ebit * (1 - taxRate);
+  let fcff = nopat0 + da + wcChange - capex;
+  let presentValueSum = 0;
+  for (let year = 1; year <= PROJECTION_YEARS; year++) {
+    const g = g1 - ((g1 - TERMINAL_GROWTH) * (year - 1)) / (PROJECTION_YEARS - 1);
+    fcff *= 1 + g;
+    presentValueSum += fcff / Math.pow(1 + wacc, year);
+  }
+  const terminalValue = (fcff * (1 + TERMINAL_GROWTH)) / (wacc - TERMINAL_GROWTH);
+  const presentValueOfTerminal = terminalValue / Math.pow(1 + wacc, PROJECTION_YEARS);
+  const equityValue = presentValueSum + presentValueOfTerminal - netDebt;
+  const fairValue = equityValue / dilutedShares;
+  return fairValue > 0 ? fairValue : null;
 }
 
 const COMPARABLE_KEYS = ['roic', 'revenueGrowth', 'profitMargin', 'fcfMargin', 'peRatio', 'pfcfRatio'];
@@ -287,16 +521,16 @@ function computeIndustryLeaders(metrics, profiles) {
 async function main() {
   const apiKey = readFinnhubApiKey();
   const symbols = await fetchUniverse(apiKey);
-  const totalRequests = symbols.length * 2; // industry + metrics, per ticker
   console.log(
-    `Fetching industry + fundamentals for ${symbols.length} tickers ` +
-      `(${totalRequests} requests, ~${Math.round((totalRequests * REQUEST_SPACING_MS) / 60000)} min)...`
+    `Fetching industry + fundamentals (+ DCF inputs for non-financial tickers) for ${symbols.length} tickers ` +
+      `(two or three requests each, rate-limited to stay under Finnhub's free-tier cap — this takes several hours)...`
   );
 
   const metrics = {};
   const profiles = {}; // name/logo, kept out of `metrics` to avoid bloating that map — only industryLeaders needs them
   let ok = 0;
   let failed = 0;
+  let dcfComputed = 0;
 
   for (let i = 0; i < symbols.length; i++) {
     const symbol = symbols[i];
@@ -304,6 +538,7 @@ async function main() {
       const profile = await fetchProfileFor(symbol, apiKey);
       await sleep(REQUEST_SPACING_MS);
       const { current, quarterly } = await fetchMetricsFor(symbol, apiKey);
+
       // netMargin's quarterly series is one of the more consistently-present
       // fields (see QUARTERLY_FIELD_MAP in src/utils/metrics.js) — used here
       // purely as a proxy for "how many quarters has Finnhub got on this
@@ -313,7 +548,27 @@ async function main() {
         historyQuarters: (quarterly.netMargin || []).length,
         trendQualified: computeTrendQualification(quarterly),
       };
-      metrics[symbol] = { industry: profile.industry, ...extractMetricValues(current, quarterly) };
+
+      let estimatedFairValue = null;
+      const isFinancial = profile.industry && FINANCIAL_INDUSTRIES.has(profile.industry);
+      if (!isFinancial) {
+        await sleep(REQUEST_SPACING_MS);
+        try {
+          const reportedFinancials = await fetchReportedFinancialsFor(symbol, apiKey);
+          const dcfInputs = extractDcfInputs(reportedFinancials);
+          if (dcfInputs) {
+            estimatedFairValue = computeEstimatedFairValue(dcfInputs, current, profile.marketCapitalization);
+            if (estimatedFairValue != null) dcfComputed++;
+          }
+        } catch {
+          // A single ticker's oddly-shaped filing (or a failed request)
+          // shouldn't take down the whole run — just skip its estimate,
+          // same graceful-degradation philosophy as the rest of this
+          // pipeline. Its sector-percentile metrics are unaffected.
+        }
+      }
+
+      metrics[symbol] = { industry: profile.industry, ...extractMetricValues(current, quarterly), estimatedFairValue };
       ok++;
     } catch (err) {
       failed++;
@@ -321,7 +576,7 @@ async function main() {
     }
 
     if ((i + 1) % 100 === 0 || i === symbols.length - 1) {
-      console.log(`  ${i + 1}/${symbols.length} (${ok} ok, ${failed} failed)`);
+      console.log(`  ${i + 1}/${symbols.length} (${ok} ok, ${failed} failed, ${dcfComputed} with a fair-value estimate)`);
     }
 
     if (i < symbols.length - 1) await sleep(REQUEST_SPACING_MS);
@@ -333,10 +588,14 @@ async function main() {
   const output = { generatedAt: new Date().toISOString(), metrics, industryLeaders };
   fs.mkdirSync(path.dirname(OUTPUT_FILE), { recursive: true }); // works regardless of which repo this script runs in
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(output, null, 2));
-  console.log(`Wrote ${ok} tickers to ${path.relative(process.cwd(), OUTPUT_FILE)} (${failed} skipped).`);
+  console.log(`Wrote ${ok} tickers to ${path.relative(process.cwd(), OUTPUT_FILE)} (${failed} skipped, ${dcfComputed} with a fair-value estimate).`);
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
+
+module.exports = { extractDcfInputs, computeEstimatedFairValue };
