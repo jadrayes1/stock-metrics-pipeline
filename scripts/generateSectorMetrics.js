@@ -114,16 +114,34 @@ function latestQuarterly(series, field) {
   return Array.isArray(arr) && arr.length > 0 ? arr[0].v : null;
 }
 
+// current.revenueGrowthTTMYoy can be entirely absent even when
+// quarterly.salesPerShare has real data (verified live: CoreWeave/CRWV) —
+// derives the latest YoY point directly from salesPerShare as a fallback,
+// same as the app's equivalent (src/utils/metrics.js).
+function latestRevenueGrowthFromQuarterly(quarterly) {
+  const sales = quarterly?.salesPerShare;
+  if (!Array.isArray(sales)) return null;
+  const thisQuarter = sales[0];
+  const yearAgo = sales[4];
+  return thisQuarter?.v != null && yearAgo?.v ? (thisQuarter.v - yearAgo.v) / yearAgo.v : null;
+}
+
 // Mirrors extractFinnhubMetricValues in src/utils/metrics.js — keep these
 // two in sync if that mapping ever changes (see the field-name notes there
-// for why current/quarterly don't share names or units).
+// for why current/quarterly don't share names or units). Doesn't mirror the
+// app's filings-based P/FCF and FCF Margin reconstruction fallbacks — those
+// need a live Twelve Data price fetch (P/FCF) or aren't worth the extra
+// financials-reported fetch for every one of ~5,140 tickers here, so a
+// ticker with a Finnhub-side gap in those two shows null in this bulk
+// dataset even though the app can still fill it in on-demand for that one
+// ticker when someone looks it up.
 function extractMetricValues(current, quarterly) {
   const roic = latestQuarterly(quarterly, 'roicTTM') ?? (current.roiTTM != null ? current.roiTTM / 100 : null);
-  const revenueGrowth = current.revenueGrowthTTMYoy != null ? current.revenueGrowthTTMYoy / 100 : null;
+  const revenueGrowth = current.revenueGrowthTTMYoy != null ? current.revenueGrowthTTMYoy / 100 : latestRevenueGrowthFromQuarterly(quarterly);
   const profitMargin = current.netProfitMarginTTM != null ? current.netProfitMarginTTM / 100 : null;
   const fcfMargin = latestQuarterly(quarterly, 'fcfMargin');
   const peRatio = current.peTTM ?? null;
-  const pfcfRatio = current.pfcfShareTTM ?? null;
+  const pfcfRatio = latestQuarterly(quarterly, 'pfcfTTM') ?? current.pfcfShareTTM ?? null;
   return { roic, revenueGrowth, profitMargin, fcfMargin, peRatio, pfcfRatio };
 }
 
@@ -511,7 +529,16 @@ function computeIndustryLeaders(metrics, profiles) {
 
     const populations = {};
     for (const key of COMPARABLE_KEYS) {
-      populations[key] = symbols.map((s) => metrics[s][key]);
+      const raw = symbols.map((s) => metrics[s][key]);
+      // A negative P/E or P/FCF means negative earnings/cash flow — a real
+      // problem, not a bargain, even though it's numerically the smallest
+      // value for a "lower is better" metric. Excluded from the ranking
+      // population so it can't (a) make a money-losing company look like
+      // the cheapest/best in its sector once the direction flips below, or
+      // (b) distort other peers' ranks by sitting artificially low in the
+      // population. A candidate's own negative value is handled explicitly
+      // below instead of running it through this population at all.
+      populations[key] = LOWER_IS_BETTER.has(key) ? raw.filter((v) => v == null || v >= 0) : raw;
     }
 
     const eligible = symbols.filter((s) => COMPARABLE_KEYS.every((k) => metrics[s][k] !== null && metrics[s][k] !== undefined));
@@ -523,7 +550,8 @@ function computeIndustryLeaders(metrics, profiles) {
       const goodnessScores = [];
       let topMetricCount = 0;
       for (const key of COMPARABLE_KEYS) {
-        const pct = percentileRank(data[key], populations[key]);
+        const isNegativeLowerIsBetter = LOWER_IS_BETTER.has(key) && data[key] < 0;
+        const pct = isNegativeLowerIsBetter ? 100 : percentileRank(data[key], populations[key]);
         const goodness = LOWER_IS_BETTER.has(key) ? 100 - pct : pct;
         goodnessScores.push(goodness); // counts toward the composite regardless of the trend check below
         if (goodness >= TOP_METRIC_PERCENTILE && trendQualified[key]) topMetricCount++;
