@@ -260,7 +260,16 @@ const WC_EXCLUDE_KEYWORDS = [
 
 function extractDcfInputs(reportedFinancials) {
   if (!reportedFinancials.length) return null;
-  const annual = reportedFinancials.find((r) => r.form === '10-K') || reportedFinancials[0];
+  // Finnhub's financials-reported for a *ticker* (not CIK) can mix in
+  // filings from a completely unrelated older company that happened to
+  // share the same ticker symbol decades earlier ("ticker recycling") —
+  // verified live for CEG (2010-2011 filings from three different old CIKs
+  // alongside the real Constellation Energy Corp's, current since its 2022
+  // spinoff from Exelon). Filtered to the most recent report's CIK before
+  // picking a 10-K, so a `.find()` below can't land on the wrong company.
+  const currentCik = reportedFinancials[0].cik;
+  const sameCikFinancials = currentCik == null ? reportedFinancials : reportedFinancials.filter((r) => r.cik === currentCik);
+  const annual = sameCikFinancials.find((r) => r.form === '10-K') || sameCikFinancials[0];
   const { ic, bs, cf } = annual.report || {};
   if (!ic || !bs || !cf) return null;
 
