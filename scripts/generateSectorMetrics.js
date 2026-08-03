@@ -311,9 +311,12 @@ function extractDcfInputs(reportedFinancials) {
       const amortization = findByConcept(cf, ['us-gaap_AmortizationOfIntangibleAssets', 'us-gaap_Amortization']) ?? findByLabelKeywords(cf, ['amortization of intangible', 'amortization']);
       return depreciation != null || amortization != null ? (depreciation || 0) + (amortization || 0) : null;
     })();
+  // Verified live: Ford labels this "Capital spending" under concept
+  // us-gaap_PaymentsToAcquireProductiveAssets — a third distinct
+  // concept/label combination beyond the two already handled below.
   const capex =
-    findByConcept(cf, ['us-gaap_PaymentsToAcquirePropertyPlantAndEquipment']) ??
-    findByLabelKeywords(cf, ['purchases of property', 'payments for acquisition of property', 'payments to acquire property', 'purchases related to property', 'capital expenditures']);
+    findByConcept(cf, ['us-gaap_PaymentsToAcquirePropertyPlantAndEquipment', 'us-gaap_PaymentsToAcquireProductiveAssets']) ??
+    findByLabelKeywords(cf, ['purchases of property', 'payments for acquisition of property', 'payments to acquire property', 'purchases related to property', 'capital expenditures', 'capital spending']);
   const cash = findByConcept(bs, ['us-gaap_CashAndCashEquivalentsAtCarryingValue', 'us-gaap_CashAndCashEquivalentsAtFairValue', 'us-gaap_Cash']) ?? findByLabelKeywords(bs, ['cash and cash equivalents']);
   const totalDebt = sumDebt(bs);
 
