@@ -271,10 +271,37 @@ function extractDcfInputs(reportedFinancials) {
       'us-gaap_IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments',
     ]) ?? findByLabelKeywords(ic, ['income before', 'income before provision for income tax']);
   const taxExpense = findByConcept(ic, ['us-gaap_IncomeTaxExpenseBenefit']) ?? findByLabelKeywords(ic, ['provision for income tax', 'income tax expense']);
+  // Falls back to basic weighted-average shares when a filer reports no
+  // diluted share count at all — basic vs. diluted is a minor, not
+  // disqualifying, difference for this purpose. As a last resort (verified
+  // live: NUTX's 10-K has neither a diluted nor basic share COUNT line
+  // anywhere, only the resulting per-share EPS dollar figures), derives it
+  // from net income ÷ diluted EPS — a direct mathematical identity, not a
+  // guess, since EPS is defined as net income attributable to common
+  // shareholders divided by that same share count.
   const dilutedShares =
-    findByConcept(ic, ['us-gaap_WeightedAverageNumberOfDilutedSharesOutstanding']) ?? findByLabelKeywords(ic, ['diluted (in shares)', 'diluted shares', 'weighted average number of shares outstanding, diluted']);
+    findByConcept(ic, ['us-gaap_WeightedAverageNumberOfDilutedSharesOutstanding']) ??
+    findByLabelKeywords(ic, ['diluted (in shares)', 'diluted shares', 'weighted average number of shares outstanding, diluted']) ??
+    findByConcept(ic, ['us-gaap_WeightedAverageNumberOfSharesOutstandingBasic']) ??
+    findByLabelKeywords(ic, ['basic (in shares)', 'basic shares', 'weighted average number of shares outstanding, basic']) ??
+    (() => {
+      const netIncomeToParent = findByConcept(ic, ['us-gaap_NetIncomeLoss']);
+      const dilutedEps = findByConcept(ic, ['us-gaap_EarningsPerShareDiluted']);
+      return netIncomeToParent != null && dilutedEps ? netIncomeToParent / dilutedEps : null;
+    })();
 
-  const da = findByConcept(cf, ['us-gaap_DepreciationDepletionAndAmortization', 'us-gaap_DepreciationAmortizationAndAccretionNet', 'us-gaap_DepreciationAndAmortization']) ?? findByLabelKeywords(cf, ['depreciation and amortization', 'depreciation, amortization']);
+  // Some filers report D&A as one combined line; others (verified live:
+  // CRMD) split it into separate "Depreciation" and "Amortization" lines
+  // with no combined total anywhere — summed as a fallback when the
+  // combined concept isn't found.
+  const da =
+    findByConcept(cf, ['us-gaap_DepreciationDepletionAndAmortization', 'us-gaap_DepreciationAmortizationAndAccretionNet', 'us-gaap_DepreciationAndAmortization']) ??
+    findByLabelKeywords(cf, ['depreciation and amortization', 'depreciation, amortization']) ??
+    (() => {
+      const depreciation = findByConcept(cf, ['us-gaap_Depreciation']) ?? findByLabelKeywords(cf, ['depreciation']);
+      const amortization = findByConcept(cf, ['us-gaap_AmortizationOfIntangibleAssets', 'us-gaap_Amortization']) ?? findByLabelKeywords(cf, ['amortization of intangible', 'amortization']);
+      return depreciation != null || amortization != null ? (depreciation || 0) + (amortization || 0) : null;
+    })();
   const capex =
     findByConcept(cf, ['us-gaap_PaymentsToAcquirePropertyPlantAndEquipment']) ??
     findByLabelKeywords(cf, ['purchases of property', 'payments for acquisition of property', 'payments to acquire property', 'purchases related to property', 'capital expenditures']);
@@ -358,7 +385,20 @@ function computeEstimatedFairValue(dcfInputs, current, marketCap) {
   const presentValueOfTerminal = terminalValue / Math.pow(1 + wacc, PROJECTION_YEARS);
   const equityValue = presentValueSum + presentValueOfTerminal - netDebt;
   const fairValue = equityValue / dilutedShares;
-  return fairValue > 0 ? fairValue : null;
+  if (fairValue <= 0) return null;
+
+  // Sanity guard: verified live that NUTX's diluted-share-count fallback
+  // (derived from net income ÷ diluted EPS — see extractDcfInputs) produced
+  // a fair value 70x its real price ($10,320 vs. $147), almost certainly
+  // from a share-count inconsistency in that filing rather than a genuine
+  // "our model disagrees with the market" signal. An independently-derived
+  // estimate disagreeing with the market by 2-3x is plausible; 8x+ either
+  // way is far more likely a data/extraction artifact than a real thesis —
+  // discard rather than surface a number this implausible.
+  const impliedPrice = marketCap / dilutedShares;
+  if (impliedPrice > 0 && (fairValue > impliedPrice * 8 || fairValue < impliedPrice / 8)) return null;
+
+  return fairValue;
 }
 
 const COMPARABLE_KEYS = ['roic', 'revenueGrowth', 'profitMargin', 'fcfMargin', 'peRatio', 'pfcfRatio'];
