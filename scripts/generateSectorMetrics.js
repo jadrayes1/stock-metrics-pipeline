@@ -28,12 +28,15 @@
 // NVDA during development, it lands within roughly -20% to +25% of FMP's
 // figure for ordinary and high-growth names, which is a genuinely different
 // (not wrong, just independently-derived) number, not a precise match.
-// Skipped entirely for Banking/Insurance/Financial Services tickers — FCF-
-// based DCF is a poor fit for financial institutions (verified live: JPM's
-// own operating cash flow is deeply negative due to loan/trading-asset
-// accounting, not a normal operating cycle), so standard practice values
-// those with a completely different model (dividend discount / excess
-// return on book equity), which is out of scope here.
+// Computed for every ticker, including Banking/Insurance/Financial Services,
+// though FCF-based DCF is a known poor fit for financial institutions
+// (verified live: JPM's own operating cash flow is deeply negative due to
+// loan/trading-asset accounting, not a normal operating cycle — its
+// estimate came out 123% above FMP's own number in testing). Standard
+// practice values financials with a completely different model (dividend
+// discount / excess return on book equity) instead of FCF-based DCF, which
+// is out of scope here — treat estimates for these industries with extra
+// skepticism.
 //
 // Universe: Finnhub's full US symbol list (`/stock/symbol?exchange=US`),
 // filtered to primary listings on NASDAQ/NYSE/NYSE American (mic codes
@@ -77,7 +80,6 @@ const REQUEST_SPACING_MS = 1100; // ~54/min, under Finnhub's 60/min free-tier ca
 
 const ALLOWED_MICS = new Set(['XNAS', 'XNYS', 'XASE']); // NASDAQ, NYSE, NYSE American
 const ALLOWED_TYPES = new Set(['Common Stock', 'REIT']);
-const FINANCIAL_INDUSTRIES = new Set(['Banking', 'Insurance', 'Financial Services']);
 
 function readFinnhubApiKey() {
   // This script runs server-side (locally or in the pipeline repo's GitHub
@@ -522,8 +524,8 @@ async function main() {
   const apiKey = readFinnhubApiKey();
   const symbols = await fetchUniverse(apiKey);
   console.log(
-    `Fetching industry + fundamentals (+ DCF inputs for non-financial tickers) for ${symbols.length} tickers ` +
-      `(two or three requests each, rate-limited to stay under Finnhub's free-tier cap — this takes several hours)...`
+    `Fetching industry + fundamentals + DCF inputs for ${symbols.length} tickers ` +
+      `(three requests each, rate-limited to stay under Finnhub's free-tier cap — this takes several hours)...`
   );
 
   const metrics = {};
@@ -550,22 +552,19 @@ async function main() {
       };
 
       let estimatedFairValue = null;
-      const isFinancial = profile.industry && FINANCIAL_INDUSTRIES.has(profile.industry);
-      if (!isFinancial) {
-        await sleep(REQUEST_SPACING_MS);
-        try {
-          const reportedFinancials = await fetchReportedFinancialsFor(symbol, apiKey);
-          const dcfInputs = extractDcfInputs(reportedFinancials);
-          if (dcfInputs) {
-            estimatedFairValue = computeEstimatedFairValue(dcfInputs, current, profile.marketCapitalization);
-            if (estimatedFairValue != null) dcfComputed++;
-          }
-        } catch {
-          // A single ticker's oddly-shaped filing (or a failed request)
-          // shouldn't take down the whole run — just skip its estimate,
-          // same graceful-degradation philosophy as the rest of this
-          // pipeline. Its sector-percentile metrics are unaffected.
+      await sleep(REQUEST_SPACING_MS);
+      try {
+        const reportedFinancials = await fetchReportedFinancialsFor(symbol, apiKey);
+        const dcfInputs = extractDcfInputs(reportedFinancials);
+        if (dcfInputs) {
+          estimatedFairValue = computeEstimatedFairValue(dcfInputs, current, profile.marketCapitalization);
+          if (estimatedFairValue != null) dcfComputed++;
         }
+      } catch {
+        // A single ticker's oddly-shaped filing (or a failed request)
+        // shouldn't take down the whole run — just skip its estimate,
+        // same graceful-degradation philosophy as the rest of this
+        // pipeline. Its sector-percentile metrics are unaffected.
       }
 
       metrics[symbol] = { industry: profile.industry, ...extractMetricValues(current, quarterly), estimatedFairValue };

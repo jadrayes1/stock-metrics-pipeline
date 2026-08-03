@@ -7,11 +7,12 @@
 # for two reasons:
 #   1. A Gist's visibility doesn't depend on the repo that updates it, so
 #      the app's source can stay private while this feed stays public.
-#   2. This job takes ~4-5 hours (two or three Finnhub calls per ticker —
-#      the third, for the estimated-fair-value DCF, is skipped for
-#      Banking/Insurance/Financial Services tickers — rate-limited to stay
-#      under the free-tier 60/min cap). Public repos get unlimited free
-#      GitHub Actions minutes on standard runners; private repos only get a
+#   2. This job takes ~4-5 hours (three Finnhub calls per ticker — the
+#      third is for the estimated-fair-value DCF, computed for every
+#      ticker including Banking/Insurance/Financial Services, though FCF-
+#      based DCF is a known poor fit there — rate-limited to stay under the
+#      free-tier 60/min cap). Public repos get unlimited free GitHub
+#      Actions minutes on standard runners; private repos only get a
 #      limited monthly allowance, which a daily multi-hour job would blow
 #      through fast.
 #
