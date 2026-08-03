@@ -3,6 +3,11 @@
 # to a public Gist that the stock-analyzer app reads at runtime — see that
 # app's src/api/sectorComparison.js.
 #
+# Also runs scripts/auditMetricsCoverage.js right after — a fast, read-only
+# scan (no new API calls) of how many tickers are missing each of the 6
+# comparable metrics, and why, published to the same Gist as a second file
+# (coverageAudit.json) for tracking coverage over time.
+#
 # This lives in its OWN public repo, separate from the app's (private) repo,
 # for two reasons:
 #   1. A Gist's visibility doesn't depend on the repo that updates it, so
@@ -62,12 +67,17 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
         run: node scripts/generateSectorMetrics.js
 
+      - name: Audit metric coverage
+        run: node scripts/auditMetricsCoverage.js
+
       - name: Publish to gist
         env:
           GH_TOKEN: ${{ secrets.GIST_TOKEN }}
         run: |
           gh gist edit "${{ secrets.GIST_ID }}" --filename marketMetrics.json src/data/marketMetrics.json || \
           gh gist edit "${{ secrets.GIST_ID }}" --add src/data/marketMetrics.json
+          gh gist edit "${{ secrets.GIST_ID }}" --filename coverageAudit.json coverageAudit.json || \
+          gh gist edit "${{ secrets.GIST_ID }}" --add coverageAudit.json
 
       - name: Report failure
         if: failure()

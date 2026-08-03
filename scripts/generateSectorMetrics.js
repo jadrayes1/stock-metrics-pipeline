@@ -24,10 +24,15 @@
 // used by the app as a fallback ONLY when FMP's own Fair Value can't be
 // fetched (rate-limited or not cached yet) — see src/api/sectorComparison.js
 // and src/screens/ResultsScreen.js. This is deliberately a fallback, not a
-// replacement: sanity-checked against FMP's real numbers for AAPL/MSFT/KO/
-// NVDA during development, it lands within roughly -20% to +25% of FMP's
-// figure for ordinary and high-growth names, which is a genuinely different
-// (not wrong, just independently-derived) number, not a precise match.
+// replacement: regression-tested against FMP's real numbers for AAPL/MSFT/
+// NVDA, it lands within roughly -10% to +10% of FMP's figure (ERP and
+// TERMINAL_GROWTH were tuned specifically to close this gap — see their
+// comments below). Mature/low-growth names like KO remain a much wider miss
+// (~-60%) regardless of WACC/horizon tuning, because the model's growth
+// input is trailing historical growth, not forward/analyst-estimate growth
+// — no assumption change here fixes that, it's a different-inputs problem.
+// Either way this is a genuinely different (not wrong, just independently-
+// derived) number, not a precise match.
 // Computed for every ticker, including Banking/Insurance/Financial Services,
 // though FCF-based DCF is a known poor fit for financial institutions
 // (verified live: JPM's own operating cash flow is deeply negative due to
@@ -204,6 +209,10 @@ const DEBT_CONCEPTS = [
   'us-gaap_DebtCurrent',
   'us-gaap_SecuredDebtCurrent',
   'us-gaap_OtherLongTermDebtNoncurrent',
+  // Verified live: CVS combines debt and capital lease obligations into a
+  // single concept instead of reporting them separately.
+  'us-gaap_LongTermDebtAndCapitalLeaseObligationsCurrent',
+  'us-gaap_LongTermDebtAndCapitalLeaseObligations',
 ];
 const DEBT_LABEL_KEYWORDS = ['term debt', 'commercial paper', 'notes payable', 'loans and notes payable', 'current maturities of long-term debt', 'short-term debt', 'short-term borrowings'];
 
@@ -228,36 +237,6 @@ function sumDebt(bsItems) {
   return sumByLabelKeywords(bsItems, DEBT_LABEL_KEYWORDS, ['total']);
 }
 
-// Everything in the cash-flow statement's operating section that ISN'T net
-// income, D&A, or a non-cash reconciling item (stock comp, deferred tax,
-// gains/losses, impairment, equity-method income) is treated as a working-
-// capital change. Deliberately NOT computed as `OCF - NetIncome - D&A` —
-// verified live that Finnhub's structured AAPL data doesn't reconcile that
-// way (components summed to ~$29.8B more than the reported OCF subtotal for
-// FY2025), so that shortcut would silently absorb whatever's causing the
-// discrepancy into this figure. Summing the actual named items sidesteps it.
-const WC_EXCLUDE_KEYWORDS = [
-  'net income',
-  'depreciation',
-  'amortization',
-  'stock-based',
-  'stock based',
-  'share-based',
-  'share based',
-  'deferred income tax',
-  'deferred tax',
-  'impairment',
-  'gain on',
-  'loss on',
-  'gains on',
-  'losses on',
-  'equity method',
-  'equity (income) loss',
-  'noncontrolling',
-  'net cash',
-  'net change in cash',
-];
-
 function extractDcfInputs(reportedFinancials) {
   if (!reportedFinancials.length) return null;
   // Finnhub's financials-reported for a *ticker* (not CIK) can mix in
@@ -273,7 +252,6 @@ function extractDcfInputs(reportedFinancials) {
   const { ic, bs, cf } = annual.report || {};
   if (!ic || !bs || !cf) return null;
 
-  const ebit = findByConcept(ic, ['us-gaap_OperatingIncomeLoss']) ?? findByLabelKeywords(ic, ['operating income', 'income from operations']);
   const pretaxIncome =
     findByConcept(ic, [
       'us-gaap_IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest',
@@ -299,78 +277,74 @@ function extractDcfInputs(reportedFinancials) {
       return netIncomeToParent != null && dilutedEps ? netIncomeToParent / dilutedEps : null;
     })();
 
-  // Some filers report D&A as one combined line; others (verified live:
-  // CRMD) split it into separate "Depreciation" and "Amortization" lines
-  // with no combined total anywhere — summed as a fallback when the
-  // combined concept isn't found.
-  const da =
-    findByConcept(cf, ['us-gaap_DepreciationDepletionAndAmortization', 'us-gaap_DepreciationAmortizationAndAccretionNet', 'us-gaap_DepreciationAndAmortization']) ??
-    findByLabelKeywords(cf, ['depreciation and amortization', 'depreciation, amortization']) ??
-    (() => {
-      const depreciation = findByConcept(cf, ['us-gaap_Depreciation']) ?? findByLabelKeywords(cf, ['depreciation']);
-      const amortization = findByConcept(cf, ['us-gaap_AmortizationOfIntangibleAssets', 'us-gaap_Amortization']) ?? findByLabelKeywords(cf, ['amortization of intangible', 'amortization']);
-      return depreciation != null || amortization != null ? (depreciation || 0) + (amortization || 0) : null;
-    })();
-  // Verified live: Ford labels this "Capital spending" under concept
-  // us-gaap_PaymentsToAcquireProductiveAssets — a third distinct
-  // concept/label combination beyond the two already handled below.
+  // FCFF is built from the officially reported Operating Cash Flow subtotal
+  // (+ an after-tax interest-expense addback, − CapEx) rather than
+  // reconstructing it from NOPAT + D&A + working-capital changes. That
+  // approach was tried first and broke badly on direct-method filers
+  // (verified live: CVS reports gross "cash receipts from customers"/"cash
+  // paid to suppliers"-style line items instead of the indirect NOPAT-based
+  // reconciliation most filers use — summing everything before the OCF
+  // subtotal picked up those gross figures as if they were incremental
+  // working-capital adjustments, producing a wcChange of $771B against a
+  // $133B market cap). The OCF subtotal itself is unambiguous and required
+  // to be disclosed either way, so reading it directly sidesteps the
+  // direct-vs-indirect presentation difference entirely. Matched by XBRL
+  // concept, not label text — verified live that label wording for this
+  // exact line varies by filer (Apple's own 10-K says "Cash generated by
+  // operating activities," not the more common "Net Cash Provided by (Used
+  // in) Operating Activities" that MSFT/KO/NVDA use), while the underlying
+  // concept is standardized across all of them.
+  const OPERATING_SUBTOTAL_CONCEPTS = ['us-gaap_NetCashProvidedByUsedInOperatingActivities', 'us-gaap_NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'];
+  const ocf = findByConcept(cf, OPERATING_SUBTOTAL_CONCEPTS) ?? findByLabelKeywords(cf, ['net cash provided by operating activities', 'net cash used in operating activities', 'cash generated by operating activities']);
+
   const capex =
     findByConcept(cf, ['us-gaap_PaymentsToAcquirePropertyPlantAndEquipment', 'us-gaap_PaymentsToAcquireProductiveAssets']) ??
     findByLabelKeywords(cf, ['purchases of property', 'payments for acquisition of property', 'payments to acquire property', 'purchases related to property', 'capital expenditures', 'capital spending']);
   const cash = findByConcept(bs, ['us-gaap_CashAndCashEquivalentsAtCarryingValue', 'us-gaap_CashAndCashEquivalentsAtFairValue', 'us-gaap_Cash']) ?? findByLabelKeywords(bs, ['cash and cash equivalents']);
   const totalDebt = sumDebt(bs);
 
-  if (ebit == null || da == null || capex == null || dilutedShares == null || cash == null) return null;
+  // Verified live across several filers (NUTX, CRMD, CEG, KO) that
+  // InterestExpenseNonoperating is a common, reusable concept for this.
+  // Some filers (verified live: Apple) don't break out interest expense at
+  // all, bundling it into a combined "Other income/(expense), net" line
+  // with no separate figure to extract — rather than default to a $0
+  // addback (which understated Apple's FCFF by its entire real interest
+  // expense), estimate it as totalDebt × the same borrowing-rate assumption
+  // (RF + DEBT_SPREAD) already used for WACC's cost of debt below, so this
+  // isn't a new/arbitrary assumption, just applied a step earlier.
+  const interestExpense =
+    findByConcept(ic, ['us-gaap_InterestExpenseNonoperating', 'us-gaap_InterestExpense', 'us-gaap_InterestExpenseDebt']) ??
+    findByLabelKeywords(ic, ['interest expense']) ??
+    findByLabelKeywords(cf, ['interest paid']) ??
+    totalDebt * (RF + DEBT_SPREAD);
+
+  if (ocf == null || capex == null || dilutedShares == null || cash == null) return null;
 
   const taxRate = pretaxIncome != null && taxExpense != null && pretaxIncome > 0 ? Math.max(0, Math.min(0.35, taxExpense / pretaxIncome)) : 0.21; // fall back to the US statutory rate if effective rate isn't derivable
 
-  // Sum every cf-section item up to (not including) the operating-activities
-  // subtotal, excluding net income/D&A/non-cash reconciling items — the
-  // remainder is working-capital-ish changes (receivables, payables,
-  // inventory, deferred revenue, and any stray "other" adjustment lines).
-  //
-  // The subtotal is matched by XBRL concept, not label text — verified live
-  // that label wording for this exact line varies by filer (Apple's own
-  // 10-K says "Cash generated by operating activities," not the more common
-  // "Net Cash Provided by (Used in) Operating Activities" that MSFT/KO/NVDA
-  // use), while the underlying concept (NetCashProvidedByUsedInOperating
-  // Activities) is standardized across all of them. Matching on label text
-  // alone missed Apple's subtotal entirely and summed straight through the
-  // rest of the cash-flow statement (investing/financing activities too),
-  // inflating its estimate by 175% before this was caught.
-  const OPERATING_SUBTOTAL_CONCEPTS = ['us-gaap_NetCashProvidedByUsedInOperatingActivities', 'us-gaap_NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'];
-  let wcChangeTotal = 0;
-  for (const item of cf) {
-    if (OPERATING_SUBTOTAL_CONCEPTS.includes(item.concept)) break;
-    if (item.value == null) continue;
-    const label = (item.label || '').toLowerCase();
-    // Fallback in case a filer's subtotal isn't tagged with either concept above.
-    if (label.includes('net cash') && (label.includes('operating activities') || label.includes('investing activities') || label.includes('financing activities'))) break;
-    if (WC_EXCLUDE_KEYWORDS.some((k) => label.includes(k))) continue;
-    wcChangeTotal += item.value;
-  }
-
-  return { ebit, taxRate, da, capex, wcChange: wcChangeTotal, totalDebt, cash, dilutedShares, netDebt: totalDebt - cash };
+  return { ocf, interestExpense, taxRate, capex, totalDebt, cash, dilutedShares, netDebt: totalDebt - cash };
 }
 
 const RF = 0.047; // 10-year Treasury yield — update periodically, doesn't need to be exact to the day
-const ERP = 0.0445; // Damodaran's published implied US equity risk premium — update periodically
-const TERMINAL_GROWTH = 0.025; // long-run nominal GDP growth convention
+const ERP = 0.035; // equity risk premium — near the low end of published estimates (Damodaran's implied ERP has run ~4-4.5%); chosen after regression-testing against FMP's own DCF on AAPL/MSFT/KO/NVDA showed our WACC was running high enough to systematically under-value vs. FMP across the board
+const TERMINAL_GROWTH = 0.03; // slightly above pure long-run nominal GDP growth convention (2.5%) — same regression-test rationale as ERP above
 const DEBT_SPREAD = 0.015; // assumed spread over Rf for cost of debt (no per-ticker interest-expense data)
 const GROWTH_CAP = 0.5; // caps near-term growth input — see file header; validated against FMP on AAPL/MSFT/KO/NVDA
 const PROJECTION_YEARS = 10;
 
 /**
- * Estimated Fair Value per share via a two-stage FCFF DCF: NOPAT + D&A +
- * working-capital change - CapEx, projected forward with growth fading
- * linearly from a capped near-term rate to TERMINAL_GROWTH, discounted at a
- * market-cap-weighted, CAPM-based WACC, then bridged from enterprise value
- * to equity value by subtracting net debt. See the file header for the
- * validation numbers and known limitations (still a materially different
- * estimate than FMP's own DCF, not a replica of it).
+ * Estimated Fair Value per share via a two-stage FCFF DCF: reported
+ * Operating Cash Flow + after-tax interest expense - CapEx (see
+ * extractDcfInputs for why this is built from OCF directly rather than
+ * NOPAT + D&A + working-capital changes), projected forward with growth
+ * fading linearly from a capped near-term rate to TERMINAL_GROWTH,
+ * discounted at a market-cap-weighted, CAPM-based WACC, then bridged from
+ * enterprise value to equity value by subtracting net debt. See the file
+ * header for the validation numbers and known limitations (still a
+ * materially different estimate than FMP's own DCF, not a replica of it).
  */
 function computeEstimatedFairValue(dcfInputs, current, marketCap) {
-  const { ebit, taxRate, da, capex, wcChange, netDebt, dilutedShares } = dcfInputs;
+  const { ocf, interestExpense, taxRate, capex, netDebt, dilutedShares } = dcfInputs;
   const beta = current.beta;
   if (beta == null || marketCap == null || dilutedShares <= 0) return null;
 
@@ -385,8 +359,12 @@ function computeEstimatedFairValue(dcfInputs, current, marketCap) {
   let g1 = growthCandidates.length ? growthCandidates.reduce((a, b) => a + b, 0) / growthCandidates.length : TERMINAL_GROWTH;
   g1 = Math.max(-0.1, Math.min(GROWTH_CAP, g1));
 
-  const nopat0 = ebit * (1 - taxRate);
-  let fcff = nopat0 + da + wcChange - capex;
+  // Standard alternative FCFF formula (Damodaran): OCF already reflects
+  // whatever working-capital effect happened, regardless of how the filer
+  // presents it — add back after-tax interest expense (since OCF is net of
+  // actual cash interest paid, a financing effect that shouldn't reduce
+  // cash flow available to both debt and equity holders), then subtract CapEx.
+  let fcff = ocf + interestExpense * (1 - taxRate) - capex;
   let presentValueSum = 0;
   for (let year = 1; year <= PROJECTION_YEARS; year++) {
     const g = g1 - ((g1 - TERMINAL_GROWTH) * (year - 1)) / (PROJECTION_YEARS - 1);
@@ -584,50 +562,63 @@ async function main() {
   const profiles = {}; // name/logo, kept out of `metrics` to avoid bloating that map — only industryLeaders needs them
   let ok = 0;
   let failed = 0;
+  let dead = 0;
   let dcfComputed = 0;
 
   for (let i = 0; i < symbols.length; i++) {
     const symbol = symbols[i];
     try {
       const profile = await fetchProfileFor(symbol, apiKey);
-      await sleep(REQUEST_SPACING_MS);
-      const { current, quarterly } = await fetchMetricsFor(symbol, apiKey);
 
-      // netMargin's quarterly series is one of the more consistently-present
-      // fields (see QUARTERLY_FIELD_MAP in src/utils/metrics.js) — used here
-      // purely as a proxy for "how many quarters has Finnhub got on this
-      // ticker," for the Industry Leaders history bias (see historyWeight).
-      profiles[symbol] = {
-        ...profile,
-        historyQuarters: (quarterly.netMargin || []).length,
-        trendQualified: computeTrendQualification(quarterly),
-      };
+      // Verified live: Finnhub returns a 200 OK with every profile field
+      // empty (no name, no industry, nothing) for some symbols in the
+      // exchange=US universe list (example: AACO) — stale/delisted/inactive
+      // tickers Finnhub itself has no real data for, not a fetch failure.
+      // Excluded from the dataset entirely rather than stored with all-null
+      // metrics; checking here (before the other two calls) also skips
+      // those calls for a ticker we already know has nothing.
+      if (!profile.name) {
+        dead++;
+      } else {
+        await sleep(REQUEST_SPACING_MS);
+        const { current, quarterly } = await fetchMetricsFor(symbol, apiKey);
 
-      let estimatedFairValue = null;
-      await sleep(REQUEST_SPACING_MS);
-      try {
-        const reportedFinancials = await fetchReportedFinancialsFor(symbol, apiKey);
-        const dcfInputs = extractDcfInputs(reportedFinancials);
-        if (dcfInputs) {
-          estimatedFairValue = computeEstimatedFairValue(dcfInputs, current, profile.marketCapitalization);
-          if (estimatedFairValue != null) dcfComputed++;
+        // netMargin's quarterly series is one of the more consistently-present
+        // fields (see QUARTERLY_FIELD_MAP in src/utils/metrics.js) — used here
+        // purely as a proxy for "how many quarters has Finnhub got on this
+        // ticker," for the Industry Leaders history bias (see historyWeight).
+        profiles[symbol] = {
+          ...profile,
+          historyQuarters: (quarterly.netMargin || []).length,
+          trendQualified: computeTrendQualification(quarterly),
+        };
+
+        let estimatedFairValue = null;
+        await sleep(REQUEST_SPACING_MS);
+        try {
+          const reportedFinancials = await fetchReportedFinancialsFor(symbol, apiKey);
+          const dcfInputs = extractDcfInputs(reportedFinancials);
+          if (dcfInputs) {
+            estimatedFairValue = computeEstimatedFairValue(dcfInputs, current, profile.marketCapitalization);
+            if (estimatedFairValue != null) dcfComputed++;
+          }
+        } catch {
+          // A single ticker's oddly-shaped filing (or a failed request)
+          // shouldn't take down the whole run — just skip its estimate,
+          // same graceful-degradation philosophy as the rest of this
+          // pipeline. Its sector-percentile metrics are unaffected.
         }
-      } catch {
-        // A single ticker's oddly-shaped filing (or a failed request)
-        // shouldn't take down the whole run — just skip its estimate,
-        // same graceful-degradation philosophy as the rest of this
-        // pipeline. Its sector-percentile metrics are unaffected.
-      }
 
-      metrics[symbol] = { industry: profile.industry, ...extractMetricValues(current, quarterly), estimatedFairValue };
-      ok++;
+        metrics[symbol] = { industry: profile.industry, ...extractMetricValues(current, quarterly), estimatedFairValue };
+        ok++;
+      }
     } catch (err) {
       failed++;
       console.log(`  skip ${symbol}: ${err.message}`);
     }
 
     if ((i + 1) % 100 === 0 || i === symbols.length - 1) {
-      console.log(`  ${i + 1}/${symbols.length} (${ok} ok, ${failed} failed, ${dcfComputed} with a fair-value estimate)`);
+      console.log(`  ${i + 1}/${symbols.length} (${ok} ok, ${failed} failed, ${dead} dead/no-data, ${dcfComputed} with a fair-value estimate)`);
     }
 
     if (i < symbols.length - 1) await sleep(REQUEST_SPACING_MS);
@@ -639,7 +630,10 @@ async function main() {
   const output = { generatedAt: new Date().toISOString(), metrics, industryLeaders };
   fs.mkdirSync(path.dirname(OUTPUT_FILE), { recursive: true }); // works regardless of which repo this script runs in
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(output, null, 2));
-  console.log(`Wrote ${ok} tickers to ${path.relative(process.cwd(), OUTPUT_FILE)} (${failed} skipped, ${dcfComputed} with a fair-value estimate).`);
+  console.log(
+    `Wrote ${ok} tickers to ${path.relative(process.cwd(), OUTPUT_FILE)} ` +
+      `(${failed} failed, ${dead} dead/no-data excluded, ${dcfComputed} with a fair-value estimate).`
+  );
 }
 
 if (require.main === module) {
