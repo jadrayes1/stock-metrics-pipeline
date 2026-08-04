@@ -135,12 +135,12 @@ function latestRevenueGrowthFromQuarterly(quarterly) {
 // ticker with a Finnhub-side gap in those two shows null in this bulk
 // dataset even though the app can still fill it in on-demand for that one
 // ticker when someone looks it up.
-function extractMetricValues(current, quarterly) {
+function extractMetricValues(current, quarterly, impliedPrice) {
   const roic = latestQuarterly(quarterly, 'roicTTM') ?? (current.roiTTM != null ? current.roiTTM / 100 : null);
   const revenueGrowth = current.revenueGrowthTTMYoy != null ? current.revenueGrowthTTMYoy / 100 : latestRevenueGrowthFromQuarterly(quarterly);
   const profitMargin = current.netProfitMarginTTM != null ? current.netProfitMarginTTM / 100 : null;
   const fcfMargin = latestQuarterly(quarterly, 'fcfMargin');
-  const peRatio = current.peTTM ?? null;
+  const peRatio = current.peTTM ?? (impliedPrice != null && current.epsTTM ? impliedPrice / current.epsTTM : null);
   const pfcfRatio = latestQuarterly(quarterly, 'pfcfTTM') ?? current.pfcfShareTTM ?? null;
   return { roic, revenueGrowth, profitMargin, fcfMargin, peRatio, pfcfRatio };
 }
@@ -168,7 +168,18 @@ async function fetchProfileFor(symbol, apiKey) {
   // raw-dollar units. Pulled from the profile response specifically so the
   // DCF estimate doesn't need its own /quote call just for a price.
   const marketCapitalization = typeof data?.marketCapitalization === 'number' ? data.marketCapitalization * 1e6 : null;
-  return { industry, name: data?.name || null, logo: data?.logo || null, marketCapitalization };
+  const shareOutstanding = typeof data?.shareOutstanding === 'number' ? data.shareOutstanding * 1e6 : null;
+  return { industry, name: data?.name || null, logo: data?.logo || null, marketCapitalization, shareOutstanding };
+}
+
+// marketCap ÷ shares outstanding, both already in the profile response —
+// close enough to a live quote for P/E's negative-EPS fallback below
+// without this pipeline needing its own /quote call for every one of
+// ~5,140 tickers (verified live: for AAL, this gives $16.04 vs. the real
+// quote's $16.58 — same P/E sign and magnitude either way, which is all
+// this fallback needs to distinguish "negative earnings" from "no data").
+function impliedPriceFromProfile(profile) {
+  return profile.marketCapitalization != null && profile.shareOutstanding > 0 ? profile.marketCapitalization / profile.shareOutstanding : null;
 }
 
 async function fetchReportedFinancialsFor(symbol, apiKey) {
@@ -651,7 +662,7 @@ async function main() {
           // pipeline. Its sector-percentile metrics are unaffected.
         }
 
-        metrics[symbol] = { industry: profile.industry, ...extractMetricValues(current, quarterly), estimatedFairValue };
+        metrics[symbol] = { industry: profile.industry, ...extractMetricValues(current, quarterly, impliedPriceFromProfile(profile)), estimatedFairValue };
         ok++;
       }
     } catch (err) {
