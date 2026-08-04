@@ -231,6 +231,20 @@ const DEBT_CONCEPTS = [
   // single concept instead of reporting them separately.
   'us-gaap_LongTermDebtAndCapitalLeaseObligationsCurrent',
   'us-gaap_LongTermDebtAndCapitalLeaseObligations',
+  // Verified live: Capital One (COF) splits its debt across these three
+  // concepts (Securitized debt obligations / Senior and subordinated notes
+  // / Other borrowings) with none of the concepts above present at all,
+  // producing totalDebt = 0 for a company that actually carries ~$50B —
+  // which in turn made netDebt hugely NEGATIVE (cash minus zero debt),
+  // inflating equity value by the entire "phantom" net-debt swing. Deposits
+  // (a much larger balance-sheet liability for any bank) are deliberately
+  // NOT included here — unlike these, deposits fund the loan book as a
+  // normal part of a bank's operating liabilities, not a discretionary
+  // financing choice, so they aren't "debt" in the capital-structure sense
+  // this list is for.
+  'us-gaap_SecuredDebt',
+  'us-gaap_UnsecuredDebt',
+  'us-gaap_OtherBorrowings',
 ];
 const DEBT_LABEL_KEYWORDS = ['term debt', 'commercial paper', 'notes payable', 'loans and notes payable', 'current maturities of long-term debt', 'short-term debt', 'short-term borrowings'];
 
