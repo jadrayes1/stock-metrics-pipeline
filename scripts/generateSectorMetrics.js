@@ -41,7 +41,18 @@
 // practice values financials with a completely different model (dividend
 // discount / excess return on book equity) instead of FCF-based DCF, which
 // is out of scope here — treat estimates for these industries with extra
-// skepticism.
+// skepticism. Financial-industry tickers are held to a tighter DCF sanity
+// bound (2.5x implied price vs. 8x for everyone else — see
+// computeEstimatedFairValue) since even correctly-extracted inputs
+// routinely produce an implausible estimate for this sector.
+//
+// Also reconstructs FCF Margin from raw SEC filings (see
+// computeLatestFcfMargin) for the ~1,367 tickers (as of a recent coverage
+// audit) where Finnhub's own quarterly fcfMargin data is missing entirely —
+// mirrors the app's on-demand fallback (buildFcfMarginFromFilings in
+// src/utils/metrics.js) so this bulk dataset doesn't have the same gap the
+// app already fixed for individual lookups. Skipped for Banking/Insurance/
+// Financial Services, where FCF isn't a meaningful concept.
 //
 // Universe: Finnhub's full US symbol list (`/stock/symbol?exchange=US`),
 // filtered to primary listings on NASDAQ/NYSE/NYSE American (mic codes
@@ -368,6 +379,161 @@ function extractDcfInputs(reportedFinancials) {
   return { ocf, interestExpense, taxRate, capex, totalDebt, cash, dilutedShares, netDebt: totalDebt - cash };
 }
 
+// ---------------------------------------------------------------------------
+// FCF Margin reconstruction — for tickers where Finnhub's own quarterly
+// fcfMargin data is missing (verified live: CoreWeave/CRWV, and ~1,367 of
+// ~5,140 tickers as of a recent coverage audit). Mirrors
+// buildFcfMarginFromFilings in src/utils/metrics.js (see that file for the
+// full rationale behind each piece) — only the LATEST TTM value is needed
+// here, not a full trend, since this pipeline stores one current value per
+// metric, not a history. Needs QUARTERLY financials-reported (unlike
+// extractDcfInputs above, which only needs the annual 10-K) — fetched
+// separately, only for tickers with this specific gap (see the main loop),
+// so this doesn't add a call for the ~3,770 tickers that don't need it.
+
+const REVENUE_CONCEPT_CANDIDATES = ['us-gaap_RevenuesNetOfInterestExpense', 'us-gaap_Revenues', 'us-gaap_RevenueFromContractWithCustomerExcludingAssessedTax'];
+
+function findReportedRevenue(icItems) {
+  for (const concept of REVENUE_CONCEPT_CANDIDATES) {
+    const match = icItems.find((item) => item.concept === concept);
+    if (match) return match.value;
+  }
+  const labelMatch = icItems.find((item) => /^total\b.*revenue|^revenue$/i.test(item.label || ''));
+  if (labelMatch) return labelMatch.value;
+
+  // Mirrors findReportedRevenue in src/utils/metrics.js — some banks
+  // (verified live: Capital One/COF) report no combined revenue line at
+  // all; Net interest income + non-interest income is the standard proxy.
+  // Included here for parity even though FCF Margin reconstruction skips
+  // financial-industry tickers entirely below — kept in sync regardless.
+  const netInterestIncome = icItems.find((item) => item.concept === 'us-gaap_InterestIncomeExpenseNet');
+  const nonInterestIncome = icItems.find((item) => item.concept === 'us-gaap_NoninterestIncome');
+  if (netInterestIncome && nonInterestIncome) {
+    return netInterestIncome.value + nonInterestIncome.value;
+  }
+
+  return null;
+}
+
+function findReportedOperatingCashFlowQ(cfItems) {
+  const match = cfItems.find((item) => item.concept === 'us-gaap_NetCashProvidedByUsedInOperatingActivities');
+  if (match) return match.value;
+  const labelMatch = cfItems.find((item) => /net cash.*operating activities/i.test(item.label || ''));
+  return labelMatch ? labelMatch.value : null;
+}
+
+// A separate copy from extractDcfInputs's inline capex extraction above
+// (which stays annual-only, unchanged) — this one also recognizes REITs'
+// PaymentsForCapitalImprovements (see findReportedCapex in
+// src/utils/metrics.js for the full REIT-vs-acquisition-spending rationale).
+function findReportedCapexQ(cfItems) {
+  for (const concept of [
+    'us-gaap_PaymentsToAcquirePropertyPlantAndEquipment',
+    'us-gaap_PaymentsToAcquireProductiveAssets',
+    'us-gaap_PaymentsForCapitalImprovements',
+  ]) {
+    const match = cfItems.find((item) => item.concept === concept);
+    if (match) return match.value;
+  }
+  const labelMatch = cfItems.find((item) =>
+    /purchases? of property|payments? (for|to) acquire property|capital expenditures|capital spending|capital improvements/i.test(item.label || '')
+  );
+  return labelMatch ? labelMatch.value : null;
+}
+
+// Mirrors decumulateYtdByYear in src/utils/metrics.js — a 10-Q reports P&L
+// and cash-flow line items as year-to-date cumulative, so each quarter is
+// de-cumulated against the prior one to get a standalone 3-month figure;
+// Q4 = the 10-K's full-year figure minus the Q3 YTD figure, since there's
+// no standalone Q4 filing. CIK-filtered first to guard against "ticker
+// recycling" (an old, unrelated company that once shared this symbol).
+function decumulateYtdByYear(quarterlyReports, annualReports, findValue, section = 'ic') {
+  const currentCik = quarterlyReports?.[0]?.cik ?? annualReports?.[0]?.cik;
+  const sameCik = (r) => currentCik == null || r.cik === currentCik;
+  quarterlyReports = (quarterlyReports || []).filter(sameCik);
+  annualReports = (annualReports || []).filter(sameCik);
+
+  const ytdByYear = {};
+  const annualByYear = {};
+
+  for (const q of quarterlyReports || []) {
+    if (!q?.quarter) continue;
+    const value = findValue(q.report?.[section] || []);
+    if (value == null) continue;
+    ytdByYear[q.year] = ytdByYear[q.year] || {};
+    ytdByYear[q.year][q.quarter] = value;
+  }
+  for (const a of annualReports || []) {
+    const value = findValue(a?.report?.[section] || []);
+    if (value != null) annualByYear[a.year] = value;
+  }
+
+  const standalone = {};
+  for (const [yearStr, q] of Object.entries(ytdByYear)) {
+    const year = Number(yearStr);
+    if (q[1] != null) standalone[`${year}-1`] = q[1];
+    if (q[1] != null && q[2] != null) standalone[`${year}-2`] = q[2] - q[1];
+    if (q[2] != null && q[3] != null) standalone[`${year}-3`] = q[3] - q[2];
+    if (q[3] != null && annualByYear[year] != null) standalone[`${year}-4`] = annualByYear[year] - q[3];
+  }
+  return standalone;
+}
+
+// Mirrors isConsecutiveQuarterWindow in src/utils/metrics.js — a TTM figure
+// sums 4 quarters, but the 4 entries at consecutive ARRAY positions aren't
+// necessarily consecutive CALENDAR quarters if some were excluded upstream
+// (a missing filing, or a de-cumulation gap). Verified live this mattered
+// for Boeing's ROIC (a different metric, same underlying risk) — summing a
+// stretched-out, non-consecutive window produced a nonsensical 10,334%
+// figure. Skips any window that isn't genuinely 4 back-to-back quarters.
+function isConsecutiveQuarterWindow(window) {
+  for (let i = 1; i < window.length; i++) {
+    const prev = window[i - 1];
+    const curr = window[i];
+    const isNextQuarter = curr.year === prev.year && curr.quarter === prev.quarter + 1;
+    const isNewYearQ1 = curr.year === prev.year + 1 && prev.quarter === 4 && curr.quarter === 1;
+    if (!isNextQuarter && !isNewYearQ1) return false;
+  }
+  return true;
+}
+
+/**
+ * Latest TTM FCF Margin ((OCF − CapEx) ÷ Revenue) from raw SEC filings —
+ * mirrors buildFcfMarginFromFilings in src/utils/metrics.js, but walks
+ * backward from the most recent quarter and returns as soon as it finds one
+ * valid (genuinely consecutive) TTM window, since only the latest value is
+ * needed here.
+ */
+function computeLatestFcfMargin(quarterlyReports, annualReports) {
+  const ocf = decumulateYtdByYear(quarterlyReports, annualReports, findReportedOperatingCashFlowQ, 'cf');
+  const capex = decumulateYtdByYear(quarterlyReports, annualReports, findReportedCapexQ, 'cf');
+  const revenue = decumulateYtdByYear(quarterlyReports, annualReports, findReportedRevenue, 'ic');
+
+  const standaloneQuarters = Object.keys(ocf)
+    .filter((key) => capex[key] != null && revenue[key])
+    .map((key) => {
+      const [year, quarter] = key.split('-').map(Number);
+      return { year, quarter, fcf: ocf[key] - capex[key], revenue: revenue[key] };
+    })
+    .sort((a, b) => a.year - b.year || a.quarter - b.quarter);
+
+  for (let i = standaloneQuarters.length - 1; i >= 3; i--) {
+    const window = standaloneQuarters.slice(i - 3, i + 1);
+    if (!isConsecutiveQuarterWindow(window)) continue;
+    const ttmFcf = window.reduce((sum, q) => sum + q.fcf, 0);
+    const ttmRevenue = window.reduce((sum, q) => sum + q.revenue, 0);
+    if (ttmRevenue) return ttmFcf / ttmRevenue;
+  }
+  return null;
+}
+
+async function fetchReportedFinancialsQuarterlyFor(symbol, apiKey) {
+  const res = await fetch(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${symbol}&freq=quarterly&token=${apiKey}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data?.data) ? data.data : [];
+}
+
 const RF = 0.047; // 10-year Treasury yield — update periodically, doesn't need to be exact to the day
 const ERP = 0.035; // equity risk premium — near the low end of published estimates (Damodaran's implied ERP has run ~4-4.5%); chosen after regression-testing against FMP's own DCF on AAPL/MSFT/KO/NVDA showed our WACC was running high enough to systematically under-value vs. FMP across the board
 const TERMINAL_GROWTH = 0.03; // slightly above pure long-run nominal GDP growth convention (2.5%) — same regression-test rationale as ERP above
@@ -628,7 +794,7 @@ async function main() {
   const symbols = await fetchUniverse(apiKey);
   console.log(
     `Fetching industry + fundamentals + DCF inputs for ${symbols.length} tickers ` +
-      `(three requests each, rate-limited to stay under Finnhub's free-tier cap — this takes several hours)...`
+      `(three requests each, a fourth for tickers needing FCF Margin reconstructed from filings, rate-limited to stay under Finnhub's free-tier cap — this takes several hours)...`
   );
 
   const metrics = {};
@@ -637,6 +803,7 @@ async function main() {
   let failed = 0;
   let dead = 0;
   let dcfComputed = 0;
+  let fcfMarginReconstructed = 0;
 
   for (let i = 0; i < symbols.length; i++) {
     const symbol = symbols[i];
@@ -667,10 +834,11 @@ async function main() {
         };
 
         let estimatedFairValue = null;
+        let annualReportedFinancials = [];
         await sleep(REQUEST_SPACING_MS);
         try {
-          const reportedFinancials = await fetchReportedFinancialsFor(symbol, apiKey);
-          const dcfInputs = extractDcfInputs(reportedFinancials);
+          annualReportedFinancials = await fetchReportedFinancialsFor(symbol, apiKey);
+          const dcfInputs = extractDcfInputs(annualReportedFinancials);
           if (dcfInputs) {
             estimatedFairValue = computeEstimatedFairValue(dcfInputs, current, profile.marketCapitalization, profile.industry);
             if (estimatedFairValue != null) dcfComputed++;
@@ -682,7 +850,30 @@ async function main() {
           // pipeline. Its sector-percentile metrics are unaffected.
         }
 
-        metrics[symbol] = { industry: profile.industry, ...extractMetricValues(current, quarterly, impliedPriceFromProfile(profile)), estimatedFairValue };
+        const values = extractMetricValues(current, quarterly, impliedPriceFromProfile(profile));
+
+        // FCF Margin reconstruction: only for the gap this specifically
+        // fixes (Finnhub's own quarterly fcfMargin missing), and only for
+        // non-financial tickers (FCF isn't a meaningful concept for banks —
+        // see isFinancialIndustry). One extra Finnhub call, only paid for
+        // gap tickers, not all ~5,140 — reuses annualReportedFinancials
+        // (already fetched above for the DCF estimate) rather than fetching
+        // it again; only the quarterly side is new here.
+        if (values.fcfMargin == null && !isFinancialIndustry(profile.industry)) {
+          await sleep(REQUEST_SPACING_MS);
+          try {
+            const quarterlyFinancials = await fetchReportedFinancialsQuarterlyFor(symbol, apiKey);
+            const reconstructed = computeLatestFcfMargin(quarterlyFinancials, annualReportedFinancials);
+            if (reconstructed != null) {
+              values.fcfMargin = reconstructed;
+              fcfMarginReconstructed++;
+            }
+          } catch {
+            // Same graceful-degradation philosophy as the DCF estimate above.
+          }
+        }
+
+        metrics[symbol] = { industry: profile.industry, ...values, estimatedFairValue };
         ok++;
       }
     } catch (err) {
@@ -691,7 +882,9 @@ async function main() {
     }
 
     if ((i + 1) % 100 === 0 || i === symbols.length - 1) {
-      console.log(`  ${i + 1}/${symbols.length} (${ok} ok, ${failed} failed, ${dead} dead/no-data, ${dcfComputed} with a fair-value estimate)`);
+      console.log(
+        `  ${i + 1}/${symbols.length} (${ok} ok, ${failed} failed, ${dead} dead/no-data, ${dcfComputed} with a fair-value estimate, ${fcfMarginReconstructed} FCF margins reconstructed)`
+      );
     }
 
     if (i < symbols.length - 1) await sleep(REQUEST_SPACING_MS);
@@ -705,7 +898,7 @@ async function main() {
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(output, null, 2));
   console.log(
     `Wrote ${ok} tickers to ${path.relative(process.cwd(), OUTPUT_FILE)} ` +
-      `(${failed} failed, ${dead} dead/no-data excluded, ${dcfComputed} with a fair-value estimate).`
+      `(${failed} failed, ${dead} dead/no-data excluded, ${dcfComputed} with a fair-value estimate, ${fcfMarginReconstructed} FCF margins reconstructed from filings).`
   );
 }
 
