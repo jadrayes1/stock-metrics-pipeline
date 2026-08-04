@@ -375,6 +375,12 @@ const DEBT_SPREAD = 0.015; // assumed spread over Rf for cost of debt (no per-ti
 const GROWTH_CAP = 0.5; // caps near-term growth input — see file header; validated against FMP on AAPL/MSFT/KO/NVDA
 const PROJECTION_YEARS = 10;
 
+// Mirrors FINANCIAL_INDUSTRIES/isFinancialIndustry in src/utils/metrics.js.
+const FINANCIAL_INDUSTRIES = new Set(['Banking', 'Insurance', 'Financial Services']);
+function isFinancialIndustry(industry) {
+  return !!industry && FINANCIAL_INDUSTRIES.has(industry);
+}
+
 /**
  * Estimated Fair Value per share via a two-stage FCFF DCF: reported
  * Operating Cash Flow + after-tax interest expense - CapEx (see
@@ -386,7 +392,7 @@ const PROJECTION_YEARS = 10;
  * header for the validation numbers and known limitations (still a
  * materially different estimate than FMP's own DCF, not a replica of it).
  */
-function computeEstimatedFairValue(dcfInputs, current, marketCap) {
+function computeEstimatedFairValue(dcfInputs, current, marketCap, industry) {
   const { ocf, interestExpense, taxRate, capex, netDebt, dilutedShares } = dcfInputs;
   const beta = current.beta;
   if (beta == null || marketCap == null || dilutedShares <= 0) return null;
@@ -428,8 +434,22 @@ function computeEstimatedFairValue(dcfInputs, current, marketCap) {
   // estimate disagreeing with the market by 2-3x is plausible; 8x+ either
   // way is far more likely a data/extraction artifact than a real thesis —
   // discard rather than surface a number this implausible.
+  //
+  // Tighter for Banking/Insurance/Financial Services specifically (2.5x,
+  // not 8x): auditing a live run found 54 of 242 financial-industry
+  // tickers still implausible (>2.5x price) even with correctly-extracted,
+  // non-zero debt — not a fixable extraction bug like NUTX's, but the same
+  // structural issue already documented above and for JPM: a bank's
+  // operating cash flow is dominated by loan-book growth, not
+  // distributable earnings, so FCFF is routinely enormous relative to
+  // market cap for this sector. 8x was tuned for the NUTX-style artifact
+  // case, not for a sector where the underlying formula itself is a poor
+  // fit — verified live: even after fixing Capital One's actual missing
+  // debt concepts, its estimate is $1,756 against a $222 price (7.9x, on
+  // ~$40.6B of "FCFF" against a $133.5B market cap, a ~30% FCFF yield).
   const impliedPrice = marketCap / dilutedShares;
-  if (impliedPrice > 0 && (fairValue > impliedPrice * 8 || fairValue < impliedPrice / 8)) return null;
+  const sanityMultiple = isFinancialIndustry(industry) ? 2.5 : 8;
+  if (impliedPrice > 0 && (fairValue > impliedPrice * sanityMultiple || fairValue < impliedPrice / sanityMultiple)) return null;
 
   return fairValue;
 }
@@ -652,7 +672,7 @@ async function main() {
           const reportedFinancials = await fetchReportedFinancialsFor(symbol, apiKey);
           const dcfInputs = extractDcfInputs(reportedFinancials);
           if (dcfInputs) {
-            estimatedFairValue = computeEstimatedFairValue(dcfInputs, current, profile.marketCapitalization);
+            estimatedFairValue = computeEstimatedFairValue(dcfInputs, current, profile.marketCapitalization, profile.industry);
             if (estimatedFairValue != null) dcfComputed++;
           }
         } catch {
