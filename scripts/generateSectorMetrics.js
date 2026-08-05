@@ -632,8 +632,12 @@ function buildFcfMarginTrendFromFilings(quarterlyReports, annualReports) {
   const capex = decumulateYtdByYear(quarterlyReports, annualReports, findReportedCapexQ, 'cf');
   const revenue = decumulateYtdByYear(quarterlyReports, annualReports, findReportedRevenue, 'ic');
 
+  // `revenue[key] != null`, not a truthy check — mirrors buildFcfMarginFromFilings
+  // in src/utils/metrics.js; see that file for the full rationale (a real
+  // reported $0 quarter is a genuine value that belongs in the TTM sum
+  // below, not missing data to exclude).
   const standaloneQuarters = Object.keys(ocf)
-    .filter((key) => capex[key] != null && revenue[key])
+    .filter((key) => capex[key] != null && revenue[key] != null)
     .map((key) => {
       const [year, quarter] = key.split('-').map(Number);
       return { year, quarter, fcf: ocf[key] - capex[key], revenue: revenue[key] };
