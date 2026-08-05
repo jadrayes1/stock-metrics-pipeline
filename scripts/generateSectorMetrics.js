@@ -558,6 +558,25 @@ function isConsecutiveQuarterWindow(window) {
   return true;
 }
 
+// Mirrors buildTrailingWindows in src/utils/metrics.js — see that file for
+// the full rationale (a very-recently-public company, verified live for
+// CapsoVision/CV, can have fewer than 4 consecutive standalone quarters
+// available at all; rather than emit nothing, fall back to whatever shorter
+// run IS available, flagged `partial: true`).
+function buildTrailingWindows(standaloneQuarters, maxSize = 4) {
+  return standaloneQuarters.map((anchor, i) => {
+    const window = [anchor];
+    for (let j = i - 1; j >= 0 && window.length < maxSize; j--) {
+      if (isConsecutiveQuarterWindow([standaloneQuarters[j], window[0]])) {
+        window.unshift(standaloneQuarters[j]);
+      } else {
+        break;
+      }
+    }
+    return { quarters: window, anchor, partial: window.length < maxSize };
+  });
+}
+
 async function fetchReportedFinancialsQuarterlyFor(symbol, apiKey) {
   const res = await fetch(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${symbol}&freq=quarterly&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -644,15 +663,12 @@ function buildFcfMarginTrendFromFilings(quarterlyReports, annualReports) {
     })
     .sort((a, b) => a.year - b.year || a.quarter - b.quarter);
 
-  const points = [];
-  for (let i = 3; i < standaloneQuarters.length; i++) {
-    const window = standaloneQuarters.slice(i - 3, i + 1);
-    if (!isConsecutiveQuarterWindow(window)) continue;
-    const ttmFcf = window.reduce((sum, q) => sum + q.fcf, 0);
-    const ttmRevenue = window.reduce((sum, q) => sum + q.revenue, 0);
-    const { year, quarter } = standaloneQuarters[i];
-    points.push({ label: `Q${quarter} '${String(year).slice(-2)}`, value: ttmRevenue ? ttmFcf / ttmRevenue : null });
-  }
+  const points = buildTrailingWindows(standaloneQuarters, 4).map(({ quarters, anchor, partial }) => {
+    const ttmFcf = quarters.reduce((sum, q) => sum + q.fcf, 0);
+    const ttmRevenue = quarters.reduce((sum, q) => sum + q.revenue, 0);
+    const { year, quarter } = anchor;
+    return { label: `Q${quarter} '${String(year).slice(-2)}`, value: ttmRevenue ? ttmFcf / ttmRevenue : null, partial, quartersUsed: quarters.length };
+  });
   return points.slice(-QUARTERS_OF_HISTORY);
 }
 

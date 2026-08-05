@@ -175,6 +175,25 @@ function isConsecutiveQuarterWindow(window) {
   return true;
 }
 
+// Mirrors buildTrailingWindows in src/utils/metrics.js — see that file for
+// the full rationale (a very-recently-public company, verified live for
+// CapsoVision/CV, can have fewer than 4 consecutive standalone quarters
+// available at all; rather than emit nothing, fall back to whatever shorter
+// run IS available, flagged `partial: true`).
+function buildTrailingWindows(standaloneQuarters, maxSize = 4) {
+  return standaloneQuarters.map((anchor, i) => {
+    const window = [anchor];
+    for (let j = i - 1; j >= 0 && window.length < maxSize; j--) {
+      if (isConsecutiveQuarterWindow([standaloneQuarters[j], window[0]])) {
+        window.unshift(standaloneQuarters[j]);
+      } else {
+        break;
+      }
+    }
+    return { quarters: window, anchor, partial: window.length < maxSize };
+  });
+}
+
 function quarterEndDate(year, quarter) {
   const month = quarter * 3;
   const lastDay = new Date(year, month, 0).getDate();
@@ -232,17 +251,14 @@ function buildPfcfTrendFromFilingsAndPrices(quarterlyReports, annualReports, mon
     })
     .sort((a, b) => a.year - b.year || a.quarter - b.quarter);
 
-  const points = [];
-  for (let i = 3; i < standaloneQuarters.length; i++) {
-    const window = standaloneQuarters.slice(i - 3, i + 1);
-    if (!isConsecutiveQuarterWindow(window)) continue;
-    const ttmFcf = window.reduce((sum, q) => sum + q.fcf, 0);
-    const { year, quarter, shares } = standaloneQuarters[i];
+  const points = buildTrailingWindows(standaloneQuarters, 4).map(({ quarters, anchor, partial }) => {
+    const ttmFcf = quarters.reduce((sum, q) => sum + q.fcf, 0);
+    const { year, quarter, shares } = anchor;
     const ttmFcfPerShare = ttmFcf / shares;
     const price = findClosestMonthlyPrice(monthlyPrices, quarterEndDate(year, quarter));
     const value = price != null && ttmFcfPerShare !== 0 ? price / ttmFcfPerShare : null;
-    points.push({ label: `Q${quarter} '${String(year).slice(-2)}`, value });
-  }
+    return { label: `Q${quarter} '${String(year).slice(-2)}`, value, partial, quartersUsed: quarters.length };
+  });
 
   return points.slice(-QUARTERS_OF_HISTORY);
 }
