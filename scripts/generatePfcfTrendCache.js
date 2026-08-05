@@ -118,11 +118,27 @@ function findReportedCapexQ(cfItems) {
   return labelMatch ? labelMatch.value : null;
 }
 
+// Mirrors findReportedDilutedShares in src/utils/metrics.js — see that file
+// for the full rationale (previously no fallback at all, which starved
+// P/FCF reconstruction of a share count for any filer reporting basic
+// shares only; verified live: BlackSky/BKSY matched diluted shares for just
+// 7 of 22 reported quarters).
 function findReportedDilutedShares(icItems) {
   const match = icItems.find((item) => item.concept === 'us-gaap_WeightedAverageNumberOfDilutedSharesOutstanding');
   if (match) return match.value;
   const labelMatch = icItems.find((item) => /diluted.*shares|weighted average.*diluted/i.test(item.label || ''));
-  return labelMatch ? labelMatch.value : null;
+  if (labelMatch) return labelMatch.value;
+
+  const basicMatch = icItems.find((item) => item.concept === 'us-gaap_WeightedAverageNumberOfSharesOutstandingBasic');
+  if (basicMatch) return basicMatch.value;
+  const basicLabelMatch = icItems.find((item) => /basic.*shares|weighted average.*basic/i.test(item.label || ''));
+  if (basicLabelMatch) return basicLabelMatch.value;
+
+  const netIncome = icItems.find((item) => item.concept === 'us-gaap_NetIncomeLoss');
+  const dilutedEps = icItems.find((item) => item.concept === 'us-gaap_EarningsPerShareDiluted');
+  if (netIncome?.value != null && dilutedEps?.value) return netIncome.value / dilutedEps.value;
+
+  return null;
 }
 
 // Mirrors decumulateYtdByYear in src/utils/metrics.js — see that file for
