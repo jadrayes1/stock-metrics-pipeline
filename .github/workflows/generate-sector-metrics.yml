@@ -44,7 +44,16 @@ name: Generate sector metrics
 
 on:
   schedule:
-    - cron: '0 8 * * *' # ~03:00 US Eastern — starts early enough that a ~4.5-4.8hr run finishes well before market open and before most app usage
+    # 02:00 UTC (~10pm US Eastern the prior night). Moved earlier from 08:00
+    # UTC after observing GitHub consistently starts this repo's scheduled
+    # runs 2h36m-3h24m late (and trending later) — likely GitHub deprior-
+    # itizing cron-triggered runs on public repos under load, not something
+    # this workflow controls. Combined with the run itself now taking
+    # ~5.5hrs (FCF Margin reconstruction added time on top of the original
+    # ~4.5-4.8hrs), the old 08:00 UTC start was landing at or after 9am ET
+    # market open instead of comfortably before it. This start time leaves
+    # roughly 2hrs of buffer against 9am ET even in a worst-case delay.
+    - cron: '0 2 * * *'
   workflow_dispatch: {}
 
 permissions:
