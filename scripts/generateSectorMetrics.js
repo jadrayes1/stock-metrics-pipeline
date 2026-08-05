@@ -160,8 +160,44 @@ function extractMetricValues(current, quarterly, impliedPrice) {
   return { roic, revenueGrowth, profitMargin, fcfMargin, peRatio, pfcfRatio };
 }
 
+// Dual/multi-class share tickers where Finnhub's fundamentals-ratio engine
+// (/stock/metric) only covers one class even though both trade the exact
+// same underlying company — verified live (Aug 2026) for every pair below:
+// the aliased ticker's own quarterly series is entirely empty (0 entries
+// across every metric, not just one) while its sibling class has full,
+// healthy coverage (verified live: Berkshire Hathaway/BRK.B has zero
+// quarterly data at all, while BRK.A — same company, same CIK, just the
+// original share class — has 99-145 quarterly points per metric). Since
+// P/E, ROIC, margins, revenue growth, and P/FCF are all RATIOS, not
+// per-share dollar amounts, they're identical between share classes of the
+// same company regardless of the (often very different) per-share price —
+// so reading the healthy sibling's ratio data isn't an approximation, it's
+// the correct number. Mirrors DUAL_CLASS_ALIASES in src/utils/metrics.js —
+// keep in sync. Deliberately only applied to this one call (the ratio
+// engine) — profile (name/logo/marketCap/industry) and the DCF's own
+// financials-reported extraction stay symbol-specific, since those
+// genuinely differ (or are separately, independently sparse) per class.
+const DUAL_CLASS_ALIASES = {
+  'AGM.A': 'AGM',
+  'BF.A': 'BF.B',
+  'BIO.B': 'BIO',
+  'BRK.B': 'BRK.A',
+  'CRD.A': 'CRD.B',
+  'GEF.B': 'GEF',
+  'GTN.A': 'GTN',
+  'HEI.A': 'HEI',
+  'HVT.A': 'HVT',
+  'LEN.B': 'LEN',
+  'MKC.V': 'MKC',
+  'MOG.B': 'MOG.A',
+  'TAP.A': 'TAP',
+  'UHAL.B': 'UHAL',
+  'WSO.B': 'WSO',
+};
+
 async function fetchMetricsFor(symbol, apiKey) {
-  const res = await fetch(`https://finnhub.io/api/v1/stock/metric?symbol=${symbol}&metric=all&token=${apiKey}`);
+  const requestSymbol = DUAL_CLASS_ALIASES[symbol] || symbol;
+  const res = await fetch(`https://finnhub.io/api/v1/stock/metric?symbol=${requestSymbol}&metric=all&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
   return { current: data?.metric || {}, quarterly: data?.series?.quarterly || {} };
@@ -622,15 +658,39 @@ function buildFcfMarginTrendFromFilings(quarterlyReports, annualReports) {
 // already reads from.
 const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/marketMetrics.json';
 
-async function fetchPreviouslyPublishedFcfMarginTrends() {
+// Fetched ONCE at the start of a run and reused for both the FCF Margin
+// trend merge-protection (pickTrendToPublish) and the per-field metrics
+// regression guard (pickMetricValue) below — one network call covers both.
+async function fetchPreviouslyPublishedDataset() {
   try {
     const res = await fetch(GIST_METRICS_URL);
-    if (!res.ok) return {};
+    if (!res.ok) return { metrics: {}, fcfMarginTrends: {} };
     const data = await res.json();
-    return data?.trends?.fcfMargin && typeof data.trends.fcfMargin === 'object' ? data.trends.fcfMargin : {};
+    return {
+      metrics: data?.metrics && typeof data.metrics === 'object' ? data.metrics : {},
+      fcfMarginTrends: data?.trends?.fcfMargin && typeof data.trends.fcfMargin === 'object' ? data.trends.fcfMargin : {},
+    };
   } catch {
-    return {}; // first-ever run, or the feed's briefly unreachable — start fresh either way
+    return { metrics: {}, fcfMarginTrends: {} }; // first-ever run, or the feed's briefly unreachable — start fresh either way
   }
+}
+
+// Mirrors pickTrendToPublish's reasoning, for a single scalar metric value
+// instead of a trend array: a fresh fetch coming back null doesn't mean the
+// underlying fact went away — verified live: IAG (IAMGOLD, a Canadian
+// foreign-private issuer cross-listed on NYSE American) previously had real
+// values here, then Finnhub's own data for it regressed to entirely empty
+// (0 quarterly entries across every metric) with no code change on our
+// side. Rather than publish a sudden gap that's more likely a transient or
+// upstream data-availability issue than a real fundamental change, keep
+// the last known-good value per field until a fresh, non-null value
+// actually replaces it. Deliberately NOT applied to estimatedFairValue —
+// that field going null is frequently an intentional decision by the
+// current code (the sanity guard rejecting an implausible estimate), not a
+// data gap, and republishing a stale estimate the current code would
+// reject defeats the point of that guard.
+function pickMetricValue(existingValue, freshValue) {
+  return freshValue != null ? freshValue : (existingValue ?? null);
 }
 
 // A fresh reconstruction attempt can come back empty, or narrower than
@@ -911,8 +971,11 @@ async function main() {
       `(three requests each, a fourth for tickers needing FCF Margin reconstructed from filings, rate-limited to stay under Finnhub's free-tier cap — this takes several hours)...`
   );
 
-  const previouslyPublishedFcfMarginTrends = await fetchPreviouslyPublishedFcfMarginTrends();
-  console.log(`Loaded ${Object.keys(previouslyPublishedFcfMarginTrends).length} previously-published FCF Margin trends (merge-protected against a bad run — see pickTrendToPublish).`);
+  const { metrics: previouslyPublishedMetrics, fcfMarginTrends: previouslyPublishedFcfMarginTrends } = await fetchPreviouslyPublishedDataset();
+  console.log(
+    `Loaded ${Object.keys(previouslyPublishedMetrics).length} previously-published tickers' metrics and ` +
+      `${Object.keys(previouslyPublishedFcfMarginTrends).length} FCF Margin trends (both merge-protected against a bad run — see pickMetricValue/pickTrendToPublish).`
+  );
 
   const metrics = {};
   const profiles = {}; // name/logo, kept out of `metrics` to avoid bloating that map — only industryLeaders needs them
@@ -999,6 +1062,19 @@ async function main() {
             fcfMarginTrends[symbol] = published;
             if (values.fcfMargin == null) values.fcfMargin = published[published.length - 1].value;
             if (freshTrend.length) fcfMarginReconstructed++; // only count genuine new reconstructions, not carried-forward cache hits
+          }
+        }
+
+        // Regression guard: a fresh null for one of the 6 comparable metrics
+        // doesn't overwrite a previously-published real value for the same
+        // field (see pickMetricValue above) — applied per field, not as an
+        // all-or-nothing choice, so a ticker with one genuinely new gap
+        // (say, a metric Finnhub just stopped reporting) still gets its
+        // OTHER, still-healthy fields refreshed normally.
+        const previous = previouslyPublishedMetrics[symbol];
+        if (previous) {
+          for (const key of COMPARABLE_KEYS) {
+            values[key] = pickMetricValue(previous[key], values[key]);
           }
         }
 
