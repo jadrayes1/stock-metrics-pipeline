@@ -46,12 +46,16 @@
 // computeEstimatedFairValue) since even correctly-extracted inputs
 // routinely produce an implausible estimate for this sector.
 //
-// Also reconstructs FCF Margin from raw SEC filings (see
-// computeLatestFcfMargin) for the ~1,367 tickers (as of a recent coverage
-// audit) where Finnhub's own quarterly fcfMargin data is missing entirely —
-// mirrors the app's on-demand fallback (buildFcfMarginFromFilings in
-// src/utils/metrics.js) so this bulk dataset doesn't have the same gap the
-// app already fixed for individual lookups. Skipped for Banking/Insurance/
+// Also reconstructs a full FCF Margin TREND from raw SEC filings (see
+// buildFcfMarginTrendFromFilings) for any ticker where Finnhub's own
+// quarterly fcfMargin series is empty OR internally gapped — mirrors the
+// app's on-demand fallback (buildFcfMarginFromFilings in
+// src/utils/metrics.js), published here so the app's trend chart can read a
+// precomputed, cross-user-shared series instead of every device
+// reconstructing the same thing live. Merge-protected against a bad run
+// (see pickTrendToPublish) — a fresh attempt that comes back empty or
+// narrower than what's already published leaves the existing cache
+// untouched rather than regressing it. Skipped for Banking/Insurance/
 // Financial Services, where FCF isn't a meaningful concept.
 //
 // Universe: Finnhub's full US symbol list (`/stock/symbol?exchange=US`),
@@ -518,14 +522,76 @@ function isConsecutiveQuarterWindow(window) {
   return true;
 }
 
-/**
- * Latest TTM FCF Margin ((OCF − CapEx) ÷ Revenue) from raw SEC filings —
- * mirrors buildFcfMarginFromFilings in src/utils/metrics.js, but walks
- * backward from the most recent quarter and returns as soon as it finds one
- * valid (genuinely consecutive) TTM window, since only the latest value is
- * needed here.
- */
-function computeLatestFcfMargin(quarterlyReports, annualReports) {
+async function fetchReportedFinancialsQuarterlyFor(symbol, apiKey) {
+  const res = await fetch(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${symbol}&freq=quarterly&token=${apiKey}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data?.data) ? data.data : [];
+}
+
+// ---------------------------------------------------------------------------
+// FCF Margin TREND reconstruction (full series, not just the latest value —
+// see fcfMargin above for the single-value case this supersedes). Published
+// alongside the metrics so the app's trend chart (MetricTrendScreen) can
+// read a precomputed, cross-user-shared series instead of every device
+// independently reconstructing the same thing live (see fetchFcfMarginTrendFallback
+// in src/api/stockData.js, and buildFcfMarginFromFilings in src/utils/metrics.js,
+// which this mirrors). Gated the same way the app's own trend screen decides
+// it needs a fallback: Finnhub's native quarterly fcfMargin series is either
+// entirely empty OR has internal gaps (see hasInternalGaps below) — not just
+// "the latest point is missing," which misses tickers with real but stale or
+// holey data (verified live: Cencora/COR's fcfMargin jumps from Q4 '23 to Q2
+// '24, Q3 '24 to Q1 '25, etc. — never empty, always gapped).
+// ---------------------------------------------------------------------------
+
+const QUARTERS_OF_HISTORY = 12; // mirrors src/utils/metrics.js
+
+function parseQuarterLabel(label) {
+  const match = /^Q(\d) '(\d\d)$/.exec(label || '');
+  return match ? { quarter: Number(match[1]), year: 2000 + Number(match[2]) } : null;
+}
+
+function quarterOrdinal({ year, quarter }) {
+  return year * 4 + quarter;
+}
+
+// Mirrors hasInternalGaps in src/utils/metrics.js — see that file for the
+// full rationale (Finnhub's quarterly series can skip calendar quarters in
+// the middle even with older and very recent data both present).
+function hasInternalGaps(points, maxAllowedGaps = 1) {
+  let missing = 0;
+  for (let i = 1; i < points.length; i++) {
+    const prev = parseQuarterLabel(points[i - 1].label);
+    const curr = parseQuarterLabel(points[i].label);
+    if (!prev || !curr) continue;
+    const diff = quarterOrdinal(curr) - quarterOrdinal(prev);
+    if (diff > 1) missing += diff - 1;
+  }
+  return missing > maxAllowedGaps;
+}
+
+function quarterLabelFromPeriod(period) {
+  if (!period) return null;
+  const d = new Date(period);
+  if (Number.isNaN(d.getTime())) return null;
+  const q = Math.floor(d.getMonth() / 3) + 1;
+  return `Q${q} '${String(d.getFullYear()).slice(-2)}`;
+}
+
+// Finnhub's own quarterly.fcfMargin series (most-recent-first) -> chronological
+// {label, value} points — mirrors extractQuarterlyMetricSeries in
+// src/utils/metrics.js for this one field, just without needing the rest of
+// that function's metricKey branching.
+function nativeFcfMarginPoints(quarterly) {
+  const entries = (quarterly?.fcfMargin || []).slice(0, QUARTERS_OF_HISTORY);
+  return entries.map((entry) => ({ label: quarterLabelFromPeriod(entry.period), value: entry?.v ?? null })).reverse();
+}
+
+// Mirrors buildFcfMarginFromFilings in src/utils/metrics.js — full trend,
+// not just the latest point. Reuses findReportedOperatingCashFlowQ/
+// findReportedCapexQ/findReportedRevenue/decumulateYtdByYear/
+// isConsecutiveQuarterWindow already defined above for the latest-value case.
+function buildFcfMarginTrendFromFilings(quarterlyReports, annualReports) {
   const ocf = decumulateYtdByYear(quarterlyReports, annualReports, findReportedOperatingCashFlowQ, 'cf');
   const capex = decumulateYtdByYear(quarterlyReports, annualReports, findReportedCapexQ, 'cf');
   const revenue = decumulateYtdByYear(quarterlyReports, annualReports, findReportedRevenue, 'ic');
@@ -538,21 +604,48 @@ function computeLatestFcfMargin(quarterlyReports, annualReports) {
     })
     .sort((a, b) => a.year - b.year || a.quarter - b.quarter);
 
-  for (let i = standaloneQuarters.length - 1; i >= 3; i--) {
+  const points = [];
+  for (let i = 3; i < standaloneQuarters.length; i++) {
     const window = standaloneQuarters.slice(i - 3, i + 1);
     if (!isConsecutiveQuarterWindow(window)) continue;
     const ttmFcf = window.reduce((sum, q) => sum + q.fcf, 0);
     const ttmRevenue = window.reduce((sum, q) => sum + q.revenue, 0);
-    if (ttmRevenue) return ttmFcf / ttmRevenue;
+    const { year, quarter } = standaloneQuarters[i];
+    points.push({ label: `Q${quarter} '${String(year).slice(-2)}`, value: ttmRevenue ? ttmFcf / ttmRevenue : null });
   }
-  return null;
+  return points.slice(-QUARTERS_OF_HISTORY);
 }
 
-async function fetchReportedFinancialsQuarterlyFor(symbol, apiKey) {
-  const res = await fetch(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${symbol}&freq=quarterly&token=${apiKey}`);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const data = await res.json();
-  return Array.isArray(data?.data) ? data.data : [];
+// Gist raw URL for the dataset this same script publishes to (see the
+// workflow's "Publish to gist" step) — fetched at the START of a run so a
+// bad run doesn't erase a good previous one. Same ID generateNewsCache.js
+// already reads from.
+const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/marketMetrics.json';
+
+async function fetchPreviouslyPublishedFcfMarginTrends() {
+  try {
+    const res = await fetch(GIST_METRICS_URL);
+    if (!res.ok) return {};
+    const data = await res.json();
+    return data?.trends?.fcfMargin && typeof data.trends.fcfMargin === 'object' ? data.trends.fcfMargin : {};
+  } catch {
+    return {}; // first-ever run, or the feed's briefly unreachable — start fresh either way
+  }
+}
+
+// A fresh reconstruction attempt can come back empty, or narrower than
+// before, on a day where Finnhub has a transient hiccup for this specific
+// ticker — that's not the same fact as "this ticker's trend data no longer
+// exists," and shouldn't blank out (or shrink) what's already published.
+// Only replaces the cached trend when the fresh attempt actually surfaces a
+// calendar quarter (by label) the cache doesn't already have — a same-or-
+// narrower result leaves the previously-published trend untouched.
+function pickTrendToPublish(existingPoints, freshPoints) {
+  if (!freshPoints || freshPoints.length === 0) return existingPoints || [];
+  if (!existingPoints || existingPoints.length === 0) return freshPoints;
+  const existingLabels = new Set(existingPoints.map((p) => p.label));
+  const hasNewQuarter = freshPoints.some((p) => !existingLabels.has(p.label));
+  return hasNewQuarter ? freshPoints : existingPoints;
 }
 
 const RF = 0.047; // 10-year Treasury yield — update periodically, doesn't need to be exact to the day
@@ -818,8 +911,12 @@ async function main() {
       `(three requests each, a fourth for tickers needing FCF Margin reconstructed from filings, rate-limited to stay under Finnhub's free-tier cap — this takes several hours)...`
   );
 
+  const previouslyPublishedFcfMarginTrends = await fetchPreviouslyPublishedFcfMarginTrends();
+  console.log(`Loaded ${Object.keys(previouslyPublishedFcfMarginTrends).length} previously-published FCF Margin trends (merge-protected against a bad run — see pickTrendToPublish).`);
+
   const metrics = {};
   const profiles = {}; // name/logo, kept out of `metrics` to avoid bloating that map — only industryLeaders needs them
+  const fcfMarginTrends = {};
   let ok = 0;
   let failed = 0;
   let dead = 0;
@@ -873,24 +970,35 @@ async function main() {
 
         const values = extractMetricValues(current, quarterly, impliedPriceFromProfile(profile));
 
-        // FCF Margin reconstruction: only for the gap this specifically
-        // fixes (Finnhub's own quarterly fcfMargin missing), and only for
-        // non-financial tickers (FCF isn't a meaningful concept for banks —
-        // see isFinancialIndustry). One extra Finnhub call, only paid for
-        // gap tickers, not all ~5,140 — reuses annualReportedFinancials
-        // (already fetched above for the DCF estimate) rather than fetching
-        // it again; only the quarterly side is new here.
-        if (values.fcfMargin == null && !isFinancialIndustry(profile.industry)) {
+        // FCF Margin trend reconstruction: gated the same way the app's own
+        // trend screen decides it needs a fallback (empty OR internally
+        // gapped native series — see hasInternalGaps above), not just "the
+        // latest value is missing," so a ticker with real-but-stale data
+        // (verified live: Cencora/COR) still gets a filled-in trend. Only
+        // for non-financial tickers (FCF isn't a meaningful concept for
+        // banks — see isFinancialIndustry). One extra Finnhub call, only
+        // paid for gap tickers, not all ~5,140 — reuses
+        // annualReportedFinancials (already fetched above for the DCF
+        // estimate) rather than fetching it again; only the quarterly side
+        // is new here.
+        const nativePoints = nativeFcfMarginPoints(quarterly);
+        if ((nativePoints.length === 0 || hasInternalGaps(nativePoints)) && !isFinancialIndustry(profile.industry)) {
+          let freshTrend = [];
           await sleep(REQUEST_SPACING_MS);
           try {
             const quarterlyFinancials = await fetchReportedFinancialsQuarterlyFor(symbol, apiKey);
-            const reconstructed = computeLatestFcfMargin(quarterlyFinancials, annualReportedFinancials);
-            if (reconstructed != null) {
-              values.fcfMargin = reconstructed;
-              fcfMarginReconstructed++;
-            }
+            freshTrend = buildFcfMarginTrendFromFilings(quarterlyFinancials, annualReportedFinancials);
           } catch {
-            // Same graceful-degradation philosophy as the DCF estimate above.
+            // Same graceful-degradation philosophy as the DCF estimate above
+            // — pickTrendToPublish below falls back to whatever was already
+            // published for this ticker rather than losing it over one
+            // failed request.
+          }
+          const published = pickTrendToPublish(previouslyPublishedFcfMarginTrends[symbol], freshTrend);
+          if (published.length) {
+            fcfMarginTrends[symbol] = published;
+            if (values.fcfMargin == null) values.fcfMargin = published[published.length - 1].value;
+            if (freshTrend.length) fcfMarginReconstructed++; // only count genuine new reconstructions, not carried-forward cache hits
           }
         }
 
@@ -914,12 +1022,13 @@ async function main() {
   const industryLeaders = computeIndustryLeaders(metrics, profiles);
   console.log(`\nComputed ${industryLeaders.length} industry leaders (industries with >= ${MIN_INDUSTRY_PEERS} peers).`);
 
-  const output = { generatedAt: new Date().toISOString(), metrics, industryLeaders };
+  const output = { generatedAt: new Date().toISOString(), metrics, industryLeaders, trends: { fcfMargin: fcfMarginTrends } };
   fs.mkdirSync(path.dirname(OUTPUT_FILE), { recursive: true }); // works regardless of which repo this script runs in
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(output, null, 2));
   console.log(
     `Wrote ${ok} tickers to ${path.relative(process.cwd(), OUTPUT_FILE)} ` +
-      `(${failed} failed, ${dead} dead/no-data excluded, ${dcfComputed} with a fair-value estimate, ${fcfMarginReconstructed} FCF margins reconstructed from filings).`
+      `(${failed} failed, ${dead} dead/no-data excluded, ${dcfComputed} with a fair-value estimate, ` +
+      `${fcfMarginReconstructed} FCF margins freshly reconstructed from filings, ${Object.keys(fcfMarginTrends).length} tickers now have a published FCF Margin trend).`
   );
 }
 

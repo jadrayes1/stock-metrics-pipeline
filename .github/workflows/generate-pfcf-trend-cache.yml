@@ -1,0 +1,115 @@
+# Pre-fetches a P/FCF TREND (not just the latest value) for tickers whose
+# Finnhub quarterly pfcfTTM series is empty, published to the SAME public
+# Gist as marketMetrics.json (see generate-sector-metrics.yml) as a third
+# file, pfcfTrendCache.json — see scripts/generatePfcfTrendCache.js for the
+# full rationale and design (why this needs its own workflow, the Twelve
+# Data call budget + least-recently-attempted rotation, etc.).
+#
+# Scheduled between the other two jobs so none of them compete for
+# Finnhub's account-wide rate limit at the same time:
+#   - generate-sector-metrics.yml: 02:00 UTC, ~5.5hr runtime (ends ~07:30 UTC)
+#   - generate-pfcf-trend-cache.yml (this one): 09:00 UTC
+#   - generate-news-cache.yml: 16:00 UTC
+#
+# One-time setup required BEYOND generate-sector-metrics.yml's existing
+# secrets (FINNHUB_API_KEY, GIST_ID, GIST_TOKEN — reused here, no changes
+# needed to those):
+#   1. Sign up for a SECOND, separate free Twelve Data account (Twelve Data
+#      allows this at no cost) — deliberately not the same key
+#      stock-analyzer-proxy uses for the app's own live per-device P/FCF
+#      fallback, so this batch job's usage doesn't compete with live user
+#      traffic for the same 800-calls/day free-tier budget.
+#   2. Add a repository secret named TWELVEDATA_PIPELINE_API_KEY with that
+#      second account's API key.
+
+name: Generate P/FCF trend cache
+
+on:
+  schedule:
+    - cron: '0 9 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 420
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Generate P/FCF trend cache
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          TWELVEDATA_PIPELINE_API_KEY: ${{ secrets.TWELVEDATA_PIPELINE_API_KEY }}
+        run: node scripts/generatePfcfTrendCache.js
+
+      - name: Publish to gist
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          gh gist edit "${{ secrets.GIST_ID }}" --filename pfcfTrendCache.json pfcfTrendCache.json || \
+          gh gist edit "${{ secrets.GIST_ID }}" --add pfcfTrendCache.json
+
+      - name: Report failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = 'pfcf-trend-pipeline-failure';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: label,
+            });
+            if (open.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: open[0].number,
+                body: `Failed again: ${runUrl}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'P/FCF trend cache pipeline failed',
+                body: `The P/FCF trend cache generation run failed.\n\nRun: ${runUrl}\n\nCheck the FINNHUB_API_KEY, TWELVEDATA_PIPELINE_API_KEY, GIST_TOKEN, and GIST_ID secrets, and Finnhub's/Twelve Data's API status. Note: this is separate from the main sector-metrics pipeline and the news-cache pipeline — those are unaffected.`,
+                labels: [label],
+              });
+            }
+
+      - name: Close failure issue on success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = 'pfcf-trend-pipeline-failure';
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: label,
+            });
+            for (const issue of open) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: 'P/FCF trend cache pipeline succeeded again — closing.',
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+              });
+            }

@@ -4,7 +4,9 @@
   "private": true,
   "description": "Daily sector/industry-metrics data pipeline for stock-analyzer",
   "scripts": {
-    "generate": "node scripts/generateSectorMetrics.js"
+    "generate": "node scripts/generateSectorMetrics.js",
+    "generate-news-cache": "node scripts/generateNewsCache.js",
+    "generate-pfcf-trend-cache": "node scripts/generatePfcfTrendCache.js"
   },
   "engines": {
     "node": ">=18"
