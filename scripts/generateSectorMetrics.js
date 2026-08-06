@@ -101,13 +101,26 @@ const REQUEST_SPACING_MS = 1100; // ~54/min, under Finnhub's 60/min free-tier ca
 const ALLOWED_MICS = new Set(['XNAS', 'XNYS', 'XASE']); // NASDAQ, NYSE, NYSE American
 const ALLOWED_TYPES = new Set(['Common Stock', 'REIT']);
 
-function readFinnhubApiKey() {
-  // This script runs server-side (locally or in the pipeline repo's GitHub
-  // Actions workflow), never bundled into the app, so it reads the key
-  // straight from the environment rather than src/config.js — the app no
-  // longer keeps a real Finnhub key there at all (see src/config.js).
-  if (process.env.FINNHUB_API_KEY) return process.env.FINNHUB_API_KEY;
-  throw new Error('FINNHUB_API_KEY env var is not set.');
+// This script runs server-side (locally or in the pipeline repo's GitHub
+// Actions workflow), never bundled into the app, so it reads keys straight
+// from the environment rather than src/config.js — the app no longer keeps
+// a real Finnhub key there at all (see src/config.js).
+//
+// A second, independent Finnhub account/key (FINNHUB_API_KEY_2) is
+// optional. When present, the ticker universe is split across one worker
+// per key, each pacing its OWN sequential Finnhub calls against its own
+// key's 60/min free-tier budget independently — roughly multiplying total
+// throughput by the number of keys, since the run's bottleneck is purely
+// that per-key rate limit, not compute (same principle already used for
+// generatePfcfTrendCache.js's separate Twelve Data pipeline key). Falls
+// back to today's single-key, single-worker behavior when only
+// FINNHUB_API_KEY is set — this is additive, not a required setup change.
+function readFinnhubApiKeys() {
+  const keys = [];
+  if (process.env.FINNHUB_API_KEY) keys.push(process.env.FINNHUB_API_KEY);
+  if (process.env.FINNHUB_API_KEY_2) keys.push(process.env.FINNHUB_API_KEY_2);
+  if (!keys.length) throw new Error('FINNHUB_API_KEY env var is not set.');
+  return keys;
 }
 
 async function fetchUniverse(apiKey) {
@@ -1339,25 +1352,276 @@ function computeIndustryLeaders(metrics, profiles) {
   return leaders.sort((a, b) => b.peerCount - a.peerCount);
 }
 
+// Fetches and computes everything for a single ticker, using the given
+// Finnhub API key. Deliberately returns a result descriptor rather than
+// mutating shared state, so runWorker below can call this from N
+// independent, concurrently-running loops (one per API key) without them
+// stepping on each other — each worker still processes ITS tickers
+// strictly sequentially, pacing every call against its own key's rate
+// limit exactly as the single-worker loop always has; only the workers
+// themselves run in parallel.
+async function processSymbol(symbol, apiKey, ctx) {
+  const { previouslyPublishedMetrics, previouslyPublishedNativeTrends, previouslyPublishedYearlyTrends, previouslyPublishedQuarterlyTrends, previouslyPublishedTtmTrends } =
+    ctx;
+
+  const profile = await fetchProfileFor(symbol, apiKey);
+
+  // Verified live: Finnhub returns a 200 OK with every profile field empty
+  // (no name, no industry, nothing) for some symbols in the exchange=US
+  // universe list (example: AACO) — stale/delisted/inactive tickers Finnhub
+  // itself has no real data for, not a fetch failure. Excluded from the
+  // dataset entirely rather than stored with all-null metrics; checking
+  // here (before the other calls) also skips those calls for a ticker we
+  // already know has nothing.
+  if (!profile.name) {
+    return { status: 'dead' };
+  }
+
+  await sleep(REQUEST_SPACING_MS);
+  const { current, quarterly } = await fetchMetricsFor(symbol, apiKey);
+
+  // netMargin's quarterly series is one of the more consistently-present
+  // fields (see QUARTERLY_FIELD_MAP in src/utils/metrics.js) — used here
+  // purely as a proxy for "how many quarters has Finnhub got on this
+  // ticker," for the Industry Leaders history bias (see historyWeight).
+  const profileEntry = {
+    ...profile,
+    historyQuarters: (quarterly.netMargin || []).length,
+    trendQualified: computeTrendQualification(quarterly),
+  };
+
+  let estimatedFairValue = null;
+  let annualReportedFinancials = [];
+  let dcfComputed = false;
+  await sleep(REQUEST_SPACING_MS);
+  try {
+    annualReportedFinancials = await fetchReportedFinancialsFor(symbol, apiKey);
+    const dcfInputs = extractDcfInputs(annualReportedFinancials);
+    if (dcfInputs) {
+      estimatedFairValue = computeEstimatedFairValue(dcfInputs, current, profile.marketCapitalization, profile.industry);
+      if (estimatedFairValue != null) dcfComputed = true;
+    }
+  } catch {
+    // A single ticker's oddly-shaped filing (or a failed request) shouldn't
+    // take down the whole run — just skip its estimate, same graceful-
+    // degradation philosophy as the rest of this pipeline. Its sector-
+    // percentile metrics are unaffected.
+  }
+
+  const values = extractMetricValues(current, quarterly, impliedPriceFromProfile(profile));
+
+  // Tier 1 — native quarterly series (all 6 metrics), straight from the
+  // stock/metric response already fetched above for the current values.
+  // Zero extra API cost — this is data already in hand, just not
+  // previously published. See buildNativeTrendsForTicker's own comments
+  // for why this matters (it's the whole fix for P/E's trend chart, which
+  // has no reconstruction fallback of its own).
+  const freshNativeTrends = buildNativeTrendsForTicker(quarterly);
+  const previousNativeForSymbol = previouslyPublishedNativeTrends[symbol] || {};
+  const mergedNativeForSymbol = {};
+  for (const key of ['roic', 'revenueGrowth', 'profitMargin', 'fcfMargin', 'peRatio', 'pfcfRatio']) {
+    const published = pickTrendToPublish(previousNativeForSymbol[key], freshNativeTrends[key]);
+    if (published.length) mergedNativeForSymbol[key] = published;
+  }
+
+  // Tier 2/3 — Quarterly/Yearly/TTM reconstruction from raw SEC filings,
+  // for the 4 metrics that don't need Twelve Data price history. Quarterly
+  // financials-reported is now fetched for EVERY ticker (not just ones
+  // with a native-data gap) so these caches cover the full universe, not
+  // just gap tickers — a deliberate, longer run in exchange for every
+  // metric's trend chart loading from a precomputed cache instead of
+  // live-reconstructing on first tap. annualReportedFinancials is already
+  // fetched above for the DCF estimate, at no extra cost either way.
+  let quarterlyFinancials = [];
+  await sleep(REQUEST_SPACING_MS);
+  try {
+    quarterlyFinancials = await fetchReportedFinancialsQuarterlyFor(symbol, apiKey);
+  } catch {
+    // Leave quarterlyFinancials empty — every builder below degrades
+    // gracefully to "nothing new," and pickTrendToPublish falls back to
+    // whatever was already published rather than losing it.
+  }
+
+  const isBankLike = isFinancialIndustry(profile.industry);
+  const yearlyBuilders = {
+    revenueGrowth: () => buildRevenueGrowthYearlyFromFilings(annualReportedFinancials),
+    profitMargin: () => buildProfitMarginYearlyFromFilings(annualReportedFinancials),
+    fcfMargin: () => (isBankLike ? [] : buildFcfMarginYearlyFromFilings(annualReportedFinancials)),
+    roic: () => buildRoicYearlyFromFilings(annualReportedFinancials),
+  };
+  const quarterlyBuilders = {
+    revenueGrowth: () => buildRevenueGrowthQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials),
+    profitMargin: () => buildProfitMarginQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials),
+    fcfMargin: () => (isBankLike ? [] : buildFcfMarginQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials)),
+    roic: () => buildRoicQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials),
+  };
+  const ttmBuilders = {
+    revenueGrowth: () => buildRevenueGrowthTTMFromFilings(quarterlyFinancials, annualReportedFinancials),
+    profitMargin: () => buildProfitMarginTTMFromFilings(quarterlyFinancials, annualReportedFinancials),
+    fcfMargin: () => (isBankLike ? [] : buildFcfMarginTrendFromFilings(quarterlyFinancials, annualReportedFinancials)),
+    roic: () => buildRoicTTMFromFilings(quarterlyFinancials, annualReportedFinancials),
+  };
+
+  const mergedYearlyForSymbol = {};
+  const mergedQuarterlyForSymbol = {};
+  const mergedTtmForSymbol = {};
+  const previousYearlyForSymbol = previouslyPublishedYearlyTrends[symbol] || {};
+  const previousQuarterlyForSymbol = previouslyPublishedQuarterlyTrends[symbol] || {};
+  const previousTtmForSymbol = previouslyPublishedTtmTrends[symbol] || {};
+
+  let fcfMarginReconstructed = false;
+
+  for (const key of Object.keys(yearlyBuilders)) {
+    let fresh = [];
+    try {
+      fresh = yearlyBuilders[key]();
+    } catch {
+      // A single metric's oddly-shaped filing shouldn't take down the
+      // others — pickTrendToPublish falls back to the previous run.
+    }
+    const published = pickTrendToPublish(previousYearlyForSymbol[key], fresh);
+    if (published.length) mergedYearlyForSymbol[key] = published;
+  }
+  for (const key of Object.keys(quarterlyBuilders)) {
+    let fresh = [];
+    try {
+      fresh = quarterlyBuilders[key]();
+    } catch {
+      // Same graceful-degradation philosophy as above.
+    }
+    const published = pickTrendToPublish(previousQuarterlyForSymbol[key], fresh);
+    if (published.length) mergedQuarterlyForSymbol[key] = published;
+  }
+  for (const key of Object.keys(ttmBuilders)) {
+    let fresh = [];
+    try {
+      fresh = ttmBuilders[key]();
+    } catch {
+      // Same graceful-degradation philosophy as above.
+    }
+    const published = pickTrendToPublish(previousTtmForSymbol[key], fresh);
+    if (published.length) {
+      mergedTtmForSymbol[key] = published;
+      if (key === 'fcfMargin' && values.fcfMargin == null) {
+        values.fcfMargin = published[published.length - 1].value;
+        fcfMarginReconstructed = true;
+      }
+    }
+  }
+
+  // Regression guard: a fresh null for one of the 6 comparable metrics
+  // doesn't overwrite a previously-published real value for the same field
+  // (see pickMetricValue above) — applied per field, not as an all-or-
+  // nothing choice, so a ticker with one genuinely new gap (say, a metric
+  // Finnhub just stopped reporting) still gets its OTHER, still-healthy
+  // fields refreshed normally.
+  const previous = previouslyPublishedMetrics[symbol];
+  if (previous) {
+    for (const key of COMPARABLE_KEYS) {
+      values[key] = pickMetricValue(previous[key], values[key]);
+    }
+  }
+
+  return {
+    status: 'ok',
+    profile: profileEntry,
+    metrics: { industry: profile.industry, ...values, estimatedFairValue },
+    nativeTrends: Object.keys(mergedNativeForSymbol).length ? mergedNativeForSymbol : null,
+    yearlyTrends: Object.keys(mergedYearlyForSymbol).length ? mergedYearlyForSymbol : null,
+    quarterlyTrends: Object.keys(mergedQuarterlyForSymbol).length ? mergedQuarterlyForSymbol : null,
+    ttmTrends: Object.keys(mergedTtmForSymbol).length ? mergedTtmForSymbol : null,
+    dcfComputed,
+    fcfMarginReconstructed,
+  };
+}
+
+// Sequentially processes one worker's slice of the ticker universe against
+// one Finnhub API key, pacing every call by REQUEST_SPACING_MS exactly as
+// the original single-worker loop did — the only thing that changed is
+// that main() now runs one of these per available key, concurrently.
+async function runWorker(workerId, symbolSubset, apiKey, ctx) {
+  const result = {
+    metrics: {},
+    profiles: {},
+    nativeTrends: {},
+    yearlyTrends: {},
+    quarterlyTrends: {},
+    ttmTrends: {},
+    ok: 0,
+    failed: 0,
+    dead: 0,
+    dcfComputed: 0,
+    fcfMarginReconstructed: 0,
+  };
+
+  for (let i = 0; i < symbolSubset.length; i++) {
+    const symbol = symbolSubset[i];
+    try {
+      const r = await processSymbol(symbol, apiKey, ctx);
+      if (r.status === 'dead') {
+        result.dead++;
+      } else {
+        result.profiles[symbol] = r.profile;
+        result.metrics[symbol] = r.metrics;
+        if (r.nativeTrends) result.nativeTrends[symbol] = r.nativeTrends;
+        if (r.yearlyTrends) result.yearlyTrends[symbol] = r.yearlyTrends;
+        if (r.quarterlyTrends) result.quarterlyTrends[symbol] = r.quarterlyTrends;
+        if (r.ttmTrends) result.ttmTrends[symbol] = r.ttmTrends;
+        if (r.dcfComputed) result.dcfComputed++;
+        if (r.fcfMarginReconstructed) result.fcfMarginReconstructed++;
+        result.ok++;
+      }
+    } catch (err) {
+      result.failed++;
+      console.log(`  [key ${workerId}] skip ${symbol}: ${err.message}`);
+    }
+
+    const processedSoFar = result.ok + result.failed + result.dead;
+    if (processedSoFar % 100 === 0 || i === symbolSubset.length - 1) {
+      console.log(
+        `  [key ${workerId}] ${processedSoFar}/${symbolSubset.length} (${result.ok} ok, ${result.failed} failed, ${result.dead} dead/no-data, ` +
+          `${result.dcfComputed} with a fair-value estimate, ${result.fcfMarginReconstructed} FCF margins reconstructed)`
+      );
+    }
+
+    if (i < symbolSubset.length - 1) await sleep(REQUEST_SPACING_MS);
+  }
+
+  return result;
+}
+
 async function main() {
-  const apiKey = readFinnhubApiKey();
-  const symbols = await fetchUniverse(apiKey);
+  const apiKeys = readFinnhubApiKeys();
+  const symbols = await fetchUniverse(apiKeys[0]);
   console.log(
-    `Fetching industry + fundamentals + DCF inputs for ${symbols.length} tickers ` +
-      `(three requests each, a fourth for tickers needing FCF Margin reconstructed from filings, rate-limited to stay under Finnhub's free-tier cap — this takes several hours)...`
+    `Fetching industry + fundamentals + DCF inputs for ${symbols.length} tickers across ${apiKeys.length} API key(s) ` +
+      `(four Finnhub calls each — the fourth is quarterly financials-reported, now fetched for every ticker — rate-limited to stay under Finnhub's free-tier cap per key)...`
   );
 
-  const {
-    metrics: previouslyPublishedMetrics,
-    nativeTrends: previouslyPublishedNativeTrends,
-    yearlyTrends: previouslyPublishedYearlyTrends,
-    quarterlyTrends: previouslyPublishedQuarterlyTrends,
-    ttmTrends: previouslyPublishedTtmTrends,
-  } = await fetchPreviouslyPublishedDataset();
+  const previouslyPublished = await fetchPreviouslyPublishedDataset();
+  const { metrics: previouslyPublishedMetrics } = previouslyPublished;
   console.log(
     `Loaded ${Object.keys(previouslyPublishedMetrics).length} previously-published tickers' metrics ` +
       `(merge-protected against a bad run — see pickMetricValue/pickTrendToPublish).`
   );
+
+  const ctx = {
+    previouslyPublishedMetrics,
+    previouslyPublishedNativeTrends: previouslyPublished.nativeTrends,
+    previouslyPublishedYearlyTrends: previouslyPublished.yearlyTrends,
+    previouslyPublishedQuarterlyTrends: previouslyPublished.quarterlyTrends,
+    previouslyPublishedTtmTrends: previouslyPublished.ttmTrends,
+  };
+
+  // Split the universe across one worker per key, interleaved (round-robin
+  // by index) rather than contiguous halves — cheap insurance against any
+  // systematic clustering in the alphabetically-sorted universe (e.g. a
+  // run of consecutive delisted tickers) skewing one worker's actual
+  // workload heavier than the other's.
+  const workerSymbolSubsets = apiKeys.map(() => []);
+  symbols.forEach((symbol, i) => workerSymbolSubsets[i % apiKeys.length].push(symbol));
+
+  const workerResults = await Promise.all(apiKeys.map((key, idx) => runWorker(idx + 1, workerSymbolSubsets[idx], key, ctx)));
 
   const metrics = {};
   const profiles = {}; // name/logo, kept out of `metrics` to avoid bloating that map — only industryLeaders needs them
@@ -1377,184 +1641,20 @@ async function main() {
   let dcfComputed = 0;
   let fcfMarginReconstructed = 0;
 
-  for (let i = 0; i < symbols.length; i++) {
-    const symbol = symbols[i];
-    try {
-      const profile = await fetchProfileFor(symbol, apiKey);
-
-      // Verified live: Finnhub returns a 200 OK with every profile field
-      // empty (no name, no industry, nothing) for some symbols in the
-      // exchange=US universe list (example: AACO) — stale/delisted/inactive
-      // tickers Finnhub itself has no real data for, not a fetch failure.
-      // Excluded from the dataset entirely rather than stored with all-null
-      // metrics; checking here (before the other two calls) also skips
-      // those calls for a ticker we already know has nothing.
-      if (!profile.name) {
-        dead++;
-      } else {
-        await sleep(REQUEST_SPACING_MS);
-        const { current, quarterly } = await fetchMetricsFor(symbol, apiKey);
-
-        // netMargin's quarterly series is one of the more consistently-present
-        // fields (see QUARTERLY_FIELD_MAP in src/utils/metrics.js) — used here
-        // purely as a proxy for "how many quarters has Finnhub got on this
-        // ticker," for the Industry Leaders history bias (see historyWeight).
-        profiles[symbol] = {
-          ...profile,
-          historyQuarters: (quarterly.netMargin || []).length,
-          trendQualified: computeTrendQualification(quarterly),
-        };
-
-        let estimatedFairValue = null;
-        let annualReportedFinancials = [];
-        await sleep(REQUEST_SPACING_MS);
-        try {
-          annualReportedFinancials = await fetchReportedFinancialsFor(symbol, apiKey);
-          const dcfInputs = extractDcfInputs(annualReportedFinancials);
-          if (dcfInputs) {
-            estimatedFairValue = computeEstimatedFairValue(dcfInputs, current, profile.marketCapitalization, profile.industry);
-            if (estimatedFairValue != null) dcfComputed++;
-          }
-        } catch {
-          // A single ticker's oddly-shaped filing (or a failed request)
-          // shouldn't take down the whole run — just skip its estimate,
-          // same graceful-degradation philosophy as the rest of this
-          // pipeline. Its sector-percentile metrics are unaffected.
-        }
-
-        const values = extractMetricValues(current, quarterly, impliedPriceFromProfile(profile));
-
-        // Tier 1 — native quarterly series (all 6 metrics), straight from
-        // the stock/metric response already fetched above for the current
-        // values. Zero extra API cost — this is data already in hand, just
-        // not previously published. See buildNativeTrendsForTicker's own
-        // comments for why this matters (it's the whole fix for P/E's trend
-        // chart, which has no reconstruction fallback of its own).
-        const freshNativeTrends = buildNativeTrendsForTicker(quarterly);
-        const previousNativeForSymbol = previouslyPublishedNativeTrends[symbol] || {};
-        const mergedNativeForSymbol = {};
-        for (const key of ['roic', 'revenueGrowth', 'profitMargin', 'fcfMargin', 'peRatio', 'pfcfRatio']) {
-          const published = pickTrendToPublish(previousNativeForSymbol[key], freshNativeTrends[key]);
-          if (published.length) mergedNativeForSymbol[key] = published;
-        }
-        if (Object.keys(mergedNativeForSymbol).length) nativeTrends[symbol] = mergedNativeForSymbol;
-
-        // Tier 2/3 — Quarterly/Yearly/TTM reconstruction from raw SEC
-        // filings, for the 4 metrics that don't need Twelve Data price
-        // history. Quarterly financials-reported is now fetched for EVERY
-        // ticker (not just ones with a native-data gap) so these caches
-        // cover the full universe, not just gap tickers — a deliberate,
-        // ~70-minute-longer run in exchange for every metric's trend chart
-        // loading from a precomputed cache instead of live-reconstructing
-        // on first tap. annualReportedFinancials is already fetched above
-        // for the DCF estimate, at no extra cost either way.
-        let quarterlyFinancials = [];
-        await sleep(REQUEST_SPACING_MS);
-        try {
-          quarterlyFinancials = await fetchReportedFinancialsQuarterlyFor(symbol, apiKey);
-        } catch {
-          // Leave quarterlyFinancials empty — every builder below degrades
-          // gracefully to "nothing new," and pickTrendToPublish falls back
-          // to whatever was already published rather than losing it.
-        }
-
-        const isBankLike = isFinancialIndustry(profile.industry);
-        const yearlyBuilders = {
-          revenueGrowth: () => buildRevenueGrowthYearlyFromFilings(annualReportedFinancials),
-          profitMargin: () => buildProfitMarginYearlyFromFilings(annualReportedFinancials),
-          fcfMargin: () => (isBankLike ? [] : buildFcfMarginYearlyFromFilings(annualReportedFinancials)),
-          roic: () => buildRoicYearlyFromFilings(annualReportedFinancials),
-        };
-        const quarterlyBuilders = {
-          revenueGrowth: () => buildRevenueGrowthQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials),
-          profitMargin: () => buildProfitMarginQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials),
-          fcfMargin: () => (isBankLike ? [] : buildFcfMarginQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials)),
-          roic: () => buildRoicQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials),
-        };
-        const ttmBuilders = {
-          revenueGrowth: () => buildRevenueGrowthTTMFromFilings(quarterlyFinancials, annualReportedFinancials),
-          profitMargin: () => buildProfitMarginTTMFromFilings(quarterlyFinancials, annualReportedFinancials),
-          fcfMargin: () => (isBankLike ? [] : buildFcfMarginTrendFromFilings(quarterlyFinancials, annualReportedFinancials)),
-          roic: () => buildRoicTTMFromFilings(quarterlyFinancials, annualReportedFinancials),
-        };
-
-        const mergedYearlyForSymbol = {};
-        const mergedQuarterlyForSymbol = {};
-        const mergedTtmForSymbol = {};
-        const previousYearlyForSymbol = previouslyPublishedYearlyTrends[symbol] || {};
-        const previousQuarterlyForSymbol = previouslyPublishedQuarterlyTrends[symbol] || {};
-        const previousTtmForSymbol = previouslyPublishedTtmTrends[symbol] || {};
-
-        for (const key of Object.keys(yearlyBuilders)) {
-          let fresh = [];
-          try {
-            fresh = yearlyBuilders[key]();
-          } catch {
-            // A single metric's oddly-shaped filing shouldn't take down the
-            // others — pickTrendToPublish falls back to the previous run.
-          }
-          const published = pickTrendToPublish(previousYearlyForSymbol[key], fresh);
-          if (published.length) mergedYearlyForSymbol[key] = published;
-        }
-        for (const key of Object.keys(quarterlyBuilders)) {
-          let fresh = [];
-          try {
-            fresh = quarterlyBuilders[key]();
-          } catch {
-            // Same graceful-degradation philosophy as above.
-          }
-          const published = pickTrendToPublish(previousQuarterlyForSymbol[key], fresh);
-          if (published.length) mergedQuarterlyForSymbol[key] = published;
-        }
-        for (const key of Object.keys(ttmBuilders)) {
-          let fresh = [];
-          try {
-            fresh = ttmBuilders[key]();
-          } catch {
-            // Same graceful-degradation philosophy as above.
-          }
-          const published = pickTrendToPublish(previousTtmForSymbol[key], fresh);
-          if (published.length) {
-            mergedTtmForSymbol[key] = published;
-            if (key === 'fcfMargin' && values.fcfMargin == null) {
-              values.fcfMargin = published[published.length - 1].value;
-              fcfMarginReconstructed++;
-            }
-          }
-        }
-
-        if (Object.keys(mergedYearlyForSymbol).length) yearlyTrends[symbol] = mergedYearlyForSymbol;
-        if (Object.keys(mergedQuarterlyForSymbol).length) quarterlyTrends[symbol] = mergedQuarterlyForSymbol;
-        if (Object.keys(mergedTtmForSymbol).length) ttmTrends[symbol] = mergedTtmForSymbol;
-
-        // Regression guard: a fresh null for one of the 6 comparable metrics
-        // doesn't overwrite a previously-published real value for the same
-        // field (see pickMetricValue above) — applied per field, not as an
-        // all-or-nothing choice, so a ticker with one genuinely new gap
-        // (say, a metric Finnhub just stopped reporting) still gets its
-        // OTHER, still-healthy fields refreshed normally.
-        const previous = previouslyPublishedMetrics[symbol];
-        if (previous) {
-          for (const key of COMPARABLE_KEYS) {
-            values[key] = pickMetricValue(previous[key], values[key]);
-          }
-        }
-
-        metrics[symbol] = { industry: profile.industry, ...values, estimatedFairValue };
-        ok++;
-      }
-    } catch (err) {
-      failed++;
-      console.log(`  skip ${symbol}: ${err.message}`);
-    }
-
-    if ((i + 1) % 100 === 0 || i === symbols.length - 1) {
-      console.log(
-        `  ${i + 1}/${symbols.length} (${ok} ok, ${failed} failed, ${dead} dead/no-data, ${dcfComputed} with a fair-value estimate, ${fcfMarginReconstructed} FCF margins reconstructed)`
-      );
-    }
-
-    if (i < symbols.length - 1) await sleep(REQUEST_SPACING_MS);
+  // Each worker owns a disjoint slice of `symbols`, so these merges never
+  // collide.
+  for (const r of workerResults) {
+    Object.assign(metrics, r.metrics);
+    Object.assign(profiles, r.profiles);
+    Object.assign(nativeTrends, r.nativeTrends);
+    Object.assign(yearlyTrends, r.yearlyTrends);
+    Object.assign(quarterlyTrends, r.quarterlyTrends);
+    Object.assign(ttmTrends, r.ttmTrends);
+    ok += r.ok;
+    failed += r.failed;
+    dead += r.dead;
+    dcfComputed += r.dcfComputed;
+    fcfMarginReconstructed += r.fcfMarginReconstructed;
   }
 
   const industryLeaders = computeIndustryLeaders(metrics, profiles);

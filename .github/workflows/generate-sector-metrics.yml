@@ -12,16 +12,21 @@
 # for two reasons:
 #   1. A Gist's visibility doesn't depend on the repo that updates it, so
 #      the app's source can stay private while this feed stays public.
-#   2. This job takes ~6.5-7.5 hours (four Finnhub calls per ticker — the
-#      third is for the estimated-fair-value DCF, the fourth is quarterly
-#      financials-reported, now fetched for every ticker rather than just
-#      ones with a native-data gap, so every metric's Quarterly/Yearly/TTM
-#      trend chart can load from a precomputed cache instead of live-
-#      reconstructing on first tap — rate-limited to stay under the
-#      free-tier 60/min cap). Public repos get unlimited free GitHub
-#      Actions minutes on standard runners; private repos only get a
-#      limited monthly allowance, which a daily multi-hour job would blow
-#      through fast.
+#   2. This job takes ~6.5-7.5 hours on a single Finnhub key (four calls per
+#      ticker — the third is for the estimated-fair-value DCF, the fourth
+#      is quarterly financials-reported, now fetched for every ticker
+#      rather than just ones with a native-data gap, so every metric's
+#      Quarterly/Yearly/TTM trend chart can load from a precomputed cache
+#      instead of live-reconstructing on first tap — rate-limited to stay
+#      under the free-tier 60/min cap PER KEY). If a second repository
+#      secret, FINNHUB_API_KEY_2, is set (a second, independent free
+#      Finnhub account), the script splits the ticker universe across one
+#      worker per key running concurrently, each pacing its own calls
+#      against its own key's 60/min budget — this roughly halves the
+#      runtime to ~3.25-3.75hrs. Optional: the job runs fine on one key,
+#      just slower. Public repos get unlimited free GitHub Actions minutes
+#      on standard runners; private repos only get a limited monthly
+#      allowance, which a daily multi-hour job would blow through fast.
 #
 # Failure monitoring: on failure, opens (or comments on, if one's already
 # open) a `pipeline-failure`-labeled issue in this repo — auto-closed the
@@ -36,8 +41,11 @@
 #
 # One-time setup required (this workflow can't do these for you):
 #   1. Add a repository secret named FINNHUB_API_KEY with your Finnhub key.
-#   2. Add a repository secret named GIST_ID (the target Gist's ID).
-#   3. Add a repository secret named GIST_TOKEN — a Personal Access Token
+#   2. Optional: add a repository secret named FINNHUB_API_KEY_2 with a
+#      SECOND, independent Finnhub account's key, to roughly halve the
+#      runtime (see point 2 above). Leave it unset to run on one key.
+#   3. Add a repository secret named GIST_ID (the target Gist's ID).
+#   4. Add a repository secret named GIST_TOKEN — a Personal Access Token
 #      scoped to ONLY "gist", CLASSIC type (not fine-grained — fine-grained
 #      tokens' Gists permission can end up read-only, which fails silently
 #      as an HTTP 404 on the write, not a clear permission error).
@@ -78,6 +86,7 @@ jobs:
       - name: Generate dataset
         env:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          FINNHUB_API_KEY_2: ${{ secrets.FINNHUB_API_KEY_2 }}
         run: node scripts/generateSectorMetrics.js
 
       - name: Audit metric coverage
