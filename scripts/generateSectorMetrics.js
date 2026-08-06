@@ -447,14 +447,28 @@ function extractDcfInputs(reportedFinancials) {
 // separately, only for tickers with this specific gap (see the main loop),
 // so this doesn't add a call for the ~3,770 tickers that don't need it.
 
-const REVENUE_CONCEPT_CANDIDATES = ['us-gaap_RevenuesNetOfInterestExpense', 'us-gaap_Revenues', 'us-gaap_RevenueFromContractWithCustomerExcludingAssessedTax'];
+// Mirrors REVENUE_CONCEPT_CANDIDATES/REVENUE_CONTRACT_CONCEPT_PREFIX in
+// src/utils/metrics.js — see that file for the full rationale (verified
+// live: SoundHound AI/SOUN uses the ...IncludingAssessedTax variant with a
+// plural "Revenues" label; an open-ended prefix match catches that AND any
+// future suffix variant we haven't individually seen yet, rather than
+// growing an exact-match list one ticker at a time).
+const REVENUE_CONCEPT_CANDIDATES = ['us-gaap_RevenuesNetOfInterestExpense', 'us-gaap_Revenues', 'us-gaap_SalesRevenueNet'];
+const REVENUE_CONTRACT_CONCEPT_PREFIX = 'us-gaap_RevenueFromContractWithCustomer';
+const REVENUE_CONTRACT_CONCEPT_EXCLUDE = /RemainingPerformanceObligation|Disaggregation|PolicyTextBlock|TableTextBlock|Liability|Asset|Member|Axis|Domain/i;
+const REVENUE_LABEL_PATTERN = /^(total\s+)?(net\s+)?revenues?(,?\s*net)?$|^(total\s+)?net\s+sales$/i;
 
 function findReportedRevenue(icItems) {
   for (const concept of REVENUE_CONCEPT_CANDIDATES) {
     const match = icItems.find((item) => item.concept === concept);
     if (match) return match.value;
   }
-  const labelMatch = icItems.find((item) => /^total\b.*revenue|^revenue$/i.test(item.label || ''));
+  const contractRevenueMatch = icItems.find(
+    (item) => item.value != null && (item.concept || '').startsWith(REVENUE_CONTRACT_CONCEPT_PREFIX) && !REVENUE_CONTRACT_CONCEPT_EXCLUDE.test(item.concept)
+  );
+  if (contractRevenueMatch) return contractRevenueMatch.value;
+
+  const labelMatch = icItems.find((item) => REVENUE_LABEL_PATTERN.test((item.label || '').trim()));
   if (labelMatch) return labelMatch.value;
 
   // Mirrors findReportedRevenue in src/utils/metrics.js — some banks
