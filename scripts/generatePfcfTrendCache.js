@@ -279,6 +279,72 @@ function buildPfcfTrendFromFilingsAndPrices(quarterlyReports, annualReports, mon
   return points.slice(-QUARTERS_OF_HISTORY);
 }
 
+function yearlyLabel(year) {
+  return `FY '${String(year).slice(-2)}`;
+}
+
+// Standalone (non-TTM) quarterly P/FCF — mirrors buildPfcfQuarterlyFromFilingsAndPrices
+// in src/utils/metrics.js. Annualized (x4), not the raw single-quarter FCF —
+// P/FCF's convention divides price by a full YEAR of cash flow; dividing by
+// just one quarter's FCF instead would inflate the multiple ~4x for no real
+// reason and make it incomparable to the Yearly/TTM views (verified live
+// building the app's equivalent tabs: AAPL's raw single-quarter P/FCF
+// computed to 150-170x vs. a sensible 21-39x on an annual basis).
+function buildPfcfQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices) {
+  const currentCik = quarterlyReports?.[0]?.cik ?? annualReports?.[0]?.cik;
+  const sameCik = (r) => currentCik == null || r.cik === currentCik;
+  quarterlyReports = (quarterlyReports || []).filter(sameCik);
+  annualReports = (annualReports || []).filter(sameCik);
+
+  const ocf = decumulateYtdByYear(quarterlyReports, annualReports, findReportedOperatingCashFlowQ, 'cf');
+  const capex = decumulateYtdByYear(quarterlyReports, annualReports, findReportedCapexQ, 'cf');
+
+  const sharesByQuarter = {};
+  for (const q of quarterlyReports || []) {
+    if (!q?.quarter) continue;
+    const shares = findReportedDilutedShares(q.report?.ic || []);
+    if (shares != null) sharesByQuarter[`${q.year}-${q.quarter}`] = shares;
+  }
+
+  const points = [];
+  for (const key of Object.keys(ocf)) {
+    if (capex[key] == null || !(sharesByQuarter[key] > 0)) continue;
+    const [year, quarter] = key.split('-').map(Number);
+    const annualizedFcfPerShare = ((ocf[key] - capex[key]) / sharesByQuarter[key]) * 4;
+    const price = findClosestMonthlyPrice(monthlyPrices, quarterEndDate(year, quarter));
+    const value = price != null && annualizedFcfPerShare !== 0 ? price / annualizedFcfPerShare : null;
+    if (value != null) points.push({ year, quarter, label: `Q${quarter} '${String(year).slice(-2)}`, value });
+  }
+  return points
+    .sort((a, b) => a.year - b.year || a.quarter - b.quarter)
+    .map(({ label, value }) => ({ label, value }))
+    .slice(-QUARTERS_OF_HISTORY);
+}
+
+// One P/FCF point per fiscal year, priced at that year's Dec-31-equivalent
+// close — mirrors buildPfcfYearlyFromFilingsAndPrices in src/utils/metrics.js.
+function buildPfcfYearlyFromFilingsAndPrices(annualReports, monthlyPrices) {
+  const currentCik = annualReports?.[0]?.cik;
+  const sameCik = (r) => currentCik == null || r.cik === currentCik;
+  const filtered = (annualReports || []).filter(sameCik);
+
+  const points = [];
+  for (const a of filtered) {
+    const ocf = findReportedOperatingCashFlowQ(a.report?.cf || []);
+    const capex = findReportedCapexQ(a.report?.cf || []);
+    const shares = findReportedDilutedShares(a.report?.ic || []);
+    if (ocf == null || capex == null || !(shares > 0)) continue;
+    const fcfPerShare = (ocf - capex) / shares;
+    const price = findClosestMonthlyPrice(monthlyPrices, quarterEndDate(a.year, 4));
+    const value = price != null && fcfPerShare !== 0 ? price / fcfPerShare : null;
+    if (value != null) points.push({ year: a.year, label: yearlyLabel(a.year), value });
+  }
+  return points
+    .sort((a, b) => a.year - b.year)
+    .map(({ label, value }) => ({ label, value }))
+    .slice(-QUARTERS_OF_HISTORY);
+}
+
 // A fresh attempt can come back empty or narrower on a day where Finnhub or
 // Twelve Data has a transient hiccup for this specific ticker — that's not
 // the same fact as "this ticker's trend no longer exists." Only replaces a
@@ -291,6 +357,14 @@ function pickTrendToPublish(existingPoints, freshPoints) {
   const existingLabels = new Set(existingPoints.map((p) => p.label));
   const hasNewQuarter = freshPoints.some((p) => !existingLabels.has(p.label));
   return hasNewQuarter ? freshPoints : existingPoints;
+}
+
+function pickCadenceTrendsToPublish(existingEntry, fresh) {
+  return {
+    ttm: pickTrendToPublish(existingEntry?.ttm, fresh.ttm),
+    quarterly: pickTrendToPublish(existingEntry?.quarterly, fresh.quarterly),
+    yearly: pickTrendToPublish(existingEntry?.yearly, fresh.yearly),
+  };
 }
 
 async function fetchReportedFinancials(symbol, freq, apiKey) {
@@ -327,10 +401,10 @@ async function main() {
     .sort((a, b) => a.attemptedAt - b.attemptedAt)
     .map((x) => x.symbol);
 
-  const alreadyCovered = priority.filter((s) => cache[s]?.points?.length).length;
+  const alreadyCovered = priority.filter((s) => cache[s]?.ttm?.length).length;
   console.log(
-    `${gapSymbols.length} tickers currently have a P/FCF gap; ${alreadyCovered} already have a cached trend. ` +
-      `Processing up to ${MAX_TWELVEDATA_CALLS_PER_RUN} this run (oldest/never-attempted first)...`
+    `${gapSymbols.length} tickers currently have a P/FCF gap; ${alreadyCovered} already have a cached TTM trend. ` +
+      `Processing up to ${MAX_TWELVEDATA_CALLS_PER_RUN} this run (oldest/never-attempted first) — computing Quarterly/Yearly/TTM together from the same fetched data.`
   );
 
   const startTime = Date.now();
@@ -348,7 +422,7 @@ async function main() {
       break;
     }
 
-    let freshPoints = [];
+    let fresh = { ttm: [], quarterly: [], yearly: [] };
     try {
       // Fully sequential, each call followed by its own spacing — NOT
       // Promise.all. A concurrent version of this exact pattern (verified
@@ -365,28 +439,34 @@ async function main() {
       const monthlyPrices = await fetchMonthlyPrices(symbol, twelveDataKey);
       twelveDataCalls++;
 
-      freshPoints = buildPfcfTrendFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices);
+      // All three cadences reuse this SAME fetched data — no extra API
+      // calls beyond the ones already budgeted above.
+      fresh = {
+        ttm: buildPfcfTrendFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices),
+        quarterly: buildPfcfQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices),
+        yearly: buildPfcfYearlyFromFilingsAndPrices(annualReports, monthlyPrices),
+      };
     } catch (err) {
       console.log(`  skip ${symbol}: ${err.message}`);
-      // pickTrendToPublish below falls back to whatever was already cached
-      // for this symbol rather than losing it over one failed request.
+      // pickCadenceTrendsToPublish below falls back to whatever was already
+      // cached for this symbol rather than losing it over one failed request.
     }
 
-    const points = pickTrendToPublish(cache[symbol]?.points, freshPoints);
-    cache[symbol] = { fetchedAt: new Date().toISOString(), points };
-    if (points.length) resolved++;
+    const cadences = pickCadenceTrendsToPublish(cache[symbol], fresh);
+    cache[symbol] = { fetchedAt: new Date().toISOString(), ...cadences };
+    if (cadences.ttm.length) resolved++;
 
     processed++;
     if (processed % 50 === 0) {
-      console.log(`  ${processed}/${priority.length} processed (${resolved} with a trend), ${((Date.now() - startTime) / 60000).toFixed(0)}min elapsed, ${twelveDataCalls} Twelve Data calls used`);
+      console.log(`  ${processed}/${priority.length} processed (${resolved} with a TTM trend), ${((Date.now() - startTime) / 60000).toFixed(0)}min elapsed, ${twelveDataCalls} Twelve Data calls used`);
     }
   }
 
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify({ generatedAt: new Date().toISOString(), trends: cache }));
-  const totalCovered = Object.values(cache).filter((entry) => entry.points?.length).length;
+  const totalCovered = Object.values(cache).filter((entry) => entry.ttm?.length).length;
   console.log(
-    `Done. Processed ${processed} tickers this run (${resolved} resolved to a trend, ${twelveDataCalls} Twelve Data calls used). ` +
-      `Cache now covers ${totalCovered}/${gapSymbols.length} gap tickers total.`
+    `Done. Processed ${processed} tickers this run (${resolved} resolved to a TTM trend, ${twelveDataCalls} Twelve Data calls used). ` +
+      `Cache now covers ${totalCovered}/${gapSymbols.length} gap tickers total (TTM basis).`
   );
 }
 

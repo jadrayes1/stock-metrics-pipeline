@@ -12,10 +12,12 @@
 # for two reasons:
 #   1. A Gist's visibility doesn't depend on the repo that updates it, so
 #      the app's source can stay private while this feed stays public.
-#   2. This job takes ~4-5 hours (three Finnhub calls per ticker — the
-#      third is for the estimated-fair-value DCF, computed for every
-#      ticker including Banking/Insurance/Financial Services, though FCF-
-#      based DCF is a known poor fit there — rate-limited to stay under the
+#   2. This job takes ~6.5-7.5 hours (four Finnhub calls per ticker — the
+#      third is for the estimated-fair-value DCF, the fourth is quarterly
+#      financials-reported, now fetched for every ticker rather than just
+#      ones with a native-data gap, so every metric's Quarterly/Yearly/TTM
+#      trend chart can load from a precomputed cache instead of live-
+#      reconstructing on first tap — rate-limited to stay under the
 #      free-tier 60/min cap). Public repos get unlimited free GitHub
 #      Actions minutes on standard runners; private repos only get a
 #      limited monthly allowance, which a daily multi-hour job would blow
@@ -44,16 +46,18 @@ name: Generate sector metrics
 
 on:
   schedule:
-    # 02:00 UTC (~10pm US Eastern the prior night). Moved earlier from 08:00
-    # UTC after observing GitHub consistently starts this repo's scheduled
-    # runs 2h36m-3h24m late (and trending later) — likely GitHub deprior-
-    # itizing cron-triggered runs on public repos under load, not something
-    # this workflow controls. Combined with the run itself now taking
-    # ~5.5hrs (FCF Margin reconstruction added time on top of the original
-    # ~4.5-4.8hrs), the old 08:00 UTC start was landing at or after 9am ET
-    # market open instead of comfortably before it. This start time leaves
-    # roughly 2hrs of buffer against 9am ET even in a worst-case delay.
-    - cron: '0 2 * * *'
+    # 00:00 UTC (~8pm US Eastern the prior night). Moved earlier from 02:00
+    # UTC (which itself was moved from 08:00 — see git history) after adding
+    # full Quarterly/Yearly/TTM trend caching pushed runtime from ~5.5hrs to
+    # an estimated ~6.5-7.5hrs (quarterly financials-reported is now fetched
+    # for every ticker, not just gap ones). Combined with GitHub's observed
+    # 2h36m-3h24m scheduled-run start delay on this public repo, the old
+    # 02:00 UTC start risked landing at or after 9am ET market open in a
+    # worst case instead of comfortably before it. This start time is a
+    # proactive estimate, not yet measured against a real run at the new
+    # runtime — re-tune if the actual finish time cuts it closer than
+    # expected once real data comes in.
+    - cron: '0 0 * * *'
   workflow_dispatch: {}
 
 permissions:
@@ -63,7 +67,7 @@ permissions:
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 420
+    timeout-minutes: 600
     steps:
       - uses: actions/checkout@v4
 

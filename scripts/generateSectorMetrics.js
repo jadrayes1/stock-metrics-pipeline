@@ -599,45 +599,19 @@ async function fetchReportedFinancialsQuarterlyFor(symbol, apiKey) {
 }
 
 // ---------------------------------------------------------------------------
-// FCF Margin TREND reconstruction (full series, not just the latest value —
-// see fcfMargin above for the single-value case this supersedes). Published
-// alongside the metrics so the app's trend chart (MetricTrendScreen) can
-// read a precomputed, cross-user-shared series instead of every device
-// independently reconstructing the same thing live (see fetchFcfMarginTrendFallback
-// in src/api/stockData.js, and buildFcfMarginFromFilings in src/utils/metrics.js,
-// which this mirrors). Gated the same way the app's own trend screen decides
-// it needs a fallback: Finnhub's native quarterly fcfMargin series is either
-// entirely empty OR has internal gaps (see hasInternalGaps below) — not just
-// "the latest point is missing," which misses tickers with real but stale or
-// holey data (verified live: Cencora/COR's fcfMargin jumps from Q4 '23 to Q2
-// '24, Q3 '24 to Q1 '25, etc. — never empty, always gapped).
+// Trend reconstruction from raw SEC filings (Quarterly/Yearly/TTM, all 4
+// metrics that don't need Twelve Data price history). Published alongside
+// the metrics so the app's trend charts (MetricTrendScreen) can read a
+// precomputed, cross-user-shared series instead of every device
+// independently reconstructing the same thing live. Computed for every
+// ticker (not gated on the native series having a gap) — see the main loop
+// below — so both the native (Tier 1) and reconstructed (Tier 2/3) caches
+// are always available; the app picks whichever is actually better
+// (pickBetterTrend in src/utils/metrics.js), same as it already does for
+// the live per-device fallback path.
 // ---------------------------------------------------------------------------
 
 const QUARTERS_OF_HISTORY = 12; // mirrors src/utils/metrics.js
-
-function parseQuarterLabel(label) {
-  const match = /^Q(\d) '(\d\d)$/.exec(label || '');
-  return match ? { quarter: Number(match[1]), year: 2000 + Number(match[2]) } : null;
-}
-
-function quarterOrdinal({ year, quarter }) {
-  return year * 4 + quarter;
-}
-
-// Mirrors hasInternalGaps in src/utils/metrics.js — see that file for the
-// full rationale (Finnhub's quarterly series can skip calendar quarters in
-// the middle even with older and very recent data both present).
-function hasInternalGaps(points, maxAllowedGaps = 1) {
-  let missing = 0;
-  for (let i = 1; i < points.length; i++) {
-    const prev = parseQuarterLabel(points[i - 1].label);
-    const curr = parseQuarterLabel(points[i].label);
-    if (!prev || !curr) continue;
-    const diff = quarterOrdinal(curr) - quarterOrdinal(prev);
-    if (diff > 1) missing += diff - 1;
-  }
-  return missing > maxAllowedGaps;
-}
 
 function quarterLabelFromPeriod(period) {
   if (!period) return null;
@@ -647,13 +621,58 @@ function quarterLabelFromPeriod(period) {
   return `Q${q} '${String(d.getFullYear()).slice(-2)}`;
 }
 
-// Finnhub's own quarterly.fcfMargin series (most-recent-first) -> chronological
-// {label, value} points — mirrors extractQuarterlyMetricSeries in
-// src/utils/metrics.js for this one field, just without needing the rest of
-// that function's metricKey branching.
-function nativeFcfMarginPoints(quarterly) {
-  const entries = (quarterly?.fcfMargin || []).slice(0, QUARTERS_OF_HISTORY);
-  return entries.map((entry) => ({ label: quarterLabelFromPeriod(entry.period), value: entry?.v ?? null })).reverse();
+// ---------------------------------------------------------------------------
+// Native quarterly-series capture (all 6 metrics) — Finnhub's stock/metric
+// response (already fetched for every ticker's card values) includes the
+// FULL quarterly series, not just the current value extractMetricValues
+// pulls out above — previously discarded after that single value was read.
+// Publishing it lets the app's trend charts read a precomputed series
+// instead of re-fetching stock/metric live on first view every session —
+// verified live this was the ONLY thing making P/E's trend chart slow to
+// load: unlike the other 5 comparable metrics, P/E has no SEC-filings
+// reconstruction fallback to fall back on, so a live fetch was the ENTIRE
+// story for it. Mirrors extractQuarterlyMetricSeries in src/utils/metrics.js
+// (see that file for the full field-mapping rationale — current/quarterly
+// field names don't match 1:1, e.g. current.roiTTM vs quarterly.roicTTM).
+// ---------------------------------------------------------------------------
+
+const NATIVE_QUARTERLY_FIELD_MAP = {
+  roic: 'roicTTM',
+  profitMargin: 'netMargin',
+  fcfMargin: 'fcfMargin',
+  peRatio: 'peTTM',
+  pfcfRatio: 'pfcfTTM',
+};
+
+function extractNativeQuarterlySeries(quarterly, metricKey) {
+  const series = quarterly || {};
+  if (metricKey === 'revenueGrowth') {
+    const sales = series.salesPerShare || [];
+    const points = [];
+    for (let i = 0; i < sales.length - 4 && points.length < QUARTERS_OF_HISTORY; i++) {
+      const thisQuarter = sales[i];
+      const yearAgo = sales[i + 4];
+      const value = thisQuarter?.v != null && yearAgo?.v ? (thisQuarter.v - yearAgo.v) / yearAgo.v : null;
+      points.push({ label: quarterLabelFromPeriod(thisQuarter?.period), value });
+    }
+    return points.reverse();
+  }
+  const field = NATIVE_QUARTERLY_FIELD_MAP[metricKey];
+  const entries = ((field && series[field]) || []).slice(0, QUARTERS_OF_HISTORY);
+  return entries.map((entry) => ({ label: quarterLabelFromPeriod(entry?.period), value: entry?.v ?? null })).reverse();
+}
+
+// One ticker's native quarterly series across all 6 metrics, keyed by
+// metricKey — a metric is only included if at least one point has a real
+// (non-null) value, so a ticker with nothing for, say, fcfMargin doesn't
+// publish an array of all-null points.
+function buildNativeTrendsForTicker(quarterly) {
+  const result = {};
+  for (const metricKey of ['roic', 'revenueGrowth', 'profitMargin', 'fcfMargin', 'peRatio', 'pfcfRatio']) {
+    const points = extractNativeQuarterlySeries(quarterly, metricKey);
+    if (points.some((p) => p.value != null)) result[metricKey] = points;
+  }
+  return result;
 }
 
 // Mirrors buildFcfMarginFromFilings in src/utils/metrics.js — full trend,
@@ -686,6 +705,314 @@ function buildFcfMarginTrendFromFilings(quarterlyReports, annualReports) {
   return points.slice(-QUARTERS_OF_HISTORY);
 }
 
+// ---------------------------------------------------------------------------
+// Quarterly / Yearly / TTM cadence coverage for revenueGrowth, profitMargin,
+// and roic (fcfMargin's TTM already exists above; pfcfRatio's three cadences
+// live in the SEPARATE pfcfTrendCache pipeline instead, since P/FCF needs
+// Twelve Data price history — that provider's 800/day free-tier cap can't
+// support fetching a price series for all ~5,140 tickers here). Mirrors the
+// identically-named functions in src/utils/metrics.js (built for the app's
+// Quarterly/Yearly/TTM trend-chart tabs) — see that file for the full
+// rationale behind each piece (MAX_ABS_RATIO's near-zero-denominator
+// clamp, the annualization needed for ROIC's Quarterly view, etc.).
+// ---------------------------------------------------------------------------
+
+const NET_INCOME_CONCEPT_CANDIDATES = ['us-gaap_NetIncomeLoss', 'us-gaap_ProfitLoss'];
+function findReportedNetIncome(icItems) {
+  for (const concept of NET_INCOME_CONCEPT_CANDIDATES) {
+    const match = icItems.find((item) => item.concept === concept);
+    if (match) return match.value;
+  }
+  const labelMatch = icItems.find((item) => /^net income/i.test(item.label || ''));
+  return labelMatch ? labelMatch.value : null;
+}
+
+function findReportedEBIT(icItems) {
+  const match = icItems.find((item) => item.concept === 'us-gaap_OperatingIncomeLoss');
+  if (match) return match.value;
+  const labelMatch = icItems.find((item) => /operating income|income from operations/i.test(item.label || ''));
+  return labelMatch ? labelMatch.value : null;
+}
+
+function findReportedTotalEquity(bsItems) {
+  const match = bsItems.find((item) => item.concept === 'us-gaap_StockholdersEquity');
+  if (match) return match.value;
+  const labelMatch = bsItems.find((item) => /total (share|stock)holders.{0,5}equity/i.test(item.label || ''));
+  return labelMatch ? labelMatch.value : null;
+}
+
+function findReportedCashBalance(bsItems) {
+  const match = bsItems.find((item) => item.concept === 'us-gaap_CashAndCashEquivalentsAtCarryingValue');
+  if (match) return match.value;
+  const labelMatch = bsItems.find((item) => /cash and cash equivalents/i.test(item.label || ''));
+  return labelMatch ? labelMatch.value : null;
+}
+
+const ROIC_ASSUMED_TAX_RATE = 0.21; // matches the DCF estimate's own default simplification above
+
+const MAX_ABS_RATIO = 10; // 1000% — see clampImplausible in src/utils/metrics.js for the full rationale
+function clampImplausible(value) {
+  return value != null && Math.abs(value) <= MAX_ABS_RATIO ? value : null;
+}
+
+// Generic YTD-cumulative flow-item de-cumulation across multiple fields at
+// once — mirrors buildStandaloneFlowQuarters in src/utils/metrics.js.
+function buildStandaloneFlowQuarters(quarterlyReports, annualReports, fieldSpecs) {
+  const perField = {};
+  for (const [name, { fn, section }] of Object.entries(fieldSpecs)) {
+    perField[name] = decumulateYtdByYear(quarterlyReports, annualReports, fn, section);
+  }
+  const keys = new Set();
+  for (const map of Object.values(perField)) Object.keys(map).forEach((k) => keys.add(k));
+
+  return Array.from(keys)
+    .map((key) => {
+      const [year, quarter] = key.split('-').map(Number);
+      const record = { year, quarter };
+      for (const name of Object.keys(fieldSpecs)) record[name] = perField[name][key];
+      return record;
+    })
+    .filter((record) => Object.keys(fieldSpecs).every((name) => record[name] != null))
+    .sort((a, b) => a.year - b.year || a.quarter - b.quarter);
+}
+
+// Reads the ANNUAL report directly (no de-cumulation — a 10-K's own figures
+// already ARE the full fiscal year's totals) — mirrors buildAnnualFlowPoints
+// in src/utils/metrics.js.
+function buildAnnualFlowPoints(annualReports, fieldSpecs) {
+  const currentCik = annualReports?.[0]?.cik;
+  const sameCik = (r) => currentCik == null || r.cik === currentCik;
+  const filtered = (annualReports || []).filter(sameCik);
+
+  return filtered
+    .map((a) => {
+      const record = { year: a.year };
+      for (const [name, { fn, section }] of Object.entries(fieldSpecs)) {
+        record[name] = fn(a.report?.[section] || []);
+      }
+      return record;
+    })
+    .filter((record) => Object.keys(fieldSpecs).every((name) => record[name] != null))
+    .sort((a, b) => a.year - b.year);
+}
+
+function yearlyLabel(year) {
+  return `FY '${String(year).slice(-2)}`;
+}
+
+// --- FCF Margin: Quarterly + Yearly (TTM already exists above) ---
+
+function buildFcfMarginQuarterlyFromFilings(quarterlyReports, annualReports) {
+  const records = buildStandaloneFlowQuarters(quarterlyReports, annualReports, {
+    ocf: { fn: findReportedOperatingCashFlowQ, section: 'cf' },
+    capex: { fn: findReportedCapexQ, section: 'cf' },
+    revenue: { fn: findReportedRevenue, section: 'ic' },
+  });
+  return records
+    .map((r) => ({ label: `Q${r.quarter} '${String(r.year).slice(-2)}`, value: clampImplausible(r.revenue ? (r.ocf - r.capex) / r.revenue : null) }))
+    .filter((p) => p.value != null)
+    .slice(-QUARTERS_OF_HISTORY);
+}
+
+function buildFcfMarginYearlyFromFilings(annualReports) {
+  const records = buildAnnualFlowPoints(annualReports, {
+    ocf: { fn: findReportedOperatingCashFlowQ, section: 'cf' },
+    capex: { fn: findReportedCapexQ, section: 'cf' },
+    revenue: { fn: findReportedRevenue, section: 'ic' },
+  });
+  return records
+    .map((r) => ({ label: yearlyLabel(r.year), value: clampImplausible(r.revenue ? (r.ocf - r.capex) / r.revenue : null) }))
+    .filter((p) => p.value != null)
+    .slice(-QUARTERS_OF_HISTORY);
+}
+
+// --- Revenue Growth: Quarterly (single-quarter YoY), Yearly, TTM ---
+
+function buildRevenueGrowthQuarterlyFromFilings(quarterlyReports, annualReports) {
+  const standalone = decumulateYtdByYear(quarterlyReports, annualReports, findReportedRevenue, 'ic');
+  const chronological = Object.keys(standalone)
+    .map((key) => {
+      const [year, quarter] = key.split('-').map(Number);
+      return { year, quarter, value: standalone[key] };
+    })
+    .sort((a, b) => a.year - b.year || a.quarter - b.quarter);
+
+  const points = [];
+  for (let i = 4; i < chronological.length; i++) {
+    const current = chronological[i];
+    const yearAgo = chronological[i - 4];
+    if (yearAgo.year !== current.year - 1 || yearAgo.quarter !== current.quarter) continue;
+    const value = clampImplausible(yearAgo.value ? (current.value - yearAgo.value) / yearAgo.value : null);
+    if (value != null) points.push({ label: `Q${current.quarter} '${String(current.year).slice(-2)}`, value });
+  }
+  return points.slice(-QUARTERS_OF_HISTORY);
+}
+
+function buildRevenueGrowthYearlyFromFilings(annualReports) {
+  const records = buildAnnualFlowPoints(annualReports, { revenue: { fn: findReportedRevenue, section: 'ic' } });
+  const points = [];
+  for (let i = 1; i < records.length; i++) {
+    if (records[i].year !== records[i - 1].year + 1) continue;
+    const value = clampImplausible(records[i - 1].revenue ? (records[i].revenue - records[i - 1].revenue) / records[i - 1].revenue : null);
+    if (value != null) points.push({ label: yearlyLabel(records[i].year), value });
+  }
+  return points.slice(-QUARTERS_OF_HISTORY);
+}
+
+function buildRevenueGrowthTTMFromFilings(quarterlyReports, annualReports) {
+  const records = buildStandaloneFlowQuarters(quarterlyReports, annualReports, { revenue: { fn: findReportedRevenue, section: 'ic' } });
+  const windows = buildTrailingWindows(records, 4).filter((w) => !w.partial);
+
+  const ttmByKey = {};
+  for (const w of windows) ttmByKey[`${w.anchor.year}-${w.anchor.quarter}`] = w.quarters.reduce((sum, q) => sum + q.revenue, 0);
+  const orderedKeys = Object.keys(ttmByKey)
+    .map((k) => {
+      const [year, quarter] = k.split('-').map(Number);
+      return { year, quarter };
+    })
+    .sort((a, b) => a.year - b.year || a.quarter - b.quarter);
+
+  const points = [];
+  for (let i = 4; i < orderedKeys.length; i++) {
+    const curr = orderedKeys[i];
+    const yearAgo = orderedKeys[i - 4];
+    if (yearAgo.year !== curr.year - 1 || yearAgo.quarter !== curr.quarter) continue;
+    const currTTM = ttmByKey[`${curr.year}-${curr.quarter}`];
+    const yearAgoTTM = ttmByKey[`${yearAgo.year}-${yearAgo.quarter}`];
+    const value = clampImplausible(yearAgoTTM ? (currTTM - yearAgoTTM) / yearAgoTTM : null);
+    if (value != null) points.push({ label: `Q${curr.quarter} '${String(curr.year).slice(-2)}`, value });
+  }
+  return points.slice(-QUARTERS_OF_HISTORY);
+}
+
+// --- Profit Margin: Quarterly, Yearly, TTM ---
+
+function buildProfitMarginQuarterlyFromFilings(quarterlyReports, annualReports) {
+  const revenue = decumulateYtdByYear(quarterlyReports, annualReports, findReportedRevenue, 'ic');
+  const netIncome = decumulateYtdByYear(quarterlyReports, annualReports, findReportedNetIncome, 'ic');
+  const chronological = Object.keys(revenue)
+    .filter((key) => netIncome[key] != null && revenue[key])
+    .map((key) => {
+      const [year, quarter] = key.split('-').map(Number);
+      return { year, quarter, value: clampImplausible(netIncome[key] / revenue[key]) };
+    })
+    .filter((p) => p.value != null)
+    .sort((a, b) => a.year - b.year || a.quarter - b.quarter);
+  return chronological.map((p) => ({ label: `Q${p.quarter} '${String(p.year).slice(-2)}`, value: p.value })).slice(-QUARTERS_OF_HISTORY);
+}
+
+function buildProfitMarginYearlyFromFilings(annualReports) {
+  const records = buildAnnualFlowPoints(annualReports, {
+    netIncome: { fn: findReportedNetIncome, section: 'ic' },
+    revenue: { fn: findReportedRevenue, section: 'ic' },
+  });
+  return records
+    .map((r) => ({ label: yearlyLabel(r.year), value: clampImplausible(r.revenue ? r.netIncome / r.revenue : null) }))
+    .filter((p) => p.value != null)
+    .slice(-QUARTERS_OF_HISTORY);
+}
+
+function buildProfitMarginTTMFromFilings(quarterlyReports, annualReports) {
+  const records = buildStandaloneFlowQuarters(quarterlyReports, annualReports, {
+    netIncome: { fn: findReportedNetIncome, section: 'ic' },
+    revenue: { fn: findReportedRevenue, section: 'ic' },
+  });
+  return buildTrailingWindows(records, 4)
+    .map(({ quarters, anchor, partial }) => {
+      const income = quarters.reduce((sum, q) => sum + q.netIncome, 0);
+      const rev = quarters.reduce((sum, q) => sum + q.revenue, 0);
+      const value = clampImplausible(rev ? income / rev : null);
+      return value != null ? { label: `Q${anchor.quarter} '${String(anchor.year).slice(-2)}`, value, partial, quartersUsed: quarters.length } : null;
+    })
+    .filter(Boolean)
+    .slice(-QUARTERS_OF_HISTORY);
+}
+
+// --- ROIC: Quarterly, Yearly, TTM (none of these existed in this pipeline before) ---
+
+function buildRoicQuarterlyFromFilings(quarterlyReports, annualReports) {
+  const ebitRecords = buildStandaloneFlowQuarters(quarterlyReports, annualReports, { ebit: { fn: findReportedEBIT, section: 'ic' } });
+
+  const investedCapitalByQuarter = {};
+  for (const q of quarterlyReports || []) {
+    if (!q?.quarter) continue;
+    const equity = findReportedTotalEquity(q.report?.bs || []);
+    if (equity == null) continue;
+    const debt = sumDebt(q.report?.bs || []);
+    const cash = findReportedCashBalance(q.report?.bs || []) || 0;
+    investedCapitalByQuarter[`${q.year}-${q.quarter}`] = debt + equity - cash;
+  }
+
+  return ebitRecords
+    .filter((r) => investedCapitalByQuarter[`${r.year}-${r.quarter}`] > 0)
+    .map((r) => {
+      // Annualized (x4) — EBIT/NOPAT is a flow figure that shrinks to ~1/4
+      // at quarterly granularity, but Invested Capital is a point-in-time
+      // balance-sheet snapshot that doesn't shrink with it; see the
+      // identical note in buildRoicQuarterlyFromFilings in src/utils/metrics.js.
+      const annualizedNopat = r.ebit * (1 - ROIC_ASSUMED_TAX_RATE) * 4;
+      const value = clampImplausible(annualizedNopat / investedCapitalByQuarter[`${r.year}-${r.quarter}`]);
+      return value != null ? { label: `Q${r.quarter} '${String(r.year).slice(-2)}`, value } : null;
+    })
+    .filter(Boolean)
+    .slice(-QUARTERS_OF_HISTORY);
+}
+
+function buildRoicYearlyFromFilings(annualReports) {
+  const currentCik = annualReports?.[0]?.cik;
+  const sameCik = (r) => currentCik == null || r.cik === currentCik;
+  const filtered = (annualReports || []).filter(sameCik);
+
+  const ebitRecords = buildAnnualFlowPoints(filtered, { ebit: { fn: findReportedEBIT, section: 'ic' } });
+
+  return ebitRecords
+    .map((r) => {
+      const annualReport = filtered.find((a) => a.year === r.year);
+      const equity = findReportedTotalEquity(annualReport?.report?.bs || []);
+      if (equity == null) return null;
+      const debt = sumDebt(annualReport?.report?.bs || []);
+      const cash = findReportedCashBalance(annualReport?.report?.bs || []) || 0;
+      const investedCapital = debt + equity - cash;
+      if (!(investedCapital > 0)) return null;
+      const nopat = r.ebit * (1 - ROIC_ASSUMED_TAX_RATE);
+      const value = clampImplausible(nopat / investedCapital);
+      return value != null ? { label: yearlyLabel(r.year), value } : null;
+    })
+    .filter(Boolean)
+    .slice(-QUARTERS_OF_HISTORY);
+}
+
+function buildRoicTTMFromFilings(quarterlyReports, annualReports) {
+  const ebit = decumulateYtdByYear(quarterlyReports, annualReports, findReportedEBIT, 'ic');
+
+  const investedCapitalByQuarter = {};
+  for (const q of quarterlyReports || []) {
+    if (!q?.quarter) continue;
+    const equity = findReportedTotalEquity(q.report?.bs || []);
+    if (equity == null) continue;
+    const debt = sumDebt(q.report?.bs || []);
+    const cash = findReportedCashBalance(q.report?.bs || []) || 0;
+    investedCapitalByQuarter[`${q.year}-${q.quarter}`] = debt + equity - cash;
+  }
+
+  const standaloneQuarters = Object.keys(ebit)
+    .filter((key) => investedCapitalByQuarter[key] > 0)
+    .map((key) => {
+      const [year, quarter] = key.split('-').map(Number);
+      return { year, quarter, nopat: ebit[key] * (1 - ROIC_ASSUMED_TAX_RATE), investedCapital: investedCapitalByQuarter[key] };
+    })
+    .sort((a, b) => a.year - b.year || a.quarter - b.quarter);
+
+  return buildTrailingWindows(standaloneQuarters, 4)
+    .map(({ quarters, anchor, partial }) => {
+      const ttmNopat = quarters.reduce((sum, q) => sum + q.nopat, 0);
+      const value = clampImplausible(ttmNopat / anchor.investedCapital);
+      return value != null ? { label: `Q${anchor.quarter} '${String(anchor.year).slice(-2)}`, value, partial, quartersUsed: quarters.length } : null;
+    })
+    .filter(Boolean)
+    .slice(-QUARTERS_OF_HISTORY);
+}
+
 // Gist raw URL for the dataset this same script publishes to (see the
 // workflow's "Publish to gist" step) — fetched at the START of a run so a
 // bad run doesn't erase a good previous one. Same ID generateNewsCache.js
@@ -696,16 +1023,31 @@ const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e
 // trend merge-protection (pickTrendToPublish) and the per-field metrics
 // regression guard (pickMetricValue) below — one network call covers both.
 async function fetchPreviouslyPublishedDataset() {
+  const empty = { metrics: {}, nativeTrends: {}, yearlyTrends: {}, quarterlyTrends: {}, ttmTrends: {} };
   try {
     const res = await fetch(GIST_METRICS_URL);
-    if (!res.ok) return { metrics: {}, fcfMarginTrends: {} };
+    if (!res.ok) return empty;
     const data = await res.json();
+    const asObject = (v) => (v && typeof v === 'object' ? v : {});
+    // trends.ttm.fcfMargin is the new home for what used to be the
+    // top-level trends.fcfMargin — read the legacy location as a fallback
+    // so the very first run after this change doesn't look like every
+    // ticker's FCF Margin TTM trend just vanished (pickTrendToPublish
+    // below only protects against a bad FRESH run, not a data-shape move).
+    const ttmTrends = asObject(data?.trends?.ttm);
+    const legacyFcfMargin = asObject(data?.trends?.fcfMargin);
+    for (const [symbol, points] of Object.entries(legacyFcfMargin)) {
+      ttmTrends[symbol] = { ...ttmTrends[symbol], fcfMargin: ttmTrends[symbol]?.fcfMargin ?? points };
+    }
     return {
-      metrics: data?.metrics && typeof data.metrics === 'object' ? data.metrics : {},
-      fcfMarginTrends: data?.trends?.fcfMargin && typeof data.trends.fcfMargin === 'object' ? data.trends.fcfMargin : {},
+      metrics: asObject(data?.metrics),
+      nativeTrends: asObject(data?.trends?.native),
+      yearlyTrends: asObject(data?.trends?.yearly),
+      quarterlyTrends: asObject(data?.trends?.quarterly),
+      ttmTrends,
     };
   } catch {
-    return { metrics: {}, fcfMarginTrends: {} }; // first-ever run, or the feed's briefly unreachable — start fresh either way
+    return empty; // first-ever run, or the feed's briefly unreachable — start fresh either way
   }
 }
 
@@ -1005,15 +1347,30 @@ async function main() {
       `(three requests each, a fourth for tickers needing FCF Margin reconstructed from filings, rate-limited to stay under Finnhub's free-tier cap — this takes several hours)...`
   );
 
-  const { metrics: previouslyPublishedMetrics, fcfMarginTrends: previouslyPublishedFcfMarginTrends } = await fetchPreviouslyPublishedDataset();
+  const {
+    metrics: previouslyPublishedMetrics,
+    nativeTrends: previouslyPublishedNativeTrends,
+    yearlyTrends: previouslyPublishedYearlyTrends,
+    quarterlyTrends: previouslyPublishedQuarterlyTrends,
+    ttmTrends: previouslyPublishedTtmTrends,
+  } = await fetchPreviouslyPublishedDataset();
   console.log(
-    `Loaded ${Object.keys(previouslyPublishedMetrics).length} previously-published tickers' metrics and ` +
-      `${Object.keys(previouslyPublishedFcfMarginTrends).length} FCF Margin trends (both merge-protected against a bad run — see pickMetricValue/pickTrendToPublish).`
+    `Loaded ${Object.keys(previouslyPublishedMetrics).length} previously-published tickers' metrics ` +
+      `(merge-protected against a bad run — see pickMetricValue/pickTrendToPublish).`
   );
 
   const metrics = {};
   const profiles = {}; // name/logo, kept out of `metrics` to avoid bloating that map — only industryLeaders needs them
-  const fcfMarginTrends = {};
+  // Every trend series this pipeline publishes, by cadence — native (straight
+  // from Finnhub's own quarterly series, all 6 metrics), and quarterly/
+  // yearly/ttm (reconstructed from SEC filings, for the 4 metrics that don't
+  // need Twelve Data price history — see the file header for why pfcfRatio's
+  // three cadences live in the separate pfcfTrendCache pipeline instead).
+  // Each is `{ [symbol]: { [metricKey]: points } }`.
+  const nativeTrends = {};
+  const yearlyTrends = {};
+  const quarterlyTrends = {};
+  const ttmTrends = {};
   let ok = 0;
   let failed = 0;
   let dead = 0;
@@ -1067,37 +1424,108 @@ async function main() {
 
         const values = extractMetricValues(current, quarterly, impliedPriceFromProfile(profile));
 
-        // FCF Margin trend reconstruction: gated the same way the app's own
-        // trend screen decides it needs a fallback (empty OR internally
-        // gapped native series — see hasInternalGaps above), not just "the
-        // latest value is missing," so a ticker with real-but-stale data
-        // (verified live: Cencora/COR) still gets a filled-in trend. Only
-        // for non-financial tickers (FCF isn't a meaningful concept for
-        // banks — see isFinancialIndustry). One extra Finnhub call, only
-        // paid for gap tickers, not all ~5,140 — reuses
-        // annualReportedFinancials (already fetched above for the DCF
-        // estimate) rather than fetching it again; only the quarterly side
-        // is new here.
-        const nativePoints = nativeFcfMarginPoints(quarterly);
-        if ((nativePoints.length === 0 || hasInternalGaps(nativePoints)) && !isFinancialIndustry(profile.industry)) {
-          let freshTrend = [];
-          await sleep(REQUEST_SPACING_MS);
+        // Tier 1 — native quarterly series (all 6 metrics), straight from
+        // the stock/metric response already fetched above for the current
+        // values. Zero extra API cost — this is data already in hand, just
+        // not previously published. See buildNativeTrendsForTicker's own
+        // comments for why this matters (it's the whole fix for P/E's trend
+        // chart, which has no reconstruction fallback of its own).
+        const freshNativeTrends = buildNativeTrendsForTicker(quarterly);
+        const previousNativeForSymbol = previouslyPublishedNativeTrends[symbol] || {};
+        const mergedNativeForSymbol = {};
+        for (const key of ['roic', 'revenueGrowth', 'profitMargin', 'fcfMargin', 'peRatio', 'pfcfRatio']) {
+          const published = pickTrendToPublish(previousNativeForSymbol[key], freshNativeTrends[key]);
+          if (published.length) mergedNativeForSymbol[key] = published;
+        }
+        if (Object.keys(mergedNativeForSymbol).length) nativeTrends[symbol] = mergedNativeForSymbol;
+
+        // Tier 2/3 — Quarterly/Yearly/TTM reconstruction from raw SEC
+        // filings, for the 4 metrics that don't need Twelve Data price
+        // history. Quarterly financials-reported is now fetched for EVERY
+        // ticker (not just ones with a native-data gap) so these caches
+        // cover the full universe, not just gap tickers — a deliberate,
+        // ~70-minute-longer run in exchange for every metric's trend chart
+        // loading from a precomputed cache instead of live-reconstructing
+        // on first tap. annualReportedFinancials is already fetched above
+        // for the DCF estimate, at no extra cost either way.
+        let quarterlyFinancials = [];
+        await sleep(REQUEST_SPACING_MS);
+        try {
+          quarterlyFinancials = await fetchReportedFinancialsQuarterlyFor(symbol, apiKey);
+        } catch {
+          // Leave quarterlyFinancials empty — every builder below degrades
+          // gracefully to "nothing new," and pickTrendToPublish falls back
+          // to whatever was already published rather than losing it.
+        }
+
+        const isBankLike = isFinancialIndustry(profile.industry);
+        const yearlyBuilders = {
+          revenueGrowth: () => buildRevenueGrowthYearlyFromFilings(annualReportedFinancials),
+          profitMargin: () => buildProfitMarginYearlyFromFilings(annualReportedFinancials),
+          fcfMargin: () => (isBankLike ? [] : buildFcfMarginYearlyFromFilings(annualReportedFinancials)),
+          roic: () => buildRoicYearlyFromFilings(annualReportedFinancials),
+        };
+        const quarterlyBuilders = {
+          revenueGrowth: () => buildRevenueGrowthQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials),
+          profitMargin: () => buildProfitMarginQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials),
+          fcfMargin: () => (isBankLike ? [] : buildFcfMarginQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials)),
+          roic: () => buildRoicQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials),
+        };
+        const ttmBuilders = {
+          revenueGrowth: () => buildRevenueGrowthTTMFromFilings(quarterlyFinancials, annualReportedFinancials),
+          profitMargin: () => buildProfitMarginTTMFromFilings(quarterlyFinancials, annualReportedFinancials),
+          fcfMargin: () => (isBankLike ? [] : buildFcfMarginTrendFromFilings(quarterlyFinancials, annualReportedFinancials)),
+          roic: () => buildRoicTTMFromFilings(quarterlyFinancials, annualReportedFinancials),
+        };
+
+        const mergedYearlyForSymbol = {};
+        const mergedQuarterlyForSymbol = {};
+        const mergedTtmForSymbol = {};
+        const previousYearlyForSymbol = previouslyPublishedYearlyTrends[symbol] || {};
+        const previousQuarterlyForSymbol = previouslyPublishedQuarterlyTrends[symbol] || {};
+        const previousTtmForSymbol = previouslyPublishedTtmTrends[symbol] || {};
+
+        for (const key of Object.keys(yearlyBuilders)) {
+          let fresh = [];
           try {
-            const quarterlyFinancials = await fetchReportedFinancialsQuarterlyFor(symbol, apiKey);
-            freshTrend = buildFcfMarginTrendFromFilings(quarterlyFinancials, annualReportedFinancials);
+            fresh = yearlyBuilders[key]();
           } catch {
-            // Same graceful-degradation philosophy as the DCF estimate above
-            // — pickTrendToPublish below falls back to whatever was already
-            // published for this ticker rather than losing it over one
-            // failed request.
+            // A single metric's oddly-shaped filing shouldn't take down the
+            // others — pickTrendToPublish falls back to the previous run.
           }
-          const published = pickTrendToPublish(previouslyPublishedFcfMarginTrends[symbol], freshTrend);
+          const published = pickTrendToPublish(previousYearlyForSymbol[key], fresh);
+          if (published.length) mergedYearlyForSymbol[key] = published;
+        }
+        for (const key of Object.keys(quarterlyBuilders)) {
+          let fresh = [];
+          try {
+            fresh = quarterlyBuilders[key]();
+          } catch {
+            // Same graceful-degradation philosophy as above.
+          }
+          const published = pickTrendToPublish(previousQuarterlyForSymbol[key], fresh);
+          if (published.length) mergedQuarterlyForSymbol[key] = published;
+        }
+        for (const key of Object.keys(ttmBuilders)) {
+          let fresh = [];
+          try {
+            fresh = ttmBuilders[key]();
+          } catch {
+            // Same graceful-degradation philosophy as above.
+          }
+          const published = pickTrendToPublish(previousTtmForSymbol[key], fresh);
           if (published.length) {
-            fcfMarginTrends[symbol] = published;
-            if (values.fcfMargin == null) values.fcfMargin = published[published.length - 1].value;
-            if (freshTrend.length) fcfMarginReconstructed++; // only count genuine new reconstructions, not carried-forward cache hits
+            mergedTtmForSymbol[key] = published;
+            if (key === 'fcfMargin' && values.fcfMargin == null) {
+              values.fcfMargin = published[published.length - 1].value;
+              fcfMarginReconstructed++;
+            }
           }
         }
+
+        if (Object.keys(mergedYearlyForSymbol).length) yearlyTrends[symbol] = mergedYearlyForSymbol;
+        if (Object.keys(mergedQuarterlyForSymbol).length) quarterlyTrends[symbol] = mergedQuarterlyForSymbol;
+        if (Object.keys(mergedTtmForSymbol).length) ttmTrends[symbol] = mergedTtmForSymbol;
 
         // Regression guard: a fresh null for one of the 6 comparable metrics
         // doesn't overwrite a previously-published real value for the same
@@ -1132,13 +1560,19 @@ async function main() {
   const industryLeaders = computeIndustryLeaders(metrics, profiles);
   console.log(`\nComputed ${industryLeaders.length} industry leaders (industries with >= ${MIN_INDUSTRY_PEERS} peers).`);
 
-  const output = { generatedAt: new Date().toISOString(), metrics, industryLeaders, trends: { fcfMargin: fcfMarginTrends } };
+  const output = {
+    generatedAt: new Date().toISOString(),
+    metrics,
+    industryLeaders,
+    trends: { native: nativeTrends, quarterly: quarterlyTrends, yearly: yearlyTrends, ttm: ttmTrends },
+  };
   fs.mkdirSync(path.dirname(OUTPUT_FILE), { recursive: true }); // works regardless of which repo this script runs in
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(output, null, 2));
   console.log(
     `Wrote ${ok} tickers to ${path.relative(process.cwd(), OUTPUT_FILE)} ` +
-      `(${failed} failed, ${dead} dead/no-data excluded, ${dcfComputed} with a fair-value estimate, ` +
-      `${fcfMarginReconstructed} FCF margins freshly reconstructed from filings, ${Object.keys(fcfMarginTrends).length} tickers now have a published FCF Margin trend).`
+      `(${failed} failed, ${dead} dead/no-data excluded, ${dcfComputed} with a fair-value estimate, ${fcfMarginReconstructed} FCF margins freshly reconstructed). ` +
+      `Trend caches published: ${Object.keys(nativeTrends).length} native, ${Object.keys(quarterlyTrends).length} quarterly, ` +
+      `${Object.keys(yearlyTrends).length} yearly, ${Object.keys(ttmTrends).length} ttm.`
   );
 }
 

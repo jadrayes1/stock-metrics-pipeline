@@ -5,10 +5,14 @@
 # full rationale and design (why this needs its own workflow, the Twelve
 # Data call budget + least-recently-attempted rotation, etc.).
 #
-# Scheduled between the other two jobs so none of them compete for
-# Finnhub's account-wide rate limit at the same time:
-#   - generate-sector-metrics.yml: 02:00 UTC, ~5.5hr runtime (ends ~07:30 UTC)
-#   - generate-pfcf-trend-cache.yml (this one): 09:00 UTC
+# Scheduled between the other jobs so none of them compete for Finnhub's
+# account-wide rate limit at the same time:
+#   - generate-sector-metrics.yml: 00:00 UTC, ~6.5-7.5hr runtime (worst-case
+#     finish ~11:00 UTC with GitHub's observed scheduling delay — moved
+#     earlier and this job's start pushed later, from 09:00, after adding
+#     full Quarterly/Yearly/TTM trend caching there grew its runtime)
+#   - generate-pfcf-trend-cache.yml (this one): 12:00 UTC
+#   - generate-foreign-filings-cache.yml (separate repo): 14:00 UTC
 #   - generate-news-cache.yml: 16:00 UTC
 #
 # One-time setup required BEYOND generate-sector-metrics.yml's existing
@@ -26,7 +30,7 @@ name: Generate P/FCF trend cache
 
 on:
   schedule:
-    - cron: '0 9 * * *'
+    - cron: '0 12 * * *'
   workflow_dispatch: {}
 
 permissions:
