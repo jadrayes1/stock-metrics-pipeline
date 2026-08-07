@@ -1683,4 +1683,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { extractDcfInputs, computeEstimatedFairValue };
+module.exports = { extractDcfInputs, computeEstimatedFairValue, readFinnhubApiKeys, processSymbol, runWorker };
