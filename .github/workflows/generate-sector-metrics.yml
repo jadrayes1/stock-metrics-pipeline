@@ -1,12 +1,19 @@
 # Daily fetch of industry classification + fundamentals for every
 # NASDAQ/NYSE/NYSE American common stock and REIT (~5,145 tickers), published
 # to a public Gist that the stock-analyzer app reads at runtime — see that
-# app's src/api/sectorComparison.js.
+# app's src/api/sectorComparison.js. Published as SIX separate files, not
+# one: marketMetrics.json (small — card values + industry leaders, fetched
+# on every screen) plus trendsNative.json/trendsQuarterly.json/
+# trendsYearly.json/trendsTtm.json (large — tens of MB combined at
+# full-universe scale, fetched by the app only when a trend chart actually
+# needs that specific cadence) plus coverageAudit.json. See
+# scripts/generateSectorMetrics.js's OUTPUT_TRENDS_*_FILE comments for why
+# the trend caches aren't just embedded in marketMetrics.json.
 #
 # Also runs scripts/auditMetricsCoverage.js right after — a fast, read-only
 # scan (no new API calls) of how many tickers are missing each of the 6
-# comparable metrics, and why, published to the same Gist as a second file
-# (coverageAudit.json) for tracking coverage over time.
+# comparable metrics, and why, published to the same Gist as coverageAudit.json
+# for tracking coverage over time.
 #
 # This lives in its OWN public repo, separate from the app's (private) repo,
 # for two reasons:
@@ -92,14 +99,34 @@ jobs:
       - name: Audit metric coverage
         run: node scripts/auditMetricsCoverage.js
 
+      # Git-based push, not `gh gist edit` (which goes through the Gist API
+      # and rejects any file over 1MB) — the trend cache files run into the
+      # tens of megabytes at full-universe scale, well past that API limit
+      # but comfortably under git's own file-size guidance. Gists are just
+      # git repos under the hood, so cloning, committing, and pushing works
+      # the same as any other repo.
       - name: Publish to gist
         env:
-          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
         run: |
-          gh gist edit "${{ secrets.GIST_ID }}" --filename marketMetrics.json src/data/marketMetrics.json || \
-          gh gist edit "${{ secrets.GIST_ID }}" --add src/data/marketMetrics.json
-          gh gist edit "${{ secrets.GIST_ID }}" --filename coverageAudit.json coverageAudit.json || \
-          gh gist edit "${{ secrets.GIST_ID }}" --add coverageAudit.json
+          git clone "https://${GIST_TOKEN}@gist.github.com/${GIST_ID}.git" gist-clone
+          cp src/data/marketMetrics.json gist-clone/marketMetrics.json
+          cp src/data/trendsNative.json gist-clone/trendsNative.json
+          cp src/data/trendsQuarterly.json gist-clone/trendsQuarterly.json
+          cp src/data/trendsYearly.json gist-clone/trendsYearly.json
+          cp src/data/trendsTtm.json gist-clone/trendsTtm.json
+          cp coverageAudit.json gist-clone/coverageAudit.json
+          cd gist-clone
+          git config user.email "actions@github.com"
+          git config user.name "stock-metrics-pipeline"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to publish."
+          else
+            git commit -m "Update dataset $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          fi
 
       - name: Report failure
         if: failure()

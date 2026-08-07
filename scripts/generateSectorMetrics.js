@@ -96,6 +96,20 @@ const fs = require('fs');
 const path = require('path');
 
 const OUTPUT_FILE = path.join(__dirname, '../src/data/marketMetrics.json');
+// Trend caches (native/quarterly/yearly/ttm) publish to their OWN files,
+// separate from marketMetrics.json — at full-universe scale (~5,000+
+// tickers x up to 6 metrics x 12 points) these run tens of megabytes,
+// which both blows past the Gist API's 1MB-per-file publish limit (see the
+// git-based publish step in .github/workflows/generate-sector-metrics.yml)
+// and — more importantly — would otherwise bloat marketMetrics.json, which
+// the app fetches on every screen, not just trend charts. Keeping trends in
+// their own files lets the app fetch marketMetrics.json cheaply for
+// everyday use and only pull a trend file when a trend chart actually
+// needs that specific cadence (see src/api/sectorComparison.js).
+const OUTPUT_TRENDS_NATIVE_FILE = path.join(__dirname, '../src/data/trendsNative.json');
+const OUTPUT_TRENDS_QUARTERLY_FILE = path.join(__dirname, '../src/data/trendsQuarterly.json');
+const OUTPUT_TRENDS_YEARLY_FILE = path.join(__dirname, '../src/data/trendsYearly.json');
+const OUTPUT_TRENDS_TTM_FILE = path.join(__dirname, '../src/data/trendsTtm.json');
 const REQUEST_SPACING_MS = 1100; // ~54/min, under Finnhub's 60/min free-tier cap
 
 const ALLOWED_MICS = new Set(['XNAS', 'XNYS', 'XASE']); // NASDAQ, NYSE, NYSE American
@@ -1026,42 +1040,67 @@ function buildRoicTTMFromFilings(quarterlyReports, annualReports) {
     .slice(-QUARTERS_OF_HISTORY);
 }
 
-// Gist raw URL for the dataset this same script publishes to (see the
-// workflow's "Publish to gist" step) — fetched at the START of a run so a
-// bad run doesn't erase a good previous one. Same ID generateNewsCache.js
-// already reads from.
+// Gist raw URLs for the dataset this same script publishes to (see the
+// workflow's git-based "Publish to gist" step) — fetched at the START of a
+// run so a bad run doesn't erase a good previous one. Same gist ID
+// generateNewsCache.js already reads from. Trend caches live in their own
+// files, separate from marketMetrics.json — see OUTPUT_TRENDS_*_FILE above
+// for why.
 const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/marketMetrics.json';
+const GIST_TRENDS_NATIVE_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/trendsNative.json';
+const GIST_TRENDS_QUARTERLY_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/trendsQuarterly.json';
+const GIST_TRENDS_YEARLY_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/trendsYearly.json';
+const GIST_TRENDS_TTM_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/trendsTtm.json';
 
-// Fetched ONCE at the start of a run and reused for both the FCF Margin
-// trend merge-protection (pickTrendToPublish) and the per-field metrics
-// regression guard (pickMetricValue) below — one network call covers both.
-async function fetchPreviouslyPublishedDataset() {
-  const empty = { metrics: {}, nativeTrends: {}, yearlyTrends: {}, quarterlyTrends: {}, ttmTrends: {} };
+async function fetchJsonSafe(url) {
   try {
-    const res = await fetch(GIST_METRICS_URL);
-    if (!res.ok) return empty;
-    const data = await res.json();
-    const asObject = (v) => (v && typeof v === 'object' ? v : {});
-    // trends.ttm.fcfMargin is the new home for what used to be the
-    // top-level trends.fcfMargin — read the legacy location as a fallback
-    // so the very first run after this change doesn't look like every
-    // ticker's FCF Margin TTM trend just vanished (pickTrendToPublish
-    // below only protects against a bad FRESH run, not a data-shape move).
-    const ttmTrends = asObject(data?.trends?.ttm);
-    const legacyFcfMargin = asObject(data?.trends?.fcfMargin);
-    for (const [symbol, points] of Object.entries(legacyFcfMargin)) {
-      ttmTrends[symbol] = { ...ttmTrends[symbol], fcfMargin: ttmTrends[symbol]?.fcfMargin ?? points };
-    }
-    return {
-      metrics: asObject(data?.metrics),
-      nativeTrends: asObject(data?.trends?.native),
-      yearlyTrends: asObject(data?.trends?.yearly),
-      quarterlyTrends: asObject(data?.trends?.quarterly),
-      ttmTrends,
-    };
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    return await res.json();
   } catch {
-    return empty; // first-ever run, or the feed's briefly unreachable — start fresh either way
+    return null; // file doesn't exist yet, or the feed's briefly unreachable — treated as "nothing published"
   }
+}
+
+// Fetched ONCE at the start of a run and reused for both the trend
+// merge-protection (pickTrendToPublish) and the per-field metrics
+// regression guard (pickMetricValue) below.
+async function fetchPreviouslyPublishedDataset() {
+  const asObject = (v) => (v && typeof v === 'object' ? v : {});
+  const [metricsData, nativeData, quarterlyData, yearlyData, ttmData] = await Promise.all([
+    fetchJsonSafe(GIST_METRICS_URL),
+    fetchJsonSafe(GIST_TRENDS_NATIVE_URL),
+    fetchJsonSafe(GIST_TRENDS_QUARTERLY_URL),
+    fetchJsonSafe(GIST_TRENDS_YEARLY_URL),
+    fetchJsonSafe(GIST_TRENDS_TTM_URL),
+  ]);
+
+  // Trend caches used to live embedded inside marketMetrics.json itself
+  // (trends.native/quarterly/yearly/ttm) before they outgrew the Gist
+  // API's 1MB-per-file publish limit at full-universe scale and were split
+  // into their own files. Read that old embedded location as a fallback
+  // for anything the new dedicated files don't have yet, so the
+  // transition doesn't look like data vanished.
+  const nativeTrends = { ...asObject(metricsData?.trends?.native), ...asObject(nativeData?.trends) };
+  const quarterlyTrends = { ...asObject(metricsData?.trends?.quarterly), ...asObject(quarterlyData?.trends) };
+  const yearlyTrends = { ...asObject(metricsData?.trends?.yearly), ...asObject(yearlyData?.trends) };
+  const ttmTrends = { ...asObject(metricsData?.trends?.ttm), ...asObject(ttmData?.trends) };
+
+  // Even older: trends.fcfMargin (pre-cadence, TTM-only) at the very top
+  // level — read as a fallback for whatever ttmTrends[symbol].fcfMargin
+  // doesn't already have.
+  const legacyFcfMargin = asObject(metricsData?.trends?.fcfMargin);
+  for (const [symbol, points] of Object.entries(legacyFcfMargin)) {
+    ttmTrends[symbol] = { ...ttmTrends[symbol], fcfMargin: ttmTrends[symbol]?.fcfMargin ?? points };
+  }
+
+  return {
+    metrics: asObject(metricsData?.metrics),
+    nativeTrends,
+    yearlyTrends,
+    quarterlyTrends,
+    ttmTrends,
+  };
 }
 
 // Mirrors pickTrendToPublish's reasoning, for a single scalar metric value
@@ -1660,14 +1699,20 @@ async function main() {
   const industryLeaders = computeIndustryLeaders(metrics, profiles);
   console.log(`\nComputed ${industryLeaders.length} industry leaders (industries with >= ${MIN_INDUSTRY_PEERS} peers).`);
 
-  const output = {
-    generatedAt: new Date().toISOString(),
-    metrics,
-    industryLeaders,
-    trends: { native: nativeTrends, quarterly: quarterlyTrends, yearly: yearlyTrends, ttm: ttmTrends },
-  };
+  const generatedAt = new Date().toISOString();
+  // marketMetrics.json stays small — no trends embedded (see
+  // OUTPUT_TRENDS_*_FILE above for why they moved to their own files).
+  // Unformatted JSON.stringify (no indentation) everywhere below too —
+  // pretty-printing was adding meaningful overhead for no benefit on a
+  // machine-generated, never-hand-edited file, and every byte matters now
+  // that these files run into the tens of megabytes at full-universe scale.
+  const output = { generatedAt, metrics, industryLeaders };
   fs.mkdirSync(path.dirname(OUTPUT_FILE), { recursive: true }); // works regardless of which repo this script runs in
-  fs.writeFileSync(OUTPUT_FILE, JSON.stringify(output, null, 2));
+  fs.writeFileSync(OUTPUT_FILE, JSON.stringify(output));
+  fs.writeFileSync(OUTPUT_TRENDS_NATIVE_FILE, JSON.stringify({ generatedAt, trends: nativeTrends }));
+  fs.writeFileSync(OUTPUT_TRENDS_QUARTERLY_FILE, JSON.stringify({ generatedAt, trends: quarterlyTrends }));
+  fs.writeFileSync(OUTPUT_TRENDS_YEARLY_FILE, JSON.stringify({ generatedAt, trends: yearlyTrends }));
+  fs.writeFileSync(OUTPUT_TRENDS_TTM_FILE, JSON.stringify({ generatedAt, trends: ttmTrends }));
   console.log(
     `Wrote ${ok} tickers to ${path.relative(process.cwd(), OUTPUT_FILE)} ` +
       `(${failed} failed, ${dead} dead/no-data excluded, ${dcfComputed} with a fair-value estimate, ${fcfMarginReconstructed} FCF margins freshly reconstructed). ` +
