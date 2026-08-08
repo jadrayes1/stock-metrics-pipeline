@@ -222,6 +222,20 @@ const DUAL_CLASS_ALIASES = {
   'WSO.B': 'WSO',
 };
 
+// Tickers that changed symbol (not a dual-class-share situation — same
+// company, same CIK, Finnhub just hasn't backfilled financials-reported
+// history under the new symbol yet) — verified live (Aug 2026): BNY (Bank
+// of New York Mellon, renamed from BK) has 0 annual and only 1 quarterly
+// financials-reported entry under "BNY", while "BK" — same CIK 1390777 —
+// has 15 years of annual and 47 quarters of history. /stock/metric and
+// /stock/profile2 are unaffected (BNY's own quarterly ratio series and
+// profile are both healthy) — this is specific to financials-reported,
+// unlike DUAL_CLASS_ALIASES above which covers the ratio engine instead.
+// Mirrored in src/utils/metrics.js — keep in sync.
+const RENAMED_TICKER_FINANCIALS_ALIASES = {
+  BNY: 'BK',
+};
+
 async function fetchMetricsFor(symbol, apiKey) {
   const requestSymbol = DUAL_CLASS_ALIASES[symbol] || symbol;
   const res = await fetch(`https://finnhub.io/api/v1/stock/metric?symbol=${requestSymbol}&metric=all&token=${apiKey}`);
@@ -261,7 +275,8 @@ function impliedPriceFromProfile(profile) {
 }
 
 async function fetchReportedFinancialsFor(symbol, apiKey) {
-  const res = await fetch(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${symbol}&freq=annual&token=${apiKey}`);
+  const requestSymbol = RENAMED_TICKER_FINANCIALS_ALIASES[symbol] || symbol;
+  const res = await fetch(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${requestSymbol}&freq=annual&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
   return Array.isArray(data?.data) ? data.data : [];
@@ -619,7 +634,8 @@ function buildTrailingWindows(standaloneQuarters, maxSize = 4) {
 }
 
 async function fetchReportedFinancialsQuarterlyFor(symbol, apiKey) {
-  const res = await fetch(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${symbol}&freq=quarterly&token=${apiKey}`);
+  const requestSymbol = RENAMED_TICKER_FINANCIALS_ALIASES[symbol] || symbol;
+  const res = await fetch(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${requestSymbol}&freq=quarterly&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
   return Array.isArray(data?.data) ? data.data : [];
@@ -1508,7 +1524,7 @@ async function processSymbol(symbol, apiKey, ctx) {
   const previousQuarterlyForSymbol = previouslyPublishedQuarterlyTrends[symbol] || {};
   const previousTtmForSymbol = previouslyPublishedTtmTrends[symbol] || {};
 
-  let fcfMarginReconstructed = false;
+  let cardValuesReconstructed = false;
 
   for (const key of Object.keys(yearlyBuilders)) {
     let fresh = [];
@@ -1541,9 +1557,16 @@ async function processSymbol(symbol, apiKey, ctx) {
     const published = pickTrendToPublish(previousTtmForSymbol[key], fresh);
     if (published.length) {
       mergedTtmForSymbol[key] = published;
-      if (key === 'fcfMargin' && values.fcfMargin == null) {
-        values.fcfMargin = published[published.length - 1].value;
-        fcfMarginReconstructed = true;
+      // Backfill the CARD value too, not just the trend cache, whenever
+      // Finnhub's native series has nothing for this field — same
+      // reasoning as the original fcfMargin-only version of this check,
+      // just generalized to all 4 TTM-reconstructible metrics. Verified
+      // live: BNY (Bank of New York Mellon) had a real revenueGrowth/
+      // profitMargin/roic TTM reconstruction available but a null card
+      // value, because only fcfMargin got backfilled here before.
+      if (values[key] == null) {
+        values[key] = published[published.length - 1].value;
+        cardValuesReconstructed = true;
       }
     }
   }
@@ -1570,7 +1593,7 @@ async function processSymbol(symbol, apiKey, ctx) {
     quarterlyTrends: Object.keys(mergedQuarterlyForSymbol).length ? mergedQuarterlyForSymbol : null,
     ttmTrends: Object.keys(mergedTtmForSymbol).length ? mergedTtmForSymbol : null,
     dcfComputed,
-    fcfMarginReconstructed,
+    cardValuesReconstructed,
   };
 }
 
@@ -1590,7 +1613,7 @@ async function runWorker(workerId, symbolSubset, apiKey, ctx) {
     failed: 0,
     dead: 0,
     dcfComputed: 0,
-    fcfMarginReconstructed: 0,
+    cardValuesReconstructed: 0,
   };
 
   for (let i = 0; i < symbolSubset.length; i++) {
@@ -1607,7 +1630,7 @@ async function runWorker(workerId, symbolSubset, apiKey, ctx) {
         if (r.quarterlyTrends) result.quarterlyTrends[symbol] = r.quarterlyTrends;
         if (r.ttmTrends) result.ttmTrends[symbol] = r.ttmTrends;
         if (r.dcfComputed) result.dcfComputed++;
-        if (r.fcfMarginReconstructed) result.fcfMarginReconstructed++;
+        if (r.cardValuesReconstructed) result.cardValuesReconstructed++;
         result.ok++;
       }
     } catch (err) {
@@ -1619,7 +1642,7 @@ async function runWorker(workerId, symbolSubset, apiKey, ctx) {
     if (processedSoFar % 100 === 0 || i === symbolSubset.length - 1) {
       console.log(
         `  [key ${workerId}] ${processedSoFar}/${symbolSubset.length} (${result.ok} ok, ${result.failed} failed, ${result.dead} dead/no-data, ` +
-          `${result.dcfComputed} with a fair-value estimate, ${result.fcfMarginReconstructed} FCF margins reconstructed)`
+          `${result.dcfComputed} with a fair-value estimate, ${result.cardValuesReconstructed} card values backfilled from reconstruction)`
       );
     }
 
@@ -1678,7 +1701,7 @@ async function main() {
   let failed = 0;
   let dead = 0;
   let dcfComputed = 0;
-  let fcfMarginReconstructed = 0;
+  let cardValuesReconstructed = 0;
 
   // Each worker owns a disjoint slice of `symbols`, so these merges never
   // collide.
@@ -1693,7 +1716,7 @@ async function main() {
     failed += r.failed;
     dead += r.dead;
     dcfComputed += r.dcfComputed;
-    fcfMarginReconstructed += r.fcfMarginReconstructed;
+    cardValuesReconstructed += r.cardValuesReconstructed;
   }
 
   const industryLeaders = computeIndustryLeaders(metrics, profiles);
@@ -1715,7 +1738,7 @@ async function main() {
   fs.writeFileSync(OUTPUT_TRENDS_TTM_FILE, JSON.stringify({ generatedAt, trends: ttmTrends }));
   console.log(
     `Wrote ${ok} tickers to ${path.relative(process.cwd(), OUTPUT_FILE)} ` +
-      `(${failed} failed, ${dead} dead/no-data excluded, ${dcfComputed} with a fair-value estimate, ${fcfMarginReconstructed} FCF margins freshly reconstructed). ` +
+      `(${failed} failed, ${dead} dead/no-data excluded, ${dcfComputed} with a fair-value estimate, ${cardValuesReconstructed} card values freshly backfilled from reconstruction). ` +
       `Trend caches published: ${Object.keys(nativeTrends).length} native, ${Object.keys(quarterlyTrends).length} quarterly, ` +
       `${Object.keys(yearlyTrends).length} yearly, ${Object.keys(ttmTrends).length} ttm.`
   );

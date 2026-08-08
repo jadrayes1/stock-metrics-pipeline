@@ -52,6 +52,15 @@ const MAX_TWELVEDATA_CALLS_PER_RUN = 700; // leaves buffer under Twelve Data's 8
 const TIME_BUDGET_MS = 6 * 60 * 60 * 1000; // safety net alongside the call cap above; leaves headroom under the workflow's 7hr timeout-minutes
 const QUARTERS_OF_HISTORY = 12; // mirrors src/utils/metrics.js
 
+// Tickers that changed symbol — Finnhub hasn't backfilled financials-
+// reported history under the new symbol yet, even though /stock/metric and
+// /stock/profile2 are fine. See RENAMED_TICKER_FINANCIALS_ALIASES in
+// src/utils/metrics.js (mirrored here — keep in sync) for the full
+// verified-live rationale (BNY/BK, CIK 1390777).
+const RENAMED_TICKER_FINANCIALS_ALIASES = {
+  BNY: 'BK',
+};
+
 function readFinnhubApiKey() {
   if (process.env.FINNHUB_API_KEY) return process.env.FINNHUB_API_KEY;
   throw new Error('FINNHUB_API_KEY env var is not set.');
@@ -368,7 +377,8 @@ function pickCadenceTrendsToPublish(existingEntry, fresh) {
 }
 
 async function fetchReportedFinancials(symbol, freq, apiKey) {
-  const data = await fetchJson(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${symbol}&freq=${freq}&token=${apiKey}`);
+  const requestSymbol = RENAMED_TICKER_FINANCIALS_ALIASES[symbol] || symbol;
+  const data = await fetchJson(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${requestSymbol}&freq=${freq}&token=${apiKey}`);
   return Array.isArray(data?.data) ? data.data : [];
 }
 
