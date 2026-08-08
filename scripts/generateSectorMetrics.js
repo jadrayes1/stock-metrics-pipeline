@@ -988,7 +988,7 @@ function buildProfitMarginTTMFromFilings(quarterlyReports, annualReports) {
 
 // --- ROIC: Quarterly, Yearly, TTM (none of these existed in this pipeline before) ---
 
-function buildRoicQuarterlyFromFilings(quarterlyReports, annualReports) {
+function buildRoicQuarterlyFromFilings(quarterlyReports, annualReports, isBank) {
   const ebitRecords = buildStandaloneFlowQuarters(quarterlyReports, annualReports, { ebit: { fn: findReportedEBIT, section: 'ic' } });
 
   const investedCapitalByQuarter = {};
@@ -997,7 +997,15 @@ function buildRoicQuarterlyFromFilings(quarterlyReports, annualReports) {
     const equity = findReportedTotalEquity(q.report?.bs || []);
     if (equity == null) continue;
     const debt = sumDebt(q.report?.bs || []);
-    const cash = findReportedCashBalance(q.report?.bs || []) || 0;
+    // Cash isn't netted out for bank filers — verified live: a bank's
+    // reported cash balance includes central-bank reserves and interbank
+    // deposits, core OPERATING assets, not idle/excess cash the way it is
+    // for an industrial company. Netting it out can collapse invested
+    // capital to a fraction of real equity, wildly inflating ROIC (verified
+    // live on the IFRS equivalent of this same formula: BMO's ROIC computed
+    // to 34-57% instead of its real ~3%). Debt is untouched (already ~0 for
+    // most banks — see sumDebt's own deliberate exclusion of deposits).
+    const cash = isBank ? 0 : findReportedCashBalance(q.report?.bs || []) || 0;
     investedCapitalByQuarter[`${q.year}-${q.quarter}`] = debt + equity - cash;
   }
 
@@ -1016,7 +1024,7 @@ function buildRoicQuarterlyFromFilings(quarterlyReports, annualReports) {
     .slice(-QUARTERS_OF_HISTORY);
 }
 
-function buildRoicYearlyFromFilings(annualReports) {
+function buildRoicYearlyFromFilings(annualReports, isBank) {
   const currentCik = annualReports?.[0]?.cik;
   const sameCik = (r) => currentCik == null || r.cik === currentCik;
   const filtered = (annualReports || []).filter(sameCik);
@@ -1029,7 +1037,9 @@ function buildRoicYearlyFromFilings(annualReports) {
       const equity = findReportedTotalEquity(annualReport?.report?.bs || []);
       if (equity == null) return null;
       const debt = sumDebt(annualReport?.report?.bs || []);
-      const cash = findReportedCashBalance(annualReport?.report?.bs || []) || 0;
+      // See buildRoicQuarterlyFromFilings above for why cash isn't netted
+      // out for bank filers.
+      const cash = isBank ? 0 : findReportedCashBalance(annualReport?.report?.bs || []) || 0;
       const investedCapital = debt + equity - cash;
       if (!(investedCapital > 0)) return null;
       const nopat = r.ebit * (1 - ROIC_ASSUMED_TAX_RATE);
@@ -1040,7 +1050,7 @@ function buildRoicYearlyFromFilings(annualReports) {
     .slice(-QUARTERS_OF_HISTORY);
 }
 
-function buildRoicTTMFromFilings(quarterlyReports, annualReports) {
+function buildRoicTTMFromFilings(quarterlyReports, annualReports, isBank) {
   const ebit = decumulateYtdByYear(quarterlyReports, annualReports, findReportedEBIT, 'ic');
 
   const investedCapitalByQuarter = {};
@@ -1049,7 +1059,9 @@ function buildRoicTTMFromFilings(quarterlyReports, annualReports) {
     const equity = findReportedTotalEquity(q.report?.bs || []);
     if (equity == null) continue;
     const debt = sumDebt(q.report?.bs || []);
-    const cash = findReportedCashBalance(q.report?.bs || []) || 0;
+    // See buildRoicQuarterlyFromFilings above for why cash isn't netted
+    // out for bank filers.
+    const cash = isBank ? 0 : findReportedCashBalance(q.report?.bs || []) || 0;
     investedCapitalByQuarter[`${q.year}-${q.quarter}`] = debt + equity - cash;
   }
 
@@ -1517,19 +1529,19 @@ async function processSymbol(symbol, apiKey, ctx) {
     revenueGrowth: () => buildRevenueGrowthYearlyFromFilings(annualReportedFinancials),
     profitMargin: () => buildProfitMarginYearlyFromFilings(annualReportedFinancials),
     fcfMargin: () => (isBankLike ? [] : buildFcfMarginYearlyFromFilings(annualReportedFinancials)),
-    roic: () => buildRoicYearlyFromFilings(annualReportedFinancials),
+    roic: () => buildRoicYearlyFromFilings(annualReportedFinancials, isBankLike),
   };
   const quarterlyBuilders = {
     revenueGrowth: () => buildRevenueGrowthQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials),
     profitMargin: () => buildProfitMarginQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials),
     fcfMargin: () => (isBankLike ? [] : buildFcfMarginQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials)),
-    roic: () => buildRoicQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials),
+    roic: () => buildRoicQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials, isBankLike),
   };
   const ttmBuilders = {
     revenueGrowth: () => buildRevenueGrowthTTMFromFilings(quarterlyFinancials, annualReportedFinancials),
     profitMargin: () => buildProfitMarginTTMFromFilings(quarterlyFinancials, annualReportedFinancials),
     fcfMargin: () => (isBankLike ? [] : buildFcfMarginTrendFromFilings(quarterlyFinancials, annualReportedFinancials)),
-    roic: () => buildRoicTTMFromFilings(quarterlyFinancials, annualReportedFinancials),
+    roic: () => buildRoicTTMFromFilings(quarterlyFinancials, annualReportedFinancials, isBankLike),
   };
 
   const mergedYearlyForSymbol = {};
