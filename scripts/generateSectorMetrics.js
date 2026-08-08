@@ -774,7 +774,22 @@ function findReportedEBIT(icItems) {
   const match = icItems.find((item) => item.concept === 'us-gaap_OperatingIncomeLoss');
   if (match) return match.value;
   const labelMatch = icItems.find((item) => /operating income|income from operations/i.test(item.label || ''));
-  return labelMatch ? labelMatch.value : null;
+  if (labelMatch) return labelMatch.value;
+
+  // Banks and other financial-services filers don't report a standard
+  // "Operating Income" line at all — verified live: Bank of New York
+  // Mellon has zero years with us-gaap_OperatingIncomeLoss across 15 years
+  // of filings. For these, pre-tax income IS the closest EBIT-equivalent —
+  // interest income/expense are core banking operations for a bank, not a
+  // separate financing layer sitting below an operating-income line the
+  // way they are for an industrial company (same reasoning already behind
+  // fcfMargin being skipped entirely for banks — see isFinancialIndustry).
+  // Matched by LABEL, not a fixed concept name, since filers tag this
+  // under inconsistent extension concepts (BNY's is a company-specific
+  // bk_IncomeLossFromContinuing... extension, not a standard us-gaap one).
+  // Mirrored in src/utils/metrics.js — keep in sync.
+  const preTaxMatch = icItems.find((item) => /pre-?tax income|income before.*tax/i.test((item.label || '').trim()));
+  return preTaxMatch ? preTaxMatch.value : null;
 }
 
 function findReportedTotalEquity(bsItems) {
