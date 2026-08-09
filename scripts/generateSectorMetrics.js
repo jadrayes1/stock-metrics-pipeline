@@ -1075,7 +1075,17 @@ function buildRoicTTMFromFilings(quarterlyReports, annualReports, isBank) {
 
   return buildTrailingWindows(standaloneQuarters, 4)
     .map(({ quarters, anchor, partial }) => {
-      const ttmNopat = quarters.reduce((sum, q) => sum + q.nopat, 0);
+      const rawNopat = quarters.reduce((sum, q) => sum + q.nopat, 0);
+      // A partial window (< 4 quarters) sums fewer than a full year of
+      // NOPAT, but investedCapital is still a full-year-scale balance-sheet
+      // snapshot — left unannualized, a 1-quarter partial window understates
+      // ROIC ~4x relative to a genuine trailing-twelve-month figure (same
+      // reasoning buildRoicQuarterlyFromFilings above already applies to a
+      // single quarter). Verified live in the foreign-filings-pipeline
+      // sibling of this function: an unannualized single-quarter value slipped
+      // under the sanity clamp while the properly-annualized quarterly figure
+      // for the same quarter was correctly clamped as implausible.
+      const ttmNopat = partial ? rawNopat * (4 / quarters.length) : rawNopat;
       const value = clampImplausible(ttmNopat / anchor.investedCapital);
       return value != null ? { label: `Q${anchor.quarter} '${String(anchor.year).slice(-2)}`, value, partial, quartersUsed: quarters.length } : null;
     })
