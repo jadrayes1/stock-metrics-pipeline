@@ -231,9 +231,15 @@ const DUAL_CLASS_ALIASES = {
 // /stock/profile2 are unaffected (BNY's own quarterly ratio series and
 // profile are both healthy) — this is specific to financials-reported,
 // unlike DUAL_CLASS_ALIASES above which covers the ratio engine instead.
+// AD (Array Digital Infrastructure) is the same pattern, verified live:
+// SEC confirms it's the renamed United States Cellular Corp (CIK 821130,
+// former name on record "UNITED STATES CELLULAR CORP" through 2025-07-25)
+// — "AD" itself has only 2 annual financials-reported entries, while
+// "USM" has 44 quarters of real history under the same CIK.
 // Mirrored in src/utils/metrics.js — keep in sync.
 const RENAMED_TICKER_FINANCIALS_ALIASES = {
   BNY: 'BK',
+  AD: 'USM',
 };
 
 async function fetchMetricsFor(symbol, apiKey) {
@@ -496,6 +502,175 @@ function extractDcfInputs(reportedFinancials) {
 // future suffix variant we haven't individually seen yet, rather than
 // growing an exact-match list one ticker at a time).
 const REVENUE_CONCEPT_CANDIDATES = ['us-gaap_RevenuesNetOfInterestExpense', 'us-gaap_Revenues', 'us-gaap_SalesRevenueNet'];
+
+// ---------------------------------------------------------------------------
+// SEC XBRL fallback for revenue-growth gaps — Finnhub's own financials-
+// reported crawl occasionally skips a single quarter entirely (verified
+// live: Dominion Energy/D has NO Q1 2024 report at all, jumping straight
+// from Q4 2023 to Q2 2024). revenueGrowth is the only one of this
+// pipeline's reconstructed metrics that needs a YoY (year-ago) comparable
+// quarter to compute a rate — profitMargin/fcfMargin/roic are self-
+// contained per-period ratios, no prior-year pairing needed — so a single
+// missing quarter silently breaks every revenueGrowth point that would
+// need to reach across it, while leaving the other three metrics
+// untouched. SEC's own companyfacts API has the real figure (verified
+// live: D's real standalone Q1 2024 revenue, $3,632,000,000, filed
+// 2024-05-02, an exact match to the value later re-reported as a
+// comparative column in three subsequent SEC filings). This fills ONLY
+// the specific missing quarter(s) actually needed — detected first via
+// free array inspection, so a SEC request is only spent on tickers that
+// actually have a gap — not a general re-architecture of this pipeline's
+// Finnhub-based approach.
+const SEC_TICKERS_URL = 'https://www.sec.gov/files/company_tickers.json';
+const SEC_COMPANYFACTS_BASE = 'https://data.sec.gov/api/xbrl/companyfacts';
+const SEC_USER_AGENT = 'stock-analyzer-app stock-metrics-pipeline contact:jadrayescpp@gmail.com';
+const SEC_FETCH_TIMEOUT_MS = 30000; // see extractFilingTextFacts.js in the sibling foreign-filings-pipeline repo for why a bare fetch() needs an explicit ceiling
+const SEC_REVENUE_CONCEPTS = ['Revenues', 'RevenueFromContractWithCustomerExcludingAssessedTax', 'RevenueFromContractWithCustomerIncludingAssessedTax', 'SalesRevenueNet', 'RevenuesNetOfInterestExpense'];
+
+async function fetchSecJson(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SEC_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { headers: { 'User-Agent': SEC_USER_AGENT, Accept: 'application/json' }, signal: controller.signal });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchSecTickerToCikMap() {
+  const data = await fetchSecJson(SEC_TICKERS_URL);
+  const map = new Map();
+  for (const entry of Object.values(data || {})) {
+    if (entry?.ticker && entry?.cik_str != null) {
+      map.set(String(entry.ticker).toUpperCase(), String(entry.cik_str).padStart(10, '0'));
+    }
+  }
+  return map;
+}
+
+// Finds (year, quarter) pairs present in quarterlyReports whose (year-1,
+// quarter) counterpart is missing — a gap that would block a YoY revenue-
+// growth comparison for that quarter. Each gap's expected {start, end} is
+// inferred from the EXISTING report's own dates, shifted back one year —
+// only valid for calendar-aligned fiscal quarters, but since the caller
+// requires an EXACT date match against SEC's real data, a wrong guess here
+// (a non-calendar fiscal year) just fails to find a match rather than
+// silently filling in a wrong period.
+function findRevenueGapsNeedingBackfill(quarterlyReports) {
+  const present = new Set((quarterlyReports || []).filter((r) => r?.year && r?.quarter).map((r) => `${r.year}-${r.quarter}`));
+  const shiftYear = (dateStr) => {
+    const d = new Date(dateStr);
+    return new Date(Date.UTC(d.getUTCFullYear() - 1, d.getUTCMonth(), d.getUTCDate())).toISOString().slice(0, 10);
+  };
+  const gaps = [];
+  for (const r of quarterlyReports || []) {
+    if (!r?.year || !r?.quarter || !r.startDate || !r.endDate) continue;
+    if (present.has(`${r.year - 1}-${r.quarter}`)) continue;
+    gaps.push({ year: r.year - 1, quarter: r.quarter, expectedStart: shiftYear(r.startDate), expectedEnd: shiftYear(r.endDate) });
+  }
+  return gaps;
+}
+
+// SEC facts keyed "start|end" -> value, across every candidate revenue
+// concept, for an exact-date lookup against each gap found above.
+async function fetchSecRevenueFactsByPeriod(cik) {
+  const data = await fetchSecJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
+  const gaap = data?.facts?.['us-gaap'] || {};
+  const byPeriod = new Map();
+  for (const concept of SEC_REVENUE_CONCEPTS) {
+    const facts = gaap[concept]?.units?.USD || [];
+    for (const f of facts) {
+      if (f.val == null || !f.start || !f.end) continue;
+      const key = `${f.start}|${f.end}`;
+      if (!byPeriod.has(key)) byPeriod.set(key, f.val);
+    }
+  }
+  return byPeriod;
+}
+
+// Finds fiscal years with quarterly coverage in quarterlyReports whose
+// matching ANNUAL report is entirely missing from annualReports — blocks
+// Q4 derivation (Q4 = full-year total - 9mo YTD) for that year, and
+// therefore every TTM window that would need to anchor on or span past
+// it. Verified live: Dominion Energy/D's own Finnhub annual reports jump
+// straight from 2022 to 2025, missing 2023 and 2024 entirely, even though
+// it has real quarterly reports for both years. Expected {start, end} is
+// inferred from an existing annual report's own dates, shifted to the
+// missing year — same reasoning as findRevenueGapsNeedingBackfill above.
+function findAnnualRevenueGapsNeedingBackfill(quarterlyReports, annualReports) {
+  const annualYears = new Set((annualReports || []).filter((r) => r?.year).map((r) => r.year));
+  const quarterlyYears = new Set((quarterlyReports || []).filter((r) => r?.year && r?.quarter).map((r) => r.year));
+  const referenceAnnual = (annualReports || []).find((r) => r.startDate && r.endDate);
+  if (!referenceAnnual) return [];
+  const shiftYear = (dateStr, deltaYears) => {
+    const d = new Date(dateStr);
+    return new Date(Date.UTC(d.getUTCFullYear() + deltaYears, d.getUTCMonth(), d.getUTCDate())).toISOString().slice(0, 10);
+  };
+  const gaps = [];
+  for (const year of quarterlyYears) {
+    if (annualYears.has(year)) continue;
+    const delta = year - referenceAnnual.year;
+    gaps.push({ year, expectedStart: shiftYear(referenceAnnual.startDate, delta), expectedEnd: shiftYear(referenceAnnual.endDate, delta) });
+  }
+  return gaps;
+}
+
+// Backfills gaps in both quarterlyReports' AND annualReports' revenue
+// coverage from SEC's own companyfacts API — see the section header
+// comment above. Synthetic entries are shaped just enough for
+// findReportedRevenue/decumulateYtdByYear/buildAnnualFlowPoints to work
+// completely unmodified (a single us-gaap_Revenues item in the ic
+// section, matching the real reports' own cik so decumulateYtdByYear's
+// sameCik filter keeps it) — never a fabricated value, only a real
+// SEC-filed figure at an exact date match. Returns
+// {quarterlyReports, annualReports}, both unchanged when nothing to fill.
+async function backfillRevenueGapsFromSec(symbol, cik, quarterlyReports, annualReports) {
+  const quarterlyGaps = findRevenueGapsNeedingBackfill(quarterlyReports);
+  const annualGaps = findAnnualRevenueGapsNeedingBackfill(quarterlyReports, annualReports);
+  if (!quarterlyGaps.length && !annualGaps.length) return { quarterlyReports, annualReports };
+  if (!cik) return { quarterlyReports, annualReports };
+
+  const byPeriod = await fetchSecRevenueFactsByPeriod(cik);
+  if (!byPeriod.size) return { quarterlyReports, annualReports };
+
+  const referenceCik = quarterlyReports[0]?.cik ?? annualReports?.[0]?.cik;
+  const filledQuarters = [];
+  for (const gap of quarterlyGaps) {
+    const value = byPeriod.get(`${gap.expectedStart}|${gap.expectedEnd}`);
+    if (value == null) continue;
+    filledQuarters.push({
+      year: gap.year,
+      quarter: gap.quarter,
+      cik: referenceCik,
+      startDate: `${gap.expectedStart} 00:00:00`,
+      endDate: `${gap.expectedEnd} 00:00:00`,
+      report: { ic: [{ concept: 'us-gaap_Revenues', label: 'Revenues (SEC XBRL fallback)', value }] },
+    });
+  }
+  const filledAnnuals = [];
+  for (const gap of annualGaps) {
+    const value = byPeriod.get(`${gap.expectedStart}|${gap.expectedEnd}`);
+    if (value == null) continue;
+    filledAnnuals.push({
+      year: gap.year,
+      cik: referenceCik,
+      startDate: `${gap.expectedStart} 00:00:00`,
+      endDate: `${gap.expectedEnd} 00:00:00`,
+      report: { ic: [{ concept: 'us-gaap_Revenues', label: 'Revenues (SEC XBRL fallback)', value }] },
+    });
+  }
+  if (filledQuarters.length || filledAnnuals.length) {
+    console.log(`  ${symbol}: backfilled ${filledQuarters.length} quarterly + ${filledAnnuals.length} annual revenue gap(s) from SEC (Finnhub crawl gap)`);
+  }
+  return {
+    quarterlyReports: filledQuarters.length ? [...quarterlyReports, ...filledQuarters] : quarterlyReports,
+    annualReports: filledAnnuals.length ? [...(annualReports || []), ...filledAnnuals] : annualReports,
+  };
+}
 const REVENUE_CONTRACT_CONCEPT_PREFIX = 'us-gaap_RevenueFromContractWithCustomer';
 const REVENUE_CONTRACT_CONCEPT_EXCLUDE = /RemainingPerformanceObligation|Disaggregation|PolicyTextBlock|TableTextBlock|Liability|Asset|Member|Axis|Domain/i;
 const REVENUE_LABEL_PATTERN = /^(total\s+)?(net\s+)?revenues?(,?\s*net)?$|^(total\s+)?net\s+sales$/i;
@@ -895,11 +1070,20 @@ function buildRevenueGrowthQuarterlyFromFilings(quarterlyReports, annualReports)
     })
     .sort((a, b) => a.year - b.year || a.quarter - b.quarter);
 
+  // Looks up the year-ago quarter by its actual (year, quarter) key, not by
+  // a fixed "4 array positions back" offset — verified live this matters:
+  // Dominion Energy/D has a 2009-to-2022 gap in its own reported history
+  // (unrelated to any specific missing quarter), which throws the
+  // positional offset off for every quarter from 2022 onward. The old code
+  // correctly VALIDATED that a wrong positional guess didn't match (year-1,
+  // same quarter) and skipped it — but skipped the quarter entirely instead
+  // of actually looking up the real year-ago record, silently losing every
+  // point past the first gap in a ticker's history.
+  const byKey = new Map(chronological.map((c) => [`${c.year}-${c.quarter}`, c]));
   const points = [];
-  for (let i = 4; i < chronological.length; i++) {
-    const current = chronological[i];
-    const yearAgo = chronological[i - 4];
-    if (yearAgo.year !== current.year - 1 || yearAgo.quarter !== current.quarter) continue;
+  for (const current of chronological) {
+    const yearAgo = byKey.get(`${current.year - 1}-${current.quarter}`);
+    if (!yearAgo) continue;
     const value = clampImplausible(yearAgo.value ? (current.value - yearAgo.value) / yearAgo.value : null);
     if (value != null) points.push({ label: `Q${current.quarter} '${String(current.year).slice(-2)}`, value });
   }
@@ -930,13 +1114,14 @@ function buildRevenueGrowthTTMFromFilings(quarterlyReports, annualReports) {
     })
     .sort((a, b) => a.year - b.year || a.quarter - b.quarter);
 
+  // Key-based year-ago lookup, not a fixed positional offset — same fix
+  // and same reasoning as buildRevenueGrowthQuarterlyFromFilings above.
   const points = [];
-  for (let i = 4; i < orderedKeys.length; i++) {
-    const curr = orderedKeys[i];
-    const yearAgo = orderedKeys[i - 4];
-    if (yearAgo.year !== curr.year - 1 || yearAgo.quarter !== curr.quarter) continue;
+  for (const curr of orderedKeys) {
+    const yearAgoKey = `${curr.year - 1}-${curr.quarter}`;
+    if (!ttmByKey[yearAgoKey]) continue;
     const currTTM = ttmByKey[`${curr.year}-${curr.quarter}`];
-    const yearAgoTTM = ttmByKey[`${yearAgo.year}-${yearAgo.quarter}`];
+    const yearAgoTTM = ttmByKey[yearAgoKey];
     const value = clampImplausible(yearAgoTTM ? (currTTM - yearAgoTTM) / yearAgoTTM : null);
     if (value != null) points.push({ label: `Q${curr.quarter} '${String(curr.year).slice(-2)}`, value });
   }
@@ -1534,6 +1719,22 @@ async function processSymbol(symbol, apiKey, ctx) {
     // whatever was already published rather than losing it.
   }
 
+  // SEC XBRL fallback for a Finnhub crawl gap that would otherwise block
+  // revenueGrowth's YoY comparison — see backfillRevenueGapsFromSec's own
+  // comment for the full rationale (verified live for Dominion Energy/D).
+  // Free to check (array inspection); only spends a request when a real
+  // gap is actually found.
+  try {
+    const cik = ctx.secTickerToCikMap?.get(symbol.toUpperCase());
+    if (cik) {
+      const backfilled = await backfillRevenueGapsFromSec(symbol, cik, quarterlyFinancials, annualReportedFinancials);
+      quarterlyFinancials = backfilled.quarterlyReports;
+      annualReportedFinancials = backfilled.annualReports;
+    }
+  } catch {
+    // Non-fatal — same graceful-degradation philosophy as the fetch above.
+  }
+
   const isBankLike = isFinancialIndustry(profile.industry);
   const yearlyBuilders = {
     revenueGrowth: () => buildRevenueGrowthYearlyFromFilings(annualReportedFinancials),
@@ -1704,12 +1905,20 @@ async function main() {
       `(merge-protected against a bad run — see pickMetricValue/pickTrendToPublish).`
   );
 
+  // Fetched once for the whole run — used only to fill a Finnhub crawl gap
+  // in revenueGrowth's YoY comparison from SEC's own free companyfacts API
+  // (see backfillRevenueGapsFromSec) — a SEC request is only spent per-
+  // ticker when a real gap is detected, this map just resolves the CIK.
+  const secTickerToCikMap = await fetchSecTickerToCikMap();
+  console.log(`Loaded ${secTickerToCikMap.size} ticker->CIK mappings from SEC for the revenue-gap fallback.`);
+
   const ctx = {
     previouslyPublishedMetrics,
     previouslyPublishedNativeTrends: previouslyPublished.nativeTrends,
     previouslyPublishedYearlyTrends: previouslyPublished.yearlyTrends,
     previouslyPublishedQuarterlyTrends: previouslyPublished.quarterlyTrends,
     previouslyPublishedTtmTrends: previouslyPublished.ttmTrends,
+    secTickerToCikMap,
   };
 
   // Split the universe across one worker per key, interleaved (round-robin
@@ -1788,4 +1997,18 @@ if (require.main === module) {
   });
 }
 
-module.exports = { extractDcfInputs, computeEstimatedFairValue, readFinnhubApiKeys, processSymbol, runWorker };
+module.exports = {
+  extractDcfInputs,
+  computeEstimatedFairValue,
+  readFinnhubApiKeys,
+  processSymbol,
+  runWorker,
+  findRevenueGapsNeedingBackfill,
+  fetchSecRevenueFactsByPeriod,
+  backfillRevenueGapsFromSec,
+  findAnnualRevenueGapsNeedingBackfill,
+  fetchSecTickerToCikMap,
+  buildRevenueGrowthQuarterlyFromFilings,
+  buildRevenueGrowthTTMFromFilings,
+  buildRevenueGrowthYearlyFromFilings,
+};
