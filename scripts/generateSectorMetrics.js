@@ -242,6 +242,20 @@ const RENAMED_TICKER_FINANCIALS_ALIASES = {
   AD: 'USM',
 };
 
+// financials-reported also needs the dual-class redirect (DUAL_CLASS_ALIASES
+// above, which was deliberately scoped to only the /stock/metric ratio
+// engine when first added) — verified live this session that the gap is
+// just as real here: HEI.A has 0 quarterly financials-reported entries
+// while HEI has 47; MOG.B has 0 while MOG.A has 8. Same underlying
+// reasoning as DUAL_CLASS_ALIASES: revenue/net income/OCF are company-wide
+// totals, identical between share classes regardless of per-share price,
+// so redirecting is the correct number, not an approximation. Checked
+// after RENAMED_TICKER_FINANCIALS_ALIASES so the two never conflict (no
+// ticker is currently in both maps).
+function resolveFinancialsReportedSymbol(symbol) {
+  return RENAMED_TICKER_FINANCIALS_ALIASES[symbol] || DUAL_CLASS_ALIASES[symbol] || symbol;
+}
+
 async function fetchMetricsFor(symbol, apiKey) {
   const requestSymbol = DUAL_CLASS_ALIASES[symbol] || symbol;
   const res = await fetch(`https://finnhub.io/api/v1/stock/metric?symbol=${requestSymbol}&metric=all&token=${apiKey}`);
@@ -281,7 +295,7 @@ function impliedPriceFromProfile(profile) {
 }
 
 async function fetchReportedFinancialsFor(symbol, apiKey) {
-  const requestSymbol = RENAMED_TICKER_FINANCIALS_ALIASES[symbol] || symbol;
+  const requestSymbol = resolveFinancialsReportedSymbol(symbol);
   const res = await fetch(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${requestSymbol}&freq=annual&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
@@ -809,7 +823,7 @@ function buildTrailingWindows(standaloneQuarters, maxSize = 4) {
 }
 
 async function fetchReportedFinancialsQuarterlyFor(symbol, apiKey) {
-  const requestSymbol = RENAMED_TICKER_FINANCIALS_ALIASES[symbol] || symbol;
+  const requestSymbol = resolveFinancialsReportedSymbol(symbol);
   const res = await fetch(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${requestSymbol}&freq=quarterly&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
@@ -2011,4 +2025,5 @@ module.exports = {
   buildRevenueGrowthQuarterlyFromFilings,
   buildRevenueGrowthTTMFromFilings,
   buildRevenueGrowthYearlyFromFilings,
+  resolveFinancialsReportedSymbol,
 };
