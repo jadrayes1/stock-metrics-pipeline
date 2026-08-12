@@ -399,8 +399,18 @@ async function main() {
   ]);
 
   const cache = existingTrendCache.trends || {};
+  // A real scalar pfcfRatio does NOT mean the Quarterly/Yearly/TTM trend
+  // has ever been attempted - verified live this matters: BAC and JPM (and
+  // 3529 other tickers, 99.8% of the 3538 with a real pfcfRatio) have a
+  // real, non-null card-level ratio computed elsewhere in the main
+  // pipeline, but were NEVER queued here since the old filter only checked
+  // pfcfRatio nullness - the same "card-value nullness is the wrong gap
+  // signal" lesson already learned once in the foreign-filings-pipeline
+  // repo's processTicker (see its own comment re: STNG), independently
+  // rediscovered here. A ticker now qualifies as a gap if EITHER the
+  // scalar ratio is missing OR no TTM trend has been cached yet for it.
   const gapSymbols = Object.entries(metricsDataset.metrics || {})
-    .filter(([, data]) => data.pfcfRatio == null)
+    .filter(([symbol, data]) => data.pfcfRatio == null || !cache[symbol]?.ttm?.length)
     .map(([symbol]) => symbol);
 
   // Least-recently-attempted first (never-attempted sorts first, via epoch
