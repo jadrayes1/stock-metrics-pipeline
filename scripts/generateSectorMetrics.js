@@ -412,7 +412,7 @@ function sumDebt(bsItems) {
 // presentation makes matching by concept the reliable path here.
 const OPERATING_SUBTOTAL_CONCEPTS = ['us-gaap_NetCashProvidedByUsedInOperatingActivities', 'us-gaap_NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'];
 
-function extractDcfInputs(reportedFinancials) {
+function extractDcfInputs(reportedFinancials, industry) {
   if (!reportedFinancials.length) return null;
   // Finnhub's financials-reported for a *ticker* (not CIK) can mix in
   // filings from a completely unrelated older company that happened to
@@ -475,7 +475,20 @@ function extractDcfInputs(reportedFinancials) {
   // us-gaap_PaymentsToAcquireOtherPropertyPlantAndEquipment ("Payments to
   // Acquire OTHER Property, Plant, and Equipment") — the inserted "Other"
   // also breaks a plain "payments to acquire property" keyword match.
-  const capex =
+  // Verified live: JPM's own 10-K cash flow statement has no capex-style
+  // line item anywhere (no "purchases of premises and equipment," nothing
+  // property/equipment-related at all) — big banks' investing activities
+  // are dominated by loan/securities portfolios, not fixed-asset purchases,
+  // so they routinely don't break out a standalone capex line the way
+  // non-financial filers do. Without this fallback, a null capex here used
+  // to null out `dcfInputs` entirely (see the guard below), silently
+  // discarding the whole DCF estimate for most Banking/Insurance/Financial
+  // Services tickers even when every OTHER input was available — same
+  // "treat missing capex as 0 for banks" fix already applied to the P/FCF
+  // trend builders in generatePfcfTrendCache.js, applied here for the same
+  // reason: a genuinely near-zero capex line, not a missing/failed
+  // extraction.
+  const rawCapex =
     findByConcept(cf, [
       'us-gaap_PaymentsToAcquirePropertyPlantAndEquipment',
       'us-gaap_PaymentsToAcquireProductiveAssets',
@@ -490,7 +503,19 @@ function extractDcfInputs(reportedFinancials) {
       'capital expenditures',
       'capital spending',
     ]);
-  const cash = findByConcept(bs, ['us-gaap_CashAndCashEquivalentsAtCarryingValue', 'us-gaap_CashAndCashEquivalentsAtFairValue', 'us-gaap_Cash']) ?? findByLabelKeywords(bs, ['cash and cash equivalents']);
+  const capex = rawCapex ?? (isFinancialIndustry(industry) ? 0 : null);
+  // Verified live: JPM's balance sheet has no
+  // CashAndCashEquivalentsAtCarryingValue (or any "cash and cash
+  // equivalents"-labeled line) at all — banks report this caption as "Cash
+  // and due from banks" (us-gaap_CashAndDueFromBanks) instead, a distinct
+  // concept the generic fallbacks above never matched. Same gap as
+  // SEC_CASH_CONCEPTS (used by the ROIC invested-capital path) not
+  // covering this concept either — flagged there as a related follow-up,
+  // not fixed here since ROIC's SEC-XBRL enrichment path is a separate
+  // code path from this DCF one.
+  const cash =
+    findByConcept(bs, ['us-gaap_CashAndCashEquivalentsAtCarryingValue', 'us-gaap_CashAndCashEquivalentsAtFairValue', 'us-gaap_Cash', 'us-gaap_CashAndDueFromBanks']) ??
+    findByLabelKeywords(bs, ['cash and cash equivalents', 'cash and due from banks']);
   const totalDebt = sumDebt(bs);
 
   // Verified live across several filers (NUTX, CRMD, CEG, KO) that
@@ -2101,7 +2126,7 @@ async function processSymbol(symbol, apiKey, ctx) {
   await sleep(REQUEST_SPACING_MS);
   try {
     annualReportedFinancials = await fetchReportedFinancialsFor(symbol, apiKey);
-    const dcfInputs = extractDcfInputs(annualReportedFinancials);
+    const dcfInputs = extractDcfInputs(annualReportedFinancials, profile.industry);
     if (dcfInputs) {
       estimatedFairValue = computeEstimatedFairValue(dcfInputs, current, profile.marketCapitalization, profile.industry);
       if (estimatedFairValue != null) dcfComputed = true;
