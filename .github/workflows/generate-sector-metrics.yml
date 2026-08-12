@@ -15,6 +15,18 @@
 # comparable metrics, and why, published to the same Gist as coverageAudit.json
 # for tracking coverage over time.
 #
+# Between those two, caps outlier DCF estimatedFairValue values at the real
+# analyst-consensus high price target for the small subset of tickers whose
+# estimate came out unusually far above the current price (see
+# DCF_CAP_CANDIDATE_MULTIPLE in generateSectorMetrics.js,
+# scripts/fetchDcfCapTargets.py, and scripts/applyDcfCap.js) — this uses
+# yfinance (Yahoo Finance) since analyst price targets aren't available on
+# Finnhub's free tier. Both yfinance-touching steps have
+# `continue-on-error: true` since that's an undocumented, unofficial
+# endpoint with no rate-limit guarantee — a failure there never blocks the
+# rest of the pipeline from publishing; affected tickers just keep their
+# uncapped DCF estimate for that run.
+#
 # This lives in its OWN public repo, separate from the app's (private) repo,
 # for two reasons:
 #   1. A Gist's visibility doesn't depend on the repo that updates it, so
@@ -95,6 +107,32 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           FINNHUB_API_KEY_2: ${{ secrets.FINNHUB_API_KEY_2 }}
         run: node scripts/generateSectorMetrics.js
+
+      # DCF fair-value cap: for the small subset of tickers whose estimate
+      # came out >= 2x the current price (see DCF_CAP_CANDIDATE_MULTIPLE in
+      # generateSectorMetrics.js), look up the real analyst-consensus high
+      # price target via yfinance and cap the estimate there if it's still
+      # above it. yfinance scrapes an undocumented Yahoo endpoint (no
+      # official API/rate limit for this data on Finnhub's free tier, which
+      # is what the rest of this pipeline uses) — `continue-on-error` on
+      # both steps below so a Yahoo-side failure (blocked IP, layout change,
+      # etc.) never blocks the rest of the pipeline from publishing;
+      # applyDcfCap.js also no-ops cleanly if analystPriceTargets.json was
+      # never written.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install yfinance
+        continue-on-error: true
+        run: pip install yfinance
+
+      - name: Fetch DCF-cap analyst price targets
+        continue-on-error: true
+        run: python3 scripts/fetchDcfCapTargets.py
+
+      - name: Apply DCF cap
+        run: node scripts/applyDcfCap.js
 
       - name: Audit metric coverage
         run: node scripts/auditMetricsCoverage.js

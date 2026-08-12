@@ -112,6 +112,12 @@ const OUTPUT_TRENDS_NATIVE_FILE = path.join(__dirname, '../src/data/trendsNative
 const OUTPUT_TRENDS_QUARTERLY_FILE = path.join(__dirname, '../src/data/trendsQuarterly.json');
 const OUTPUT_TRENDS_YEARLY_FILE = path.join(__dirname, '../src/data/trendsYearly.json');
 const OUTPUT_TRENDS_TTM_FILE = path.join(__dirname, '../src/data/trendsTtm.json');
+// Intermediate, unpublished artifact — see DCF_CAP_CANDIDATE_MULTIPLE.
+// scripts/fetchDcfCapTargets.py reads this, scripts/applyDcfCap.js
+// consumes its output and rewrites OUTPUT_FILE in place, both run as
+// separate workflow steps between "Generate dataset" and "Publish to gist"
+// so a yfinance failure never blocks the rest of the pipeline.
+const OUTPUT_DCF_CAP_CANDIDATES_FILE = path.join(__dirname, '../dcfCapCandidates.json');
 const REQUEST_SPACING_MS = 1100; // ~54/min, under Finnhub's 60/min free-tier cap
 
 const ALLOWED_MICS = new Set(['XNAS', 'XNYS', 'XASE']); // NASDAQ, NYSE, NYSE American
@@ -1785,6 +1791,12 @@ const DEBT_SPREAD = 0.015; // assumed spread over Rf for cost of debt (no per-ti
 const GROWTH_CAP = 0.5; // caps near-term growth input — see file header; validated against FMP on AAPL/MSFT/KO/NVDA
 const PROJECTION_YEARS = 10;
 
+// A DCF estimate at least this many times the current price is flagged as a
+// candidate for the analyst-consensus cap (see scripts/fetchDcfCapTargets.py
+// and scripts/applyDcfCap.js) — a pre-filter so that step only spends a
+// yfinance lookup on genuine outliers, not the full universe.
+const DCF_CAP_CANDIDATE_MULTIPLE = 2.0;
+
 // Mirrors FINANCIAL_INDUSTRIES/isFinancialIndustry in src/utils/metrics.js.
 const FINANCIAL_INDUSTRIES = new Set(['Banking', 'Insurance', 'Financial Services']);
 function isFinancialIndustry(industry) {
@@ -2098,7 +2110,8 @@ async function processSymbol(symbol, apiKey, ctx) {
     // percentile metrics are unaffected.
   }
 
-  const values = extractMetricValues(current, quarterly, impliedPriceFromProfile(profile));
+  const impliedPrice = impliedPriceFromProfile(profile);
+  const values = extractMetricValues(current, quarterly, impliedPrice);
 
   // Tier 1 — native quarterly series (all 6 metrics), straight from the
   // stock/metric response already fetched above for the current values.
@@ -2287,6 +2300,11 @@ async function processSymbol(symbol, apiKey, ctx) {
     }
   }
 
+  const dcfCapCandidate =
+    estimatedFairValue != null && impliedPrice != null && estimatedFairValue > impliedPrice * DCF_CAP_CANDIDATE_MULTIPLE
+      ? { estimatedFairValue, currentPrice: impliedPrice }
+      : null;
+
   return {
     status: 'ok',
     profile: profileEntry,
@@ -2297,6 +2315,7 @@ async function processSymbol(symbol, apiKey, ctx) {
     ttmTrends: Object.keys(mergedTtmForSymbol).length ? mergedTtmForSymbol : null,
     dcfComputed,
     cardValuesReconstructed,
+    dcfCapCandidate,
   };
 }
 
@@ -2317,6 +2336,7 @@ async function runWorker(workerId, symbolSubset, apiKey, ctx) {
     dead: 0,
     dcfComputed: 0,
     cardValuesReconstructed: 0,
+    dcfCapCandidates: {},
   };
 
   for (let i = 0; i < symbolSubset.length; i++) {
@@ -2334,6 +2354,7 @@ async function runWorker(workerId, symbolSubset, apiKey, ctx) {
         if (r.ttmTrends) result.ttmTrends[symbol] = r.ttmTrends;
         if (r.dcfComputed) result.dcfComputed++;
         if (r.cardValuesReconstructed) result.cardValuesReconstructed++;
+        if (r.dcfCapCandidate) result.dcfCapCandidates[symbol] = r.dcfCapCandidate;
         result.ok++;
       }
     } catch (err) {
@@ -2408,6 +2429,7 @@ async function main() {
   const yearlyTrends = {};
   const quarterlyTrends = {};
   const ttmTrends = {};
+  const dcfCapCandidates = {};
   let ok = 0;
   let failed = 0;
   let dead = 0;
@@ -2423,6 +2445,7 @@ async function main() {
     Object.assign(yearlyTrends, r.yearlyTrends);
     Object.assign(quarterlyTrends, r.quarterlyTrends);
     Object.assign(ttmTrends, r.ttmTrends);
+    Object.assign(dcfCapCandidates, r.dcfCapCandidates);
     ok += r.ok;
     failed += r.failed;
     dead += r.dead;
@@ -2448,11 +2471,13 @@ async function main() {
   fs.writeFileSync(OUTPUT_TRENDS_QUARTERLY_FILE, JSON.stringify({ generatedAt, trends: quarterlyTrends }));
   fs.writeFileSync(OUTPUT_TRENDS_YEARLY_FILE, JSON.stringify({ generatedAt, trends: yearlyTrends }));
   fs.writeFileSync(OUTPUT_TRENDS_TTM_FILE, JSON.stringify({ generatedAt, trends: ttmTrends }));
+  fs.writeFileSync(OUTPUT_DCF_CAP_CANDIDATES_FILE, JSON.stringify({ generatedAt, candidates: dcfCapCandidates }));
   console.log(
     `Wrote ${ok} tickers to ${path.relative(process.cwd(), OUTPUT_FILE)} ` +
       `(${failed} failed, ${dead} dead/no-data excluded, ${dcfComputed} with a fair-value estimate, ${cardValuesReconstructed} card values freshly backfilled from reconstruction). ` +
       `Trend caches published: ${Object.keys(nativeTrends).length} native, ${Object.keys(quarterlyTrends).length} quarterly, ` +
-      `${Object.keys(yearlyTrends).length} yearly, ${Object.keys(ttmTrends).length} ttm.`
+      `${Object.keys(yearlyTrends).length} yearly, ${Object.keys(ttmTrends).length} ttm. ` +
+      `${Object.keys(dcfCapCandidates).length} DCF-cap candidates (>= ${DCF_CAP_CANDIDATE_MULTIPLE}x price) written to ${path.relative(process.cwd(), OUTPUT_DCF_CAP_CANDIDATES_FILE)} for the analyst-target cap step.`
   );
 }
 
