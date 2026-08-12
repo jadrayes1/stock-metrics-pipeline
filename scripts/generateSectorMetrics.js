@@ -898,7 +898,15 @@ function findReportedOperatingCashFlowQ(cfItems) {
   const match = cfItems.find((item) => item.concept === 'us-gaap_NetCashProvidedByUsedInOperatingActivities');
   if (match) return match.value;
   const labelMatch = cfItems.find((item) => /net cash.*operating activities/i.test(item.label || ''));
-  return labelMatch ? labelMatch.value : null;
+  if (labelMatch) return labelMatch.value;
+  // Same class of gap as findReportedEBIT's pretax fallback: the label
+  // regex above can't match buildSecSyntheticReports' concept-name-derived
+  // labels (no spaces) - checked by exact concept name for the OTHER
+  // OPERATING_SUBTOTAL_CONCEPTS entry (ContinuingOperations variant), which
+  // buildSecSyntheticReports can also synthesize under when a filer only
+  // tags that one and not the primary concept above.
+  const continuingOpsMatch = cfItems.find((item) => item.concept === 'us-gaap_NetCashProvidedByUsedInOperatingActivitiesContinuingOperations');
+  return continuingOpsMatch ? continuingOpsMatch.value : null;
 }
 
 // A separate copy from extractDcfInputs's inline capex extraction above
@@ -1183,7 +1191,15 @@ function findReportedCashBalance(bsItems) {
   const match = bsItems.find((item) => item.concept === 'us-gaap_CashAndCashEquivalentsAtCarryingValue');
   if (match) return match.value;
   const labelMatch = bsItems.find((item) => /cash and cash equivalents/i.test(item.label || ''));
-  return labelMatch ? labelMatch.value : null;
+  if (labelMatch) return labelMatch.value;
+  // Same class of gap as findReportedEBIT's pretax fallback: the label
+  // regex above can't match buildSecSyntheticReports' concept-name-derived
+  // labels (no spaces) - checked by exact concept name for the other two
+  // SEC_CASH_CONCEPTS entries, which buildSecSyntheticReports can also
+  // synthesize under when a filer tags cash under one of those instead of
+  // the primary concept above.
+  const altMatch = bsItems.find((item) => item.concept === 'us-gaap_CashAndCashEquivalentsAtFairValue' || item.concept === 'us-gaap_Cash');
+  return altMatch ? altMatch.value : null;
 }
 
 // ---------------------------------------------------------------------------
