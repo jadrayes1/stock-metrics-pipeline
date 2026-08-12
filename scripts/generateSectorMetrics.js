@@ -1823,7 +1823,7 @@ const PROJECTION_YEARS = 10;
 // candidate for the analyst-consensus cap (see scripts/fetchDcfCapTargets.py
 // and scripts/applyDcfCap.js) — a pre-filter so that step only spends a
 // yfinance lookup on genuine outliers, not the full universe.
-const DCF_CAP_CANDIDATE_MULTIPLE = 2.0;
+const DCF_CAP_CANDIDATE_MULTIPLE = 1.8;
 
 // Mirrors FINANCIAL_INDUSTRIES/isFinancialIndustry in src/utils/metrics.js.
 const FINANCIAL_INDUSTRIES = new Set(['Banking', 'Insurance', 'Financial Services']);
