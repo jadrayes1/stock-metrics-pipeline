@@ -2168,6 +2168,27 @@ async function processSymbol(symbol, apiKey, ctx) {
     }
   }
 
+  // Cross-cadence derivation — fills a missing quarter/year using ONLY real
+  // arithmetic on already-known real (or SEC-enriched, from above) facts,
+  // never fabrication (see deriveCrossCadenceReports' own comment for the
+  // full design). Runs after SEC enrichment, before the 12 builders, so a
+  // ticker like BRK.A - now enriched with real SEC facts above - gets any
+  // remaining one-off cadence gaps closed on top. A pure local computation
+  // (no network calls) - cheap enough to run for every ticker unconditionally;
+  // for an already-complete ticker every per-field/per-year condition simply
+  // never matches, so this is a no-op rather than a cost.
+  try {
+    const derived = deriveCrossCadenceReports(quarterlyFinancials, annualReportedFinancials);
+    if (process.env.DEBUG_SEC_ENRICHMENT) {
+      console.error('DEBUG cross-cadence derived', derived.quarterlyReports.length - quarterlyFinancials.length, 'new quarters,', derived.annualReports.length - annualReportedFinancials.length, 'new annuals');
+    }
+    quarterlyFinancials = derived.quarterlyReports;
+    annualReportedFinancials = derived.annualReports;
+  } catch (e) {
+    if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG cross-cadence derivation threw', e.message, e.stack);
+    // Non-fatal — same graceful-degradation philosophy as the fetches above.
+  }
+
   const isBankLike = isFinancialIndustry(profile.industry);
   const yearlyBuilders = {
     revenueGrowth: () => buildRevenueGrowthYearlyFromFilings(annualReportedFinancials),
