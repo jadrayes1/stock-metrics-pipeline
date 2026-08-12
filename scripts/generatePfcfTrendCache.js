@@ -61,6 +61,21 @@ const RENAMED_TICKER_FINANCIALS_ALIASES = {
   BNY: 'BK',
 };
 
+// Mirrors FINANCIAL_INDUSTRIES/isFinancialIndustry in generateSectorMetrics.js
+// (kept in sync) — verified live: BAC's real reported cash-flow statement
+// has ZERO capex-related line items under any concept this file checks (no
+// "purchases of premises and equipment" or similar), a genuine
+// characteristic of how large banks tag their financials, not a missing
+// concept name to add. buildPfcfTrendFromFilingsAndPrices and its Quarterly/
+// Yearly siblings below treat missing capex as 0 for these tickers instead
+// of excluding the period entirely - bank capex, on the rare filers that DO
+// report it, is small relative to their OCF (tens of billions), so FCF ≈
+// OCF is a reasonable approximation here, not a fabrication.
+const FINANCIAL_INDUSTRIES = new Set(['Banking', 'Insurance', 'Financial Services']);
+function isFinancialIndustry(industry) {
+  return !!industry && FINANCIAL_INDUSTRIES.has(industry);
+}
+
 function readFinnhubApiKey() {
   if (process.env.FINNHUB_API_KEY) return process.env.FINNHUB_API_KEY;
   throw new Error('FINNHUB_API_KEY env var is not set.');
@@ -248,7 +263,7 @@ function findClosestMonthlyPrice(monthlyPrices, targetDate) {
 // ticker; a filer with no per-quarter share count AND no diluted/basic
 // count anywhere just doesn't get a point for that quarter, same as any
 // other missing input.
-function buildPfcfTrendFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices) {
+function buildPfcfTrendFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices, isBank = false) {
   const currentCik = quarterlyReports?.[0]?.cik ?? annualReports?.[0]?.cik;
   const sameCik = (r) => currentCik == null || r.cik === currentCik;
   quarterlyReports = (quarterlyReports || []).filter(sameCik);
@@ -269,10 +284,10 @@ function buildPfcfTrendFromFilingsAndPrices(quarterlyReports, annualReports, mon
   }
 
   const standaloneQuarters = Object.keys(ocf)
-    .filter((key) => capex[key] != null && sharesByQuarter[key] > 0)
+    .filter((key) => (capex[key] != null || isBank) && sharesByQuarter[key] > 0)
     .map((key) => {
       const [year, quarter] = key.split('-').map(Number);
-      return { year, quarter, fcf: ocf[key] - capex[key], shares: sharesByQuarter[key] };
+      return { year, quarter, fcf: ocf[key] - (capex[key] ?? 0), shares: sharesByQuarter[key] };
     })
     .sort((a, b) => a.year - b.year || a.quarter - b.quarter);
 
@@ -299,7 +314,7 @@ function yearlyLabel(year) {
 // reason and make it incomparable to the Yearly/TTM views (verified live
 // building the app's equivalent tabs: AAPL's raw single-quarter P/FCF
 // computed to 150-170x vs. a sensible 21-39x on an annual basis).
-function buildPfcfQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices) {
+function buildPfcfQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices, isBank = false) {
   const currentCik = quarterlyReports?.[0]?.cik ?? annualReports?.[0]?.cik;
   const sameCik = (r) => currentCik == null || r.cik === currentCik;
   quarterlyReports = (quarterlyReports || []).filter(sameCik);
@@ -317,9 +332,9 @@ function buildPfcfQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports,
 
   const points = [];
   for (const key of Object.keys(ocf)) {
-    if (capex[key] == null || !(sharesByQuarter[key] > 0)) continue;
+    if ((capex[key] == null && !isBank) || !(sharesByQuarter[key] > 0)) continue;
     const [year, quarter] = key.split('-').map(Number);
-    const annualizedFcfPerShare = ((ocf[key] - capex[key]) / sharesByQuarter[key]) * 4;
+    const annualizedFcfPerShare = ((ocf[key] - (capex[key] ?? 0)) / sharesByQuarter[key]) * 4;
     const price = findClosestMonthlyPrice(monthlyPrices, quarterEndDate(year, quarter));
     const value = price != null && annualizedFcfPerShare !== 0 ? price / annualizedFcfPerShare : null;
     if (value != null) points.push({ year, quarter, label: `Q${quarter} '${String(year).slice(-2)}`, value });
@@ -332,7 +347,7 @@ function buildPfcfQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports,
 
 // One P/FCF point per fiscal year, priced at that year's Dec-31-equivalent
 // close — mirrors buildPfcfYearlyFromFilingsAndPrices in src/utils/metrics.js.
-function buildPfcfYearlyFromFilingsAndPrices(annualReports, monthlyPrices) {
+function buildPfcfYearlyFromFilingsAndPrices(annualReports, monthlyPrices, isBank = false) {
   const currentCik = annualReports?.[0]?.cik;
   const sameCik = (r) => currentCik == null || r.cik === currentCik;
   const filtered = (annualReports || []).filter(sameCik);
@@ -342,8 +357,8 @@ function buildPfcfYearlyFromFilingsAndPrices(annualReports, monthlyPrices) {
     const ocf = findReportedOperatingCashFlowQ(a.report?.cf || []);
     const capex = findReportedCapexQ(a.report?.cf || []);
     const shares = findReportedDilutedShares(a.report?.ic || []);
-    if (ocf == null || capex == null || !(shares > 0)) continue;
-    const fcfPerShare = (ocf - capex) / shares;
+    if (ocf == null || (capex == null && !isBank) || !(shares > 0)) continue;
+    const fcfPerShare = (ocf - (capex ?? 0)) / shares;
     const price = findClosestMonthlyPrice(monthlyPrices, quarterEndDate(a.year, 4));
     const value = price != null && fcfPerShare !== 0 ? price / fcfPerShare : null;
     if (value != null) points.push({ year: a.year, label: yearlyLabel(a.year), value });
@@ -460,11 +475,15 @@ async function main() {
       twelveDataCalls++;
 
       // All three cadences reuse this SAME fetched data — no extra API
-      // calls beyond the ones already budgeted above.
+      // calls beyond the ones already budgeted above. industry is already
+      // available from the metricsDataset fetched at the top of main() (the
+      // main pipeline publishes it alongside pfcfRatio) — no extra fetch
+      // needed to know whether this ticker is bank-like.
+      const isBank = isFinancialIndustry(metricsDataset.metrics?.[symbol]?.industry);
       fresh = {
-        ttm: buildPfcfTrendFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices),
-        quarterly: buildPfcfQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices),
-        yearly: buildPfcfYearlyFromFilingsAndPrices(annualReports, monthlyPrices),
+        ttm: buildPfcfTrendFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices, isBank),
+        quarterly: buildPfcfQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices, isBank),
+        yearly: buildPfcfYearlyFromFilingsAndPrices(annualReports, monthlyPrices, isBank),
       };
     } catch (err) {
       console.log(`  skip ${symbol}: ${err.message}`);
@@ -490,7 +509,26 @@ async function main() {
   );
 }
 
-main().catch((err) => {
-  console.error('Fatal error:', err);
-  process.exit(1);
-});
+module.exports = {
+  buildPfcfTrendFromFilingsAndPrices,
+  buildPfcfQuarterlyFromFilingsAndPrices,
+  buildPfcfYearlyFromFilingsAndPrices,
+  fetchReportedFinancials,
+  fetchMonthlyPrices,
+  isFinancialIndustry,
+  findReportedOperatingCashFlowQ,
+  findReportedCapexQ,
+  findReportedDilutedShares,
+};
+
+// Matches the require.main guard already used in the sibling
+// generateForeignFilingsCache.js/generateSectorMetrics.js scripts — lets
+// this file be required for direct testing (e.g. of the builder functions
+// above against real fetched data) without triggering a full production
+// run, which main() would otherwise do unconditionally on require.
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('Fatal error:', err);
+    process.exit(1);
+  });
+}
