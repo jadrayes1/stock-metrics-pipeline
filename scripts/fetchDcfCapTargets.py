@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """Fetches analyst consensus price targets (via yfinance) for the tickers
-scripts/generateSectorMetrics.js flagged as DCF-cap candidates — its own
-estimatedFairValue is at least DCF_CAP_CANDIDATE_MULTIPLE (2.0x, see that
-file) above the current price. Only those candidates are looked up, not the
-full ~5,000-ticker universe, to keep scrape volume against Yahoo's
-undocumented endpoints (yfinance has no official rate limit or SLA, and can
-be throttled without warning, especially from a shared CI IP range) as low
-as possible.
+scripts/generateSectorMetrics.js flagged as needing one, for one of two
+reasons (see the 'reason' field on each candidate):
+  - 'cap': our own estimatedFairValue is at least DCF_CAP_CANDIDATE_MULTIPLE
+    (2.0x, see that file) above the current price — the real analyst high
+    is used as a ceiling (scripts/applyDcfCap.js).
+  - 'fallback': DCF wasn't computable at all for this ticker — the real
+    analyst mid-range ((high+low)/2, or mean/median if only one of those is
+    available) is used to fill estimatedFairValue rather than leaving it
+    empty, tagged with estimatedFairValueSource so it stays distinguishable
+    from a real DCF output.
+Only flagged candidates are looked up, not the full ~5,000-ticker universe,
+to keep scrape volume against Yahoo's undocumented endpoints (yfinance has
+no official rate limit or SLA, and can be throttled without warning,
+especially from a shared CI IP range) as low as possible.
 
 A missing/failed lookup for a given ticker is never fatal — it just means
-that ticker's DCF estimate goes unchecked for this run (scripts/applyDcfCap.js
-leaves it as-is). The DCF estimate itself, and every other metric, is
-entirely unaffected by a failure here.
+that ticker's DCF estimate goes unchecked/unfilled for this run
+(scripts/applyDcfCap.js leaves it as-is). Every other metric is entirely
+unaffected by a failure here.
 
 Usage: python3 scripts/fetchDcfCapTargets.py
 Reads:  dcfCapCandidates.json (repo root, written by generateSectorMetrics.js)
@@ -45,7 +52,7 @@ def main():
         candidates = json.load(f).get("candidates", {})
 
     symbols = sorted(candidates.keys())
-    print(f"{len(symbols)} DCF-cap candidates to look up.")
+    print(f"{len(symbols)} candidates to look up.")
 
     targets = {}
     failed = 0
@@ -53,12 +60,16 @@ def main():
         try:
             info = yf.Ticker(symbol).analyst_price_targets
             high = info.get("high") if info else None
-            if high is not None:
+            low = info.get("low") if info else None
+            mean = info.get("mean") if info else None
+            median = info.get("median") if info else None
+            if high is not None or low is not None or mean is not None or median is not None:
                 targets[symbol] = {
+                    "reason": candidates[symbol].get("reason"),
                     "high": high,
-                    "low": info.get("low"),
-                    "mean": info.get("mean"),
-                    "median": info.get("median"),
+                    "low": low,
+                    "mean": mean,
+                    "median": median,
                 }
         except Exception as err:
             failed += 1

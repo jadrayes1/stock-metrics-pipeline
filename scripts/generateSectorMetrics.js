@@ -112,7 +112,10 @@ const OUTPUT_TRENDS_NATIVE_FILE = path.join(__dirname, '../src/data/trendsNative
 const OUTPUT_TRENDS_QUARTERLY_FILE = path.join(__dirname, '../src/data/trendsQuarterly.json');
 const OUTPUT_TRENDS_YEARLY_FILE = path.join(__dirname, '../src/data/trendsYearly.json');
 const OUTPUT_TRENDS_TTM_FILE = path.join(__dirname, '../src/data/trendsTtm.json');
-// Intermediate, unpublished artifact — see DCF_CAP_CANDIDATE_MULTIPLE.
+// Intermediate, unpublished artifact — tickers needing a real analyst price
+// target lookup, either to cap an outlier DCF estimate (see
+// DCF_CAP_CANDIDATE_MULTIPLE) or to fill in a mid-range estimate where DCF
+// wasn't computable at all (see the 'fallback' reason in processSymbol).
 // scripts/fetchDcfCapTargets.py reads this, scripts/applyDcfCap.js
 // consumes its output and rewrites OUTPUT_FILE in place, both run as
 // separate workflow steps between "Generate dataset" and "Publish to gist"
@@ -2300,10 +2303,20 @@ async function processSymbol(symbol, apiKey, ctx) {
     }
   }
 
-  const dcfCapCandidate =
-    estimatedFairValue != null && impliedPrice != null && estimatedFairValue > impliedPrice * DCF_CAP_CANDIDATE_MULTIPLE
-      ? { estimatedFairValue, currentPrice: impliedPrice }
-      : null;
+  // Two distinct reasons a ticker goes to the analyst-target lookup step
+  // (scripts/fetchDcfCapTargets.py + applyDcfCap.js): our own DCF estimate
+  // is a >= DCF_CAP_CANDIDATE_MULTIPLE outlier vs. price ('cap' — real
+  // analyst high used as a ceiling), or DCF wasn't computable at all for
+  // this ticker ('fallback' — real analyst mid-range used to fill the gap
+  // rather than leaving estimatedFairValue empty). Mutually exclusive:
+  // 'fallback' only applies when there's no DCF estimate to even evaluate
+  // against the multiple.
+  let dcfCapCandidate = null;
+  if (estimatedFairValue != null && impliedPrice != null && estimatedFairValue > impliedPrice * DCF_CAP_CANDIDATE_MULTIPLE) {
+    dcfCapCandidate = { reason: 'cap', estimatedFairValue, currentPrice: impliedPrice };
+  } else if (estimatedFairValue == null) {
+    dcfCapCandidate = { reason: 'fallback', currentPrice: impliedPrice };
+  }
 
   return {
     status: 'ok',
@@ -2472,12 +2485,14 @@ async function main() {
   fs.writeFileSync(OUTPUT_TRENDS_YEARLY_FILE, JSON.stringify({ generatedAt, trends: yearlyTrends }));
   fs.writeFileSync(OUTPUT_TRENDS_TTM_FILE, JSON.stringify({ generatedAt, trends: ttmTrends }));
   fs.writeFileSync(OUTPUT_DCF_CAP_CANDIDATES_FILE, JSON.stringify({ generatedAt, candidates: dcfCapCandidates }));
+  const capCandidateCount = Object.values(dcfCapCandidates).filter((c) => c.reason === 'cap').length;
+  const fallbackCandidateCount = Object.values(dcfCapCandidates).filter((c) => c.reason === 'fallback').length;
   console.log(
     `Wrote ${ok} tickers to ${path.relative(process.cwd(), OUTPUT_FILE)} ` +
       `(${failed} failed, ${dead} dead/no-data excluded, ${dcfComputed} with a fair-value estimate, ${cardValuesReconstructed} card values freshly backfilled from reconstruction). ` +
       `Trend caches published: ${Object.keys(nativeTrends).length} native, ${Object.keys(quarterlyTrends).length} quarterly, ` +
       `${Object.keys(yearlyTrends).length} yearly, ${Object.keys(ttmTrends).length} ttm. ` +
-      `${Object.keys(dcfCapCandidates).length} DCF-cap candidates (>= ${DCF_CAP_CANDIDATE_MULTIPLE}x price) written to ${path.relative(process.cwd(), OUTPUT_DCF_CAP_CANDIDATES_FILE)} for the analyst-target cap step.`
+      `${Object.keys(dcfCapCandidates).length} tickers need an analyst-target lookup (${capCandidateCount} to cap an outlier DCF estimate >= ${DCF_CAP_CANDIDATE_MULTIPLE}x price, ${fallbackCandidateCount} to fill a mid-range estimate where DCF wasn't available) — written to ${path.relative(process.cwd(), OUTPUT_DCF_CAP_CANDIDATES_FILE)}.`
   );
 }
 

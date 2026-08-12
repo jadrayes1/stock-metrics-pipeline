@@ -15,17 +15,21 @@
 # comparable metrics, and why, published to the same Gist as coverageAudit.json
 # for tracking coverage over time.
 #
-# Between those two, caps outlier DCF estimatedFairValue values at the real
-# analyst-consensus high price target for the small subset of tickers whose
-# estimate came out unusually far above the current price (see
-# DCF_CAP_CANDIDATE_MULTIPLE in generateSectorMetrics.js,
-# scripts/fetchDcfCapTargets.py, and scripts/applyDcfCap.js) — this uses
-# yfinance (Yahoo Finance) since analyst price targets aren't available on
-# Finnhub's free tier. Both yfinance-touching steps have
-# `continue-on-error: true` since that's an undocumented, unofficial
-# endpoint with no rate-limit guarantee — a failure there never blocks the
-# rest of the pipeline from publishing; affected tickers just keep their
-# uncapped DCF estimate for that run.
+# Between those two, applies real analyst-consensus price targets to two
+# distinct subsets of tickers (see DCF_CAP_CANDIDATE_MULTIPLE in
+# generateSectorMetrics.js, scripts/fetchDcfCapTargets.py, and
+# scripts/applyDcfCap.js): caps an outlier estimatedFairValue at the
+# analyst high, for tickers whose DCF estimate came out unusually far above
+# the current price; and fills estimatedFairValue with the analyst
+# mid-range for tickers where DCF wasn't computable at all (tagged
+# estimatedFairValueSource: 'analystConsensus' so it stays distinguishable
+# from a real DCF output). This uses yfinance (Yahoo Finance) since analyst
+# price targets aren't available on Finnhub's free tier. Both
+# yfinance-touching steps have `continue-on-error: true` since that's an
+# undocumented, unofficial endpoint with no rate-limit guarantee — a
+# failure there never blocks the rest of the pipeline from publishing;
+# affected tickers just keep whatever estimatedFairValue they already had
+# for that run.
 #
 # This lives in its OWN public repo, separate from the app's (private) repo,
 # for two reasons:
@@ -108,11 +112,12 @@ jobs:
           FINNHUB_API_KEY_2: ${{ secrets.FINNHUB_API_KEY_2 }}
         run: node scripts/generateSectorMetrics.js
 
-      # DCF fair-value cap: for the small subset of tickers whose estimate
-      # came out >= 2x the current price (see DCF_CAP_CANDIDATE_MULTIPLE in
-      # generateSectorMetrics.js), look up the real analyst-consensus high
-      # price target via yfinance and cap the estimate there if it's still
-      # above it. yfinance scrapes an undocumented Yahoo endpoint (no
+      # DCF cap + fallback: for tickers whose DCF estimate came out >= 2x the
+      # current price (see DCF_CAP_CANDIDATE_MULTIPLE in
+      # generateSectorMetrics.js), or where DCF wasn't computable at all,
+      # look up the real analyst-consensus price target via yfinance and
+      # either cap the outlier estimate or fill the gap with the analyst
+      # mid-range. yfinance scrapes an undocumented Yahoo endpoint (no
       # official API/rate limit for this data on Finnhub's free tier, which
       # is what the rest of this pipeline uses) — `continue-on-error` on
       # both steps below so a Yahoo-side failure (blocked IP, layout change,
@@ -127,11 +132,11 @@ jobs:
         continue-on-error: true
         run: pip install yfinance
 
-      - name: Fetch DCF-cap analyst price targets
+      - name: Fetch analyst price targets for DCF cap/fallback candidates
         continue-on-error: true
         run: python3 scripts/fetchDcfCapTargets.py
 
-      - name: Apply DCF cap
+      - name: Apply DCF cap and mid-range fallback
         run: node scripts/applyDcfCap.js
 
       - name: Audit metric coverage

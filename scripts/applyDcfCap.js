@@ -1,17 +1,27 @@
 // scripts/applyDcfCap.js
 //
-// Caps an outlier DCF estimatedFairValue at the analyst-consensus high price
-// target, when one is available and our estimate exceeds it. Runs as an
-// extra step right after scripts/fetchDcfCapTargets.py (which resolves
-// analyst targets, via yfinance, only for the candidates
-// generateSectorMetrics.js already flagged as >= DCF_CAP_CANDIDATE_MULTIPLE
-// above the current price — see that file) and before "Publish to gist" —
-// see .github/workflows/generate-sector-metrics.yml.
+// Consumes scripts/fetchDcfCapTargets.py's resolved analyst targets and
+// applies one of two treatments per ticker, based on the 'reason' that
+// ticker was flagged with in dcfCapCandidates.json (see
+// generateSectorMetrics.js):
+//   - 'cap': our own estimatedFairValue exceeded the real analyst high —
+//     cap it there.
+//   - 'fallback': DCF wasn't computable at all for this ticker — fill
+//     estimatedFairValue with the real analyst mid-range ((high+low)/2, or
+//     mean/median if only one of those is available), tagged with
+//     estimatedFairValueSource: 'analystConsensus' so it stays
+//     distinguishable from a real DCF output (the app's own Fair Value
+//     (DCF) label/description otherwise implies "not a price target," which
+//     an analyst-consensus figure very much is).
+//
+// Runs right after fetchDcfCapTargets.py and before "Publish to gist" — see
+// .github/workflows/generate-sector-metrics.yml.
 //
 // Deliberately conservative: a ticker with no resolved analyst target (a
-// failed/skipped yfinance lookup, or simply no coverage) is left untouched
-// — this only ever lowers an estimate that's both flagged AND has a real
-// target to check against, never removes or nulls an estimate outright.
+// failed/skipped yfinance lookup, or simply no coverage) is left exactly as
+// it was — this never removes or nulls an estimate outright, only lowers a
+// flagged outlier or fills a genuine gap, both gated on having a real
+// target to act on.
 
 const fs = require('fs');
 const path = require('path');
@@ -19,35 +29,55 @@ const path = require('path');
 const METRICS_FILE = process.argv[2] || path.join(__dirname, '../src/data/marketMetrics.json');
 const TARGETS_FILE = process.argv[3] || path.join(__dirname, '../analystPriceTargets.json');
 
+function computeMidRange(target) {
+  if (typeof target.high === 'number' && typeof target.low === 'number') return (target.high + target.low) / 2;
+  if (typeof target.mean === 'number') return target.mean;
+  if (typeof target.median === 'number') return target.median;
+  return null;
+}
+
 function applyDcfCap(metrics, targets) {
   let capped = 0;
+  let filled = 0;
   for (const [symbol, target] of Object.entries(targets)) {
-    const high = target?.high;
     const entry = metrics[symbol];
-    if (typeof high !== 'number' || !entry || entry.estimatedFairValue == null) continue;
-    if (entry.estimatedFairValue > high) {
-      entry.estimatedFairValue = high;
-      capped++;
+    if (!entry) continue;
+
+    if (target?.reason === 'cap') {
+      const high = target.high;
+      if (typeof high === 'number' && entry.estimatedFairValue != null && entry.estimatedFairValue > high) {
+        entry.estimatedFairValue = high;
+        capped++;
+      }
+    } else if (target?.reason === 'fallback') {
+      if (entry.estimatedFairValue == null) {
+        const midRange = computeMidRange(target);
+        if (midRange != null) {
+          entry.estimatedFairValue = midRange;
+          entry.estimatedFairValueSource = 'analystConsensus';
+          filled++;
+        }
+      }
     }
   }
-  return capped;
+  return { capped, filled };
 }
 
 function main() {
   if (!fs.existsSync(TARGETS_FILE)) {
-    console.log(`${TARGETS_FILE} not found — skipping DCF cap (no analyst targets to apply).`);
+    console.log(`${TARGETS_FILE} not found — skipping DCF cap/fallback (no analyst targets to apply).`);
     return;
   }
 
   const dataset = JSON.parse(fs.readFileSync(METRICS_FILE, 'utf8'));
   const { targets } = JSON.parse(fs.readFileSync(TARGETS_FILE, 'utf8'));
 
-  const capped = applyDcfCap(dataset.metrics || {}, targets || {});
+  const { capped, filled } = applyDcfCap(dataset.metrics || {}, targets || {});
   fs.writeFileSync(METRICS_FILE, JSON.stringify(dataset));
 
   console.log(
-    `Capped ${capped} of ${Object.keys(targets || {}).length} resolved analyst targets ` +
-      `(estimatedFairValue exceeded the analyst high) in ${path.relative(process.cwd(), METRICS_FILE)}.`
+    `Applied ${Object.keys(targets || {}).length} resolved analyst targets to ${path.relative(process.cwd(), METRICS_FILE)}: ` +
+      `${capped} outlier DCF estimates capped, ${filled} missing DCF estimates filled with an analyst mid-range.`
   );
 }
 
@@ -55,4 +85,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { applyDcfCap };
+module.exports = { applyDcfCap, computeMidRange };
