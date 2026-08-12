@@ -8,16 +8,18 @@
 // no live Finnhub calls, no waiting, no rate-limit exposure for the
 // person using the app.
 //
-// Also computes `industryLeaders`: one ticker per industry with at least
-// MIN_INDUSTRY_PEERS peers, required to have all 6 comparable metrics
-// present AND rank top-quintile in at least 5 of them (see
-// computeIndustryLeaders below for why — a ticker with only 1 of 6 metrics
-// present was otherwise winning on a single outlier/likely-erroneous
-// number), lightly biased toward tickers with more reported quarters (see
-// historyWeight). Precomputed here rather than on-device so the Home
-// screen's carousel is just reading a small pre-baked list, same "compute
-// once daily, app just reads" philosophy as everything else this pipeline
-// produces.
+// Also computes `industryLeaders`: up to MAX_LEADERS_PER_INDUSTRY tickers
+// per industry with at least MIN_INDUSTRY_PEERS peers, each required to
+// have all 6 comparable metrics present AND rank top-quintile in at least
+// 5 of them (see computeIndustryLeaders below for why — a ticker with only
+// 1 of 6 metrics present was otherwise winning on a single outlier/likely-
+// erroneous number), lightly biased toward tickers with more reported
+// quarters (see historyWeight). One grouped entry per industry
+// ({industry, peerCount, leaders: [...]}), not a flat per-ticker list — see
+// IndustryLeaders.js for the per-industry carousel this renders as.
+// Precomputed here rather than on-device so the Home screen's carousels are
+// just reading a small pre-baked list, same "compute once daily, app just
+// reads" philosophy as everything else this pipeline produces.
 //
 // Also computes `estimatedFairValue`: a DCF fair-value estimate built from
 // Finnhub's own reported financials (see computeEstimatedFairValue below),
@@ -1875,6 +1877,7 @@ const TOP_METRIC_PERCENTILE = 80;
 const MIN_TOP_METRICS = 5; // must be top-tier in at least this many of the 6 metrics, not just a good average
 const HISTORY_QUARTERS_FULL_WEIGHT = 8; // ~2 years — no penalty at or above this
 const HISTORY_QUARTERS_FLOOR = 4; // ~1 year — a steeper penalty below this
+const MAX_LEADERS_PER_INDUSTRY = 5; // show up to this many qualifying tickers per industry, not just the single best
 
 // Mirrors the percentile-rank + goodness logic in src/utils/metrics.js
 // (percentileRank, percentileTone) — keep in sync if that ever changes.
@@ -1946,8 +1949,10 @@ function historyWeight(historyQuarters) {
 }
 
 /**
- * One "leader" per industry (>= MIN_INDUSTRY_PEERS peers only). A candidate
- * must have:
+ * Up to MAX_LEADERS_PER_INDUSTRY qualifying tickers per industry (>=
+ * MIN_INDUSTRY_PEERS peers only), one grouped entry per industry rather than
+ * a flat per-ticker list — see IndustryLeaders.js for the per-industry
+ * carousel this shape is meant to render. A candidate must have:
  *  1. All 6 comparable metrics present — verified live that a ticker with
  *     only 1 of 6 (e.g. SharonAI/SHAZ: fcfMargin present, everything else
  *     null, and that one figure a wildly implausible 2065% margin) could
@@ -1963,11 +1968,13 @@ function historyWeight(historyQuarters) {
  *     only gates whether it can count as one of the "top" ones. Nothing is
  *     excluded outright for this; a candidate can still win on its other
  *     metrics if one is disqualified from counting as "top."
- * Among qualifying candidates, the winner is the highest composite score
- * (the goodness-averaged score across all 6, unaffected by rule 2's gating),
- * weighted down slightly for thin reporting history (see historyWeight). An
- * industry with no qualifying candidate at all gets no leader, rather than
- * forcing a pick.
+ * Among qualifying candidates, ranked by composite score (the goodness-
+ * averaged score across all 6, unaffected by rule 2's gating), weighted
+ * down slightly for thin reporting history (see historyWeight) — the top
+ * MAX_LEADERS_PER_INDUSTRY of those make the cut. An industry with no
+ * qualifying candidate at all gets no entry, rather than forcing a pick;
+ * one with fewer than MAX_LEADERS_PER_INDUSTRY qualifiers just shows
+ * however many genuinely qualify, never padded with a non-qualifying pick.
  */
 function computeIndustryLeaders(metrics, profiles) {
   const byIndustry = {};
@@ -1996,7 +2003,7 @@ function computeIndustryLeaders(metrics, profiles) {
 
     const eligible = symbols.filter((s) => COMPARABLE_KEYS.every((k) => metrics[s][k] !== null && metrics[s][k] !== undefined));
 
-    let best = null;
+    const qualifying = [];
     for (const symbol of eligible) {
       const data = metrics[symbol];
       const trendQualified = profiles[symbol]?.trendQualified || {};
@@ -2013,17 +2020,21 @@ function computeIndustryLeaders(metrics, profiles) {
 
       const composite = goodnessScores.reduce((a, b) => a + b, 0) / goodnessScores.length;
       const adjustedScore = composite * historyWeight(profiles[symbol]?.historyQuarters || 0);
-      if (!best || adjustedScore > best.adjustedScore) best = { symbol, composite, adjustedScore };
+      qualifying.push({ symbol, composite, adjustedScore });
     }
 
-    if (best) {
+    if (qualifying.length) {
+      qualifying.sort((a, b) => b.adjustedScore - a.adjustedScore);
+      const top = qualifying.slice(0, MAX_LEADERS_PER_INDUSTRY);
       leaders.push({
-        symbol: best.symbol,
-        name: profiles[best.symbol]?.name || best.symbol,
-        logo: profiles[best.symbol]?.logo || null,
         industry,
-        composite: best.composite,
         peerCount: symbols.length,
+        leaders: top.map((t) => ({
+          symbol: t.symbol,
+          name: profiles[t.symbol]?.name || t.symbol,
+          logo: profiles[t.symbol]?.logo || null,
+          composite: t.composite,
+        })),
       });
     }
   }
@@ -2420,7 +2431,8 @@ async function main() {
   }
 
   const industryLeaders = computeIndustryLeaders(metrics, profiles);
-  console.log(`\nComputed ${industryLeaders.length} industry leaders (industries with >= ${MIN_INDUSTRY_PEERS} peers).`);
+  const totalLeaderTickers = industryLeaders.reduce((sum, entry) => sum + entry.leaders.length, 0);
+  console.log(`\nComputed leaders for ${industryLeaders.length} industries (>= ${MIN_INDUSTRY_PEERS} peers each), ${totalLeaderTickers} leader tickers total.`);
 
   const generatedAt = new Date().toISOString();
   // marketMetrics.json stays small — no trends embedded (see
@@ -2476,4 +2488,5 @@ module.exports = {
   parseLabelToApproxDate,
   isRecentEnough,
   pickCadenceMetric,
+  computeIndustryLeaders,
 };
