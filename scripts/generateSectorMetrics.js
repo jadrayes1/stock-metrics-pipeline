@@ -715,6 +715,13 @@ async function backfillRevenueGapsFromSec(symbol, cik, quarterlyReports, annualR
       year: gap.year,
       quarter: gap.quarter,
       cik: referenceCik,
+      // Marks this as a narrow, revenue-only stub (unlike a real Finnhub
+      // report's own form, e.g. '10-Q') — see mergeSyntheticReports below,
+      // which needs to tell a stub like this apart from a genuine filing so
+      // the broader SEC-XBRL enrichment (buildSecSyntheticReports) can
+      // still fill in the OTHER metrics' data for this same period instead
+      // of treating the slot as already fully covered.
+      form: 'SEC-XBRL-narrow',
       startDate: `${gap.expectedStart} 00:00:00`,
       endDate: `${gap.expectedEnd} 00:00:00`,
       report: { ic: [{ concept: 'us-gaap_Revenues', label: 'Revenues (SEC XBRL fallback)', value }] },
@@ -727,6 +734,7 @@ async function backfillRevenueGapsFromSec(symbol, cik, quarterlyReports, annualR
     filledAnnuals.push({
       year: gap.year,
       cik: referenceCik,
+      form: 'SEC-XBRL-narrow', // see the matching comment on filledQuarters above
       startDate: `${gap.expectedStart} 00:00:00`,
       endDate: `${gap.expectedEnd} 00:00:00`,
       report: { ic: [{ concept: 'us-gaap_Revenues', label: 'Revenues (SEC XBRL fallback)', value }] },
@@ -758,6 +766,67 @@ async function backfillRevenueGapsFromSec(symbol, cik, quarterlyReports, annualR
 
 const SEC_ENRICHMENT_SPARSE_QUARTERLY_THRESHOLD = 4; // can't complete even one TTM window below this
 const SEC_ENRICHMENT_SPARSE_ANNUAL_THRESHOLD = 2; // can't compute a single YoY annual point below this
+
+// A second, independent enrichment trigger alongside the sparse-overall one
+// above — verified live for MSFT: 46 total quarterly reports (nowhere near
+// "sparse"), but Finnhub's own financials-reported feed is missing the two
+// 10-Qs covering 2023-12-31 and 2024-03-31, a real hole in an otherwise
+// healthy sequence. That gap alone is enough to stall TTM's trailing
+// 4-quarter window at Q1 '24 even though quarterly itself reaches Q3 '26 —
+// exactly the kind of one-cadence-fresh-another-stale inconsistency the
+// recency floor (isRecentEnough/pickCadenceMetric above) is a backstop
+// for, but backfilling the real gap from SEC directly is strictly better
+// than falling back to that backstop.
+//
+// Deliberately scoped to the RECENT portion of the report sequence, not the
+// full multi-decade history, to keep the extra companyfacts fetch limited
+// to tickers where it actually matters for freshness. Position-based (most
+// recent N report entries), not calendar-date-based — a calendar cutoff
+// (e.g. "gaps within the last 12 months") sounds intuitive but doesn't
+// actually work: MSFT's real gap (the periods ending 2023-12-31 and
+// 2024-03-31) is now over 2 years old by calendar time, yet it still
+// permanently blocks TTM's trailing-4-quarter window AND poisons
+// revenueGrowth's YoY comparison for the same two calendar quarters a year
+// later (2024-12-31/2025-03-31) — a gap's age doesn't reduce its ongoing
+// effect on today's published data the way a calendar-only filter would
+// assume. What actually bounds the cost/benefit correctly is POSITION:
+// QUARTERS_OF_HISTORY (12) is all that ever gets published, so a gap
+// beyond roughly that many real entries back literally cannot affect any
+// currently-displayed trend chart, no matter how "recent" or "old" its
+// calendar date is (e.g. GS's missing FY'20/FY'21 sits much further back in
+// a long report history and correctly falls outside this window).
+const RECENT_GAP_SCAN_ENTRIES = 16; // QUARTERS_OF_HISTORY (12) + margin
+// Normal quarterly cadence is ~91 days — but a fiscal Q4 is reported via
+// 10-K, not 10-Q, so this quarterly-only feed naturally has a ~183-day gap
+// once a year (Q3 straight to next fiscal year's Q1) that must NOT be
+// mistaken for a skipped quarter. Set comfortably above that normal case,
+// well below MSFT's real 366-day anomaly (Sept 2023 -> Sept 2024).
+const EXPECTED_QUARTERLY_GAP_DAYS = 200;
+
+// Real Finnhub report entries carry their own startDate/endDate (unlike the
+// SEC-synthesized ones — see buildSecSyntheticReports' own comment on why
+// those don't need them), so this reads real chronology directly rather
+// than trying to infer it from fiscal quarter numbers (which aren't
+// calendar-aligned the same way across filers with different fiscal
+// year-ends).
+function hasRecentQuarterlyGap(quarterlyFinancials, scanEntries = RECENT_GAP_SCAN_ENTRIES) {
+  const endDates = (quarterlyFinancials || [])
+    .map((r) => (r?.endDate ? new Date(r.endDate) : null))
+    .filter((d) => d instanceof Date && !isNaN(d))
+    .sort((a, b) => b - a); // newest first
+  if (!endDates.length) return false; // nothing dated to check — the sparse-count trigger already covers "no real data at all"
+
+  // "Now" anchors the first comparison too, so a ticker whose most recent
+  // real quarter is itself already overdue (Finnhub simply hasn't ingested
+  // it yet, even though SEC might) is caught the same way as a gap between
+  // two older entries — same threshold, same reasoning either way.
+  const checkpoints = [new Date(), ...endDates.slice(0, scanEntries)];
+  for (let i = 0; i < checkpoints.length - 1; i++) {
+    const gapDays = (checkpoints[i] - checkpoints[i + 1]) / (1000 * 60 * 60 * 24);
+    if (gapDays > EXPECTED_QUARTERLY_GAP_DAYS) return true;
+  }
+  return false;
+}
 
 // Same 2 concepts as NET_INCOME_CONCEPT_CANDIDATES further down in this
 // file (kept as a plain literal here, not a reference to that const,
@@ -794,6 +863,22 @@ async function fetchSecUsGaapFacts(cik) {
 // fact AND a start=2026-01-01/end=2026-06-30 cumulative fact exist,
 // identically fy=2026/fp="Q2") — the cumulative one always has the
 // EARLIER start date for the same fy/fp, since it spans more months.
+//
+// A SEPARATE, independent ambiguity under the same (fy,fp) key: a 10-Q's
+// income statement also discloses the SAME quarter one year prior for YoY
+// comparison, and SEC tags that comparative with the FILING's own fy/fp,
+// not the value's true period — verified live for ELF's fy=2025/fp=Q1:
+// both a real 2024-04-01/2024-06-30 fact ($324.5M) AND a 2023-04-01/
+// 2023-06-30 comparative ($216.3M) share fy=2025/fp=Q1, same accession
+// number, same filed date. Sorting by earliest start ALONE (the original
+// cumulative-vs-exact logic above) picked the comparative here, since it
+// has the earlier start — silently substituting the WRONG period's value,
+// which then corrupted decumulateYtdByYear's YoY math for every quarter
+// after it. Fixed by sorting on the LATEST end date first: the true
+// primary period is always the more recent one, a same-quarter-prior-year
+// comparative is always earlier — only once end dates tie (the genuine
+// cumulative-vs-exact case) does start date become the tiebreaker.
+//
 // Known accepted risk: a smaller filer that only tags the exact-quarter
 // fact (no cumulative one) for some concept would be misread as
 // cumulative here, under-counting after de-cumulation — this pipeline has
@@ -802,21 +887,21 @@ async function fetchSecUsGaapFacts(cik) {
 function pickDurationFact(facts, fy, fp) {
   const matches = (facts || []).filter((f) => f.fy === fy && f.fp === fp && f.start && f.end && f.val != null);
   if (!matches.length) return null;
-  matches.sort((a, b) => new Date(a.start) - new Date(b.start) || new Date(b.filed || 0) - new Date(a.filed || 0));
+  matches.sort((a, b) => new Date(b.end) - new Date(a.end) || new Date(a.start) - new Date(b.start) || new Date(b.filed || 0) - new Date(a.filed || 0));
   return matches[0];
 }
 
-// Balance-sheet (bs) concepts are instant (point-in-time, no `start`) —
-// take whichever matches fy/fp, most-recently-filed if more than one does
-// (a later filing's own comparative figure for the same period, not a
-// restatement we'd want to prefer over the original — but any real
-// disclosed value for the period is acceptable here, unlike flow items
-// where picking the wrong SHAPE, not just the wrong instance, corrupts
-// de-cumulation).
+// Balance-sheet (bs) concepts are instant (point-in-time, no `start`) — same
+// same-fy/fp-comparative risk as pickDurationFact above (a prior-year-end
+// balance shown for comparison could in principle share fy/fp with the
+// primary period too), so the latest `end` date is preferred first here as
+// well, before falling back to most-recently-filed as the tiebreak for
+// genuine same-period duplicates (a later filing's own restatement of the
+// same date).
 function pickInstantFact(facts, fy, fp) {
   const matches = (facts || []).filter((f) => f.fy === fy && f.fp === fp && !f.start && f.end && f.val != null);
   if (!matches.length) return null;
-  matches.sort((a, b) => new Date(b.filed || 0) - new Date(a.filed || 0));
+  matches.sort((a, b) => new Date(b.end) - new Date(a.end) || new Date(b.filed || 0) - new Date(a.filed || 0));
   return matches[0];
 }
 
@@ -851,7 +936,25 @@ function collectSecFyFpKeys(gaapFacts, seedConcepts) {
 // builders only read .year/.quarter/.cik/.report), so these plug in with
 // zero changes to any downstream builder, de-cumulation, or trailing-
 // window logic.
+//
+// `cik` normalized to Finnhub's own plain-numeric-string CIK format (no
+// leading zeros), NOT the zero-padded 10-digit format SEC's own API and
+// secTickerToCikMap use — every ticker-recycling guard in this file
+// (decumulateYtdByYear and others; see the 6 `r.cik === currentCik` sites)
+// compares a report's .cik against quarterlyReports[0].cik, a REAL
+// Finnhub entry's unpadded CIK. A padded value here would silently fail
+// that comparison and get filtered out entirely — verified live for ELF:
+// the synthesized 2025-Q1 entry (correctly matched by (year,quarter), all
+// its concept values correct) was still dropped from decumulateYtdByYear's
+// output because '0001600033' !== '1600033', which then broke every
+// dependent standalone-quarter calculation downstream (2025-Q1 AND
+// 2025-Q2, since Q2's calc needs Q1's value too). This bug was latent
+// since buildSecSyntheticReports was first written — it only ever ran for
+// severely-sparse tickers before, where quarterlyReports[0] was ITSELF
+// often a synthesized entry, so the mismatch never had a real Finnhub CIK
+// to disagree with.
 function buildSecSyntheticReports(gaapFacts, cik) {
+  const normalizedCik = cik != null ? String(Number(cik)) : cik;
   const fyFpKeys = collectSecFyFpKeys(gaapFacts, [...SEC_REVENUE_CONCEPTS, ...SEC_NET_INCOME_CONCEPTS, ...SEC_EBIT_CONCEPTS, ...SEC_PRETAX_INCOME_CONCEPTS]);
   const quarterlyReports = [];
   const annualReports = [];
@@ -876,7 +979,7 @@ function buildSecSyntheticReports(gaapFacts, cik) {
     const bsReportItems = bsItems.map((r) => ({ concept: r.concept, label: `${r.concept} (SEC XBRL enrichment)`, value: r.value }));
 
     if (!icItems.length && !cfItems.length && !bsReportItems.length) continue;
-    const entry = { cik, form: 'SEC-XBRL', report: { ic: icItems, cf: cfItems, bs: bsReportItems } };
+    const entry = { cik: normalizedCik, form: 'SEC-XBRL', report: { ic: icItems, cf: cfItems, bs: bsReportItems } };
     if (fp === 'FY') annualReports.push({ ...entry, year: fy });
     else if (quarterNumber[fp]) quarterlyReports.push({ ...entry, year: fy, quarter: quarterNumber[fp] });
   }
@@ -885,18 +988,44 @@ function buildSecSyntheticReports(gaapFacts, cik) {
 
 // Additive merge — real Finnhub entries always win on a (year, quarter)/
 // (year) conflict, since they typically carry more validated line items
-// already; SEC-synthesized entries only fill in combos Finnhub has none of
-// at all (mirrors backfillRevenueGapsFromSec's own additive-only pattern
-// above, just keyed for a broader merge rather than a specific gap list).
+// already. The one exception: backfillRevenueGapsFromSec's own narrow
+// stubs (form: 'SEC-XBRL-narrow', ic-only, revenue only) are NOT real
+// Finnhub filings — they just happened to claim the slot first (that
+// function runs before this one). A slot claimed by a narrow stub is
+// REPLACED by the broader synthesized entry for the same period when one
+// exists, since it carries strictly more data (ic+cf+bs, all 4 metrics'
+// worth) for the exact same real period, not a conflicting value —
+// verified live for ELF: the narrow stub had only revenue for its missing
+// 2024-04-01/2024-06-30 quarter, silently leaving profitMargin/fcfMargin/
+// roic with a hole the broader enrichment could have closed, until this
+// replacement step was added. A slot with no existing entry at all is
+// filled in as before.
 function mergeSyntheticReports(quarterlyReports, annualReports, synthesized) {
-  const existingQuarterKeys = new Set((quarterlyReports || []).filter((r) => r?.year && r?.quarter).map((r) => `${r.year}-${r.quarter}`));
-  const existingAnnualYears = new Set((annualReports || []).filter((r) => r?.year).map((r) => r.year));
-  const newQuarters = synthesized.quarterlyReports.filter((r) => !existingQuarterKeys.has(`${r.year}-${r.quarter}`));
-  const newAnnuals = synthesized.annualReports.filter((r) => !existingAnnualYears.has(r.year));
-  return {
-    quarterlyReports: newQuarters.length ? [...(quarterlyReports || []), ...newQuarters] : quarterlyReports || [],
-    annualReports: newAnnuals.length ? [...(annualReports || []), ...newAnnuals] : annualReports || [],
-  };
+  const isNarrowStub = (r) => r?.form === 'SEC-XBRL-narrow';
+
+  const mergedQuarterlyReports = [...(quarterlyReports || [])];
+  const existingQuarterByKey = new Map(mergedQuarterlyReports.filter((r) => r?.year && r?.quarter).map((r) => [`${r.year}-${r.quarter}`, r]));
+  for (const r of synthesized.quarterlyReports) {
+    const existing = existingQuarterByKey.get(`${r.year}-${r.quarter}`);
+    if (!existing) {
+      mergedQuarterlyReports.push(r);
+    } else if (isNarrowStub(existing)) {
+      mergedQuarterlyReports[mergedQuarterlyReports.indexOf(existing)] = r;
+    }
+  }
+
+  const mergedAnnualReports = [...(annualReports || [])];
+  const existingAnnualByYear = new Map(mergedAnnualReports.filter((r) => r?.year).map((r) => [r.year, r]));
+  for (const r of synthesized.annualReports) {
+    const existing = existingAnnualByYear.get(r.year);
+    if (!existing) {
+      mergedAnnualReports.push(r);
+    } else if (isNarrowStub(existing)) {
+      mergedAnnualReports[mergedAnnualReports.indexOf(existing)] = r;
+    }
+  }
+
+  return { quarterlyReports: mergedQuarterlyReports, annualReports: mergedAnnualReports };
 }
 
 const REVENUE_CONTRACT_CONCEPT_PREFIX = 'us-gaap_RevenueFromContractWithCustomer';
@@ -2151,7 +2280,7 @@ async function processSymbol(symbol, apiKey, ctx) {
   const previousNativeForSymbol = previouslyPublishedNativeTrends[symbol] || {};
   const mergedNativeForSymbol = {};
   for (const key of ['roic', 'revenueGrowth', 'profitMargin', 'fcfMargin', 'peRatio', 'pfcfRatio']) {
-    const published = pickCadenceMetric(previousNativeForSymbol[key], freshNativeTrends[key]);
+    const published = pickTrendToPublish(previousNativeForSymbol[key], freshNativeTrends[key]);
     if (published.length) mergedNativeForSymbol[key] = published;
   }
 
@@ -2189,17 +2318,28 @@ async function processSymbol(symbol, apiKey, ctx) {
     // Non-fatal — same graceful-degradation philosophy as the fetch above.
   }
 
-  // SEC-XBRL broad enrichment — for tickers whose Finnhub coverage is too
-  // sparse to ever complete even one TTM window or one YoY annual point
-  // (SEC_ENRICHMENT_SPARSE_QUARTERLY_THRESHOLD/SEC_ENRICHMENT_SPARSE_ANNUAL_THRESHOLD
-  // above) — verified live for BRK.A, whose own financials-reported
-  // coverage is exactly 1 historical report. The narrow gap-finder above
-  // needs an existing report to date-shift from, so it structurally can't
-  // reach a ticker this sparse; this fetches SEC's own companyfacts
+  // SEC-XBRL broad enrichment — two independent triggers, either one is
+  // enough: (1) Finnhub coverage is too sparse to ever complete even one
+  // TTM window or one YoY annual point (SEC_ENRICHMENT_SPARSE_QUARTERLY_
+  // THRESHOLD/SEC_ENRICHMENT_SPARSE_ANNUAL_THRESHOLD above) — verified live
+  // for BRK.A, whose own financials-reported coverage is exactly 1
+  // historical report; or (2) coverage is otherwise healthy but has a real
+  // RECENT gap (hasRecentQuarterlyGap above) — verified live for MSFT (46
+  // total quarterly reports, but missing the two 10-Qs covering
+  // 2023-12-31/2024-03-31, which alone stalls TTM's trailing window years
+  // behind quarterly). The narrow gap-finder above needs an existing report
+  // to date-shift from, so it structurally can't reach a ticker this
+  // sparse or fill a gap-in-the-middle; this fetches SEC's own companyfacts
   // directly and synthesizes report entries from its fy/fp-labeled facts
-  // instead. Only spends the extra fetch for tickers below either
-  // threshold — the ~4990 already-healthy tickers pay nothing extra.
-  if (quarterlyFinancials.length < SEC_ENRICHMENT_SPARSE_QUARTERLY_THRESHOLD || annualReportedFinancials.length < SEC_ENRICHMENT_SPARSE_ANNUAL_THRESHOLD) {
+  // instead, merged in additively (real Finnhub entries always win — see
+  // mergeSyntheticReports). Only spends the extra fetch for tickers that
+  // actually trip one of the two triggers — most of the ~4990 otherwise-
+  // healthy tickers pay nothing extra.
+  if (
+    quarterlyFinancials.length < SEC_ENRICHMENT_SPARSE_QUARTERLY_THRESHOLD ||
+    annualReportedFinancials.length < SEC_ENRICHMENT_SPARSE_ANNUAL_THRESHOLD ||
+    hasRecentQuarterlyGap(quarterlyFinancials)
+  ) {
     if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG enrichment triggered for', symbol, 'q=', quarterlyFinancials.length, 'a=', annualReportedFinancials.length);
     try {
       const cik = ctx.secTickerToCikMap?.get(symbol.toUpperCase());
@@ -2278,7 +2418,7 @@ async function processSymbol(symbol, apiKey, ctx) {
       // A single metric's oddly-shaped filing shouldn't take down the
       // others — pickTrendToPublish falls back to the previous run.
     }
-    const published = pickCadenceMetric(previousYearlyForSymbol[key], fresh);
+    const published = pickTrendToPublish(previousYearlyForSymbol[key], fresh);
     if (published.length) mergedYearlyForSymbol[key] = published;
   }
   for (const key of Object.keys(quarterlyBuilders)) {
@@ -2288,7 +2428,7 @@ async function processSymbol(symbol, apiKey, ctx) {
     } catch {
       // Same graceful-degradation philosophy as above.
     }
-    const published = pickCadenceMetric(previousQuarterlyForSymbol[key], fresh);
+    const published = pickTrendToPublish(previousQuarterlyForSymbol[key], fresh);
     if (published.length) mergedQuarterlyForSymbol[key] = published;
   }
   for (const key of Object.keys(ttmBuilders)) {
@@ -2298,7 +2438,7 @@ async function processSymbol(symbol, apiKey, ctx) {
     } catch {
       // Same graceful-degradation philosophy as above.
     }
-    const published = pickCadenceMetric(previousTtmForSymbol[key], fresh);
+    const published = pickTrendToPublish(previousTtmForSymbol[key], fresh);
     if (published.length) {
       mergedTtmForSymbol[key] = published;
       // Backfill the CARD value too, not just the trend cache, whenever
@@ -2554,4 +2694,10 @@ module.exports = {
   isRecentEnough,
   pickCadenceMetric,
   computeIndustryLeaders,
+  hasRecentQuarterlyGap,
+  pickDurationFact,
+  pickInstantFact,
+  decumulateYtdByYear,
+  findReportedRevenue,
+  buildRevenueGrowthQuarterlyFromFilings,
 };
