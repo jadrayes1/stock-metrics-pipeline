@@ -2515,6 +2515,12 @@ async function runWorker(workerId, symbolSubset, apiKey, ctx) {
     dcfComputed: 0,
     cardValuesReconstructed: 0,
     dcfCapCandidates: {},
+    // Confirmed-dead symbols (real Finnhub signal: no profile data at
+    // all), tracked by symbol not just count — main() needs this set to
+    // correctly EXCLUDE them from the hard-failure fallback below (a dead
+    // ticker's old data should stop publishing, unlike a merely
+    // transient-failed one).
+    deadSymbols: new Set(),
   };
 
   for (let i = 0; i < symbolSubset.length; i++) {
@@ -2523,6 +2529,7 @@ async function runWorker(workerId, symbolSubset, apiKey, ctx) {
       const r = await processSymbol(symbol, apiKey, ctx);
       if (r.status === 'dead') {
         result.dead++;
+        result.deadSymbols.add(symbol);
       } else {
         result.profiles[symbol] = r.profile;
         result.metrics[symbol] = r.metrics;
@@ -2608,6 +2615,7 @@ async function main() {
   const quarterlyTrends = {};
   const ttmTrends = {};
   const dcfCapCandidates = {};
+  const deadSymbols = new Set();
   let ok = 0;
   let failed = 0;
   let dead = 0;
@@ -2624,11 +2632,56 @@ async function main() {
     Object.assign(quarterlyTrends, r.quarterlyTrends);
     Object.assign(ttmTrends, r.ttmTrends);
     Object.assign(dcfCapCandidates, r.dcfCapCandidates);
+    for (const s of r.deadSymbols) deadSymbols.add(s);
     ok += r.ok;
     failed += r.failed;
     dead += r.dead;
     dcfComputed += r.dcfComputed;
     cardValuesReconstructed += r.cardValuesReconstructed;
+  }
+
+  // Hard-failure fallback — a DIFFERENT, more severe gap than the existing
+  // per-field merge-protection (pickMetricValue/pickTrendToPublish) already
+  // handles. Those compare fresh vs. previous WITHIN a values object that
+  // processSymbol actually finished computing; they never run at all for a
+  // ticker whose processSymbol call threw before reaching that point (a
+  // transient HTTP error, a timeout, etc.) — runWorker's catch block just
+  // counts it as `failed`, so it never gets a key in metrics/the trend
+  // caches (all four of which start as `{}` here, not seeded from
+  // previously-published data). Without this, such a ticker doesn't
+  // regress to narrower data, it's REMOVED from the dataset entirely.
+  // Verified live: a run where one API key got rate-limited partway
+  // through (unrelated interference, not a code bug) silently dropped
+  // MSFT and 1,031 other tickers — including ones with perfectly good
+  // previously-published data — this closes that gap by falling back to
+  // whatever was last published for any symbol missing from this run's
+  // fresh results, EXCEPT symbols this run's own real Finnhub check
+  // confirmed are genuinely dead (those should stop publishing, not keep
+  // resurrecting stale data for a delisted/invalid ticker forever).
+  let recoveredFromFailure = 0;
+  for (const [symbol, prevMetrics] of Object.entries(previouslyPublishedMetrics)) {
+    if (metrics[symbol] || deadSymbols.has(symbol)) continue;
+    metrics[symbol] = prevMetrics;
+    recoveredFromFailure++;
+  }
+  for (const [symbol, prevTrends] of Object.entries(previouslyPublished.nativeTrends)) {
+    if (nativeTrends[symbol] || deadSymbols.has(symbol)) continue;
+    nativeTrends[symbol] = prevTrends;
+  }
+  for (const [symbol, prevTrends] of Object.entries(previouslyPublished.yearlyTrends)) {
+    if (yearlyTrends[symbol] || deadSymbols.has(symbol)) continue;
+    yearlyTrends[symbol] = prevTrends;
+  }
+  for (const [symbol, prevTrends] of Object.entries(previouslyPublished.quarterlyTrends)) {
+    if (quarterlyTrends[symbol] || deadSymbols.has(symbol)) continue;
+    quarterlyTrends[symbol] = prevTrends;
+  }
+  for (const [symbol, prevTrends] of Object.entries(previouslyPublished.ttmTrends)) {
+    if (ttmTrends[symbol] || deadSymbols.has(symbol)) continue;
+    ttmTrends[symbol] = prevTrends;
+  }
+  if (recoveredFromFailure) {
+    console.log(`Recovered ${recoveredFromFailure} hard-failed tickers' previously-published data (never regress a ticker to nothing).`);
   }
 
   const industryLeaders = computeIndustryLeaders(metrics, profiles);
