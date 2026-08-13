@@ -2117,6 +2117,25 @@ function historyWeight(historyQuarters) {
   return 0.9;
 }
 
+// Packs computeTrendQualification's 6 named booleans into a single integer
+// (one bit per COMPARABLE_KEYS entry) for publishing inside metrics[symbol]
+// itself — the full object form (~95 bytes/ticker as JSON) would nearly
+// double marketMetrics.json's size across the full ~5,000-ticker universe
+// just so this survives a hard-failure-fallback recovery (see main()'s own
+// fallback comment); the packed form costs ~2 bytes/ticker instead. Only
+// ever encoded/decoded here — computeIndustryLeaders reads the mask, not
+// the object, directly.
+function encodeTrendQualifiedMask(trendQualified) {
+  return COMPARABLE_KEYS.reduce((mask, key, i) => (trendQualified[key] ? mask | (1 << i) : mask), 0);
+}
+function decodeTrendQualifiedMask(mask) {
+  const result = {};
+  COMPARABLE_KEYS.forEach((key, i) => {
+    result[key] = !!(mask & (1 << i));
+  });
+  return result;
+}
+
 /**
  * Up to MAX_LEADERS_PER_INDUSTRY qualifying tickers per industry (>=
  * MIN_INDUSTRY_PEERS peers only), one grouped entry per industry rather than
@@ -2175,7 +2194,13 @@ function computeIndustryLeaders(metrics, profiles) {
     const qualifying = [];
     for (const symbol of eligible) {
       const data = metrics[symbol];
-      const trendQualified = profiles[symbol]?.trendQualified || {};
+      // Read from metrics[symbol] (published, and restored by main()'s
+      // hard-failure fallback), not profiles[symbol] (ephemeral, computed
+      // fresh every run, never persisted) — a ticker that hard-failed this
+      // run and got its metrics restored from the previous publish still
+      // has a real trendQualifiedMask/historyQuarters to score against,
+      // instead of silently failing every "top metric" check below.
+      const trendQualified = decodeTrendQualifiedMask(data.trendQualifiedMask || 0);
       const goodnessScores = [];
       let topMetricCount = 0;
       for (const key of COMPARABLE_KEYS) {
@@ -2188,7 +2213,7 @@ function computeIndustryLeaders(metrics, profiles) {
       if (topMetricCount < MIN_TOP_METRICS) continue;
 
       const composite = goodnessScores.reduce((a, b) => a + b, 0) / goodnessScores.length;
-      const adjustedScore = composite * historyWeight(profiles[symbol]?.historyQuarters || 0);
+      const adjustedScore = composite * historyWeight(data.historyQuarters || 0);
       qualifying.push({ symbol, composite, adjustedScore });
     }
 
@@ -2486,7 +2511,20 @@ async function processSymbol(symbol, apiKey, ctx) {
   return {
     status: 'ok',
     profile: profileEntry,
-    metrics: { industry: profile.industry, ...values, estimatedFairValue },
+    metrics: {
+      industry: profile.industry,
+      ...values,
+      estimatedFairValue,
+      // Published alongside the comparable metrics (not just kept in
+      // profileEntry, which never persists across runs) specifically so
+      // computeIndustryLeaders can still score a ticker that's recovered
+      // via main()'s hard-failure fallback — see that fallback's own
+      // comment. Packed as a bitmask (encodeTrendQualifiedMask) rather
+      // than the full 6-key object to keep marketMetrics.json's per-ticker
+      // footprint small.
+      historyQuarters: profileEntry.historyQuarters,
+      trendQualifiedMask: encodeTrendQualifiedMask(profileEntry.trendQualified),
+    },
     nativeTrends: Object.keys(mergedNativeForSymbol).length ? mergedNativeForSymbol : null,
     yearlyTrends: Object.keys(mergedYearlyForSymbol).length ? mergedYearlyForSymbol : null,
     quarterlyTrends: Object.keys(mergedQuarterlyForSymbol).length ? mergedQuarterlyForSymbol : null,
@@ -2747,6 +2785,8 @@ module.exports = {
   isRecentEnough,
   pickCadenceMetric,
   computeIndustryLeaders,
+  encodeTrendQualifiedMask,
+  decodeTrendQualifiedMask,
   hasRecentQuarterlyGap,
   pickDurationFact,
   pickInstantFact,
