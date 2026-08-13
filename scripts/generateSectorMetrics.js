@@ -1700,6 +1700,25 @@ function buildRoicQuarterlyFromFilings(quarterlyReports, annualReports, isBank) 
     const cash = isBank ? 0 : findReportedCashBalance(q.report?.bs || []) || 0;
     investedCapitalByQuarter[`${q.year}-${q.quarter}`] = debt + equity - cash;
   }
+  // A fiscal year-end balance sheet is only ever tagged as part of the
+  // annual (10-K) report, never as a standalone Q4 entry in
+  // quarterlyReports (SEC XBRL tags a fiscal year-end instant fact under
+  // fp='FY', not 'Q4') -- without this, Q4 ROIC silently vanished from
+  // Quarterly/TTM every single year for every ticker (verified live:
+  // AAPL/AMZN/JPM/XOM all missing exactly their Q4 point, every year,
+  // while revenueGrowth/profitMargin/fcfMargin -- which don't need a
+  // balance sheet -- had no such gap). A fiscal year-end snapshot and a
+  // Q4-end snapshot are the same date, so this is exact, not an
+  // approximation; only fills in where a real quarterly entry is absent.
+  for (const a of annualReports || []) {
+    const key = `${a.year}-4`;
+    if (investedCapitalByQuarter[key] > 0) continue;
+    const equity = findReportedTotalEquity(a.report?.bs || []);
+    if (equity == null) continue;
+    const debt = sumDebt(a.report?.bs || []);
+    const cash = isBank ? 0 : findReportedCashBalance(a.report?.bs || []) || 0;
+    investedCapitalByQuarter[key] = debt + equity - cash;
+  }
 
   return ebitRecords
     .filter((r) => investedCapitalByQuarter[`${r.year}-${r.quarter}`] > 0)
@@ -1755,6 +1774,17 @@ function buildRoicTTMFromFilings(quarterlyReports, annualReports, isBank) {
     // out for bank filers.
     const cash = isBank ? 0 : findReportedCashBalance(q.report?.bs || []) || 0;
     investedCapitalByQuarter[`${q.year}-${q.quarter}`] = debt + equity - cash;
+  }
+  // See the identical backfill in buildRoicQuarterlyFromFilings above --
+  // without it, any TTM window anchored on Q4 was silently dropped too.
+  for (const a of annualReports || []) {
+    const key = `${a.year}-4`;
+    if (investedCapitalByQuarter[key] > 0) continue;
+    const equity = findReportedTotalEquity(a.report?.bs || []);
+    if (equity == null) continue;
+    const debt = sumDebt(a.report?.bs || []);
+    const cash = isBank ? 0 : findReportedCashBalance(a.report?.bs || []) || 0;
+    investedCapitalByQuarter[key] = debt + equity - cash;
   }
 
   const standaloneQuarters = Object.keys(ebit)
