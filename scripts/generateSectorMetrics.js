@@ -149,7 +149,7 @@ function readFinnhubApiKeys() {
 }
 
 async function fetchUniverse(apiKey) {
-  const res = await fetch(`https://finnhub.io/api/v1/stock/symbol?exchange=US&token=${apiKey}`);
+  const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/symbol?exchange=US&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status} fetching symbol universe`);
   const all = await res.json();
   return all
@@ -160,6 +160,31 @@ async function fetchUniverse(apiKey) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Verified live: even at REQUEST_SPACING_MS's ~54/min pace (under
+// Finnhub's documented 60/min free-tier cap), a run can still hit
+// scattered real HTTP 429s for a handful of tickers (confirmed run
+// 31755628636: GOOGL/KO/NVDA each 429'd once, ~10-15min apart, long after
+// any of this session's own concurrent local testing had stopped). The
+// hard-failure fallback in main() only ever has something to restore FROM
+// if a PAST run published that ticker successfully -- for a ticker that's
+// missing because a PRIOR run also 429'd (like these three, still absent
+// from the gist this run started from), there's nothing to fall back to,
+// so it stays missing indefinitely until some run gets lucky. A short
+// retry-with-backoff on 429 specifically (never on other errors, which
+// are usually not transient in the same way) lets most of these self-heal
+// within the SAME run instead of depending on luck across runs.
+const FINNHUB_MAX_429_RETRIES = 3;
+const FINNHUB_RETRY_BASE_MS = 2000;
+async function fetchFinnhub(url) {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url);
+    if (res.ok || res.status !== 429 || attempt >= FINNHUB_MAX_429_RETRIES) return res;
+    const retryAfterHeader = res.headers.get('Retry-After');
+    const retryAfterMs = retryAfterHeader && !Number.isNaN(Number(retryAfterHeader)) ? Number(retryAfterHeader) * 1000 : null;
+    await sleep(retryAfterMs ?? FINNHUB_RETRY_BASE_MS * 2 ** attempt);
+  }
 }
 
 function latestQuarterly(series, field) {
@@ -269,14 +294,14 @@ function resolveFinancialsReportedSymbol(symbol) {
 
 async function fetchMetricsFor(symbol, apiKey) {
   const requestSymbol = DUAL_CLASS_ALIASES[symbol] || symbol;
-  const res = await fetch(`https://finnhub.io/api/v1/stock/metric?symbol=${requestSymbol}&metric=all&token=${apiKey}`);
+  const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/metric?symbol=${requestSymbol}&metric=all&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
   return { current: data?.metric || {}, quarterly: data?.series?.quarterly || {} };
 }
 
 async function fetchProfileFor(symbol, apiKey) {
-  const res = await fetch(`https://finnhub.io/api/v1/stock/profile2?symbol=${symbol}&token=${apiKey}`);
+  const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/profile2?symbol=${symbol}&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
   // Verified live: Finnhub returns the literal string "N/A" for some tickers
@@ -307,7 +332,7 @@ function impliedPriceFromProfile(profile) {
 
 async function fetchReportedFinancialsFor(symbol, apiKey) {
   const requestSymbol = resolveFinancialsReportedSymbol(symbol);
-  const res = await fetch(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${requestSymbol}&freq=annual&token=${apiKey}`);
+  const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${requestSymbol}&freq=annual&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
   return Array.isArray(data?.data) ? data.data : [];
@@ -1175,7 +1200,7 @@ function buildTrailingWindows(standaloneQuarters, maxSize = 4) {
 
 async function fetchReportedFinancialsQuarterlyFor(symbol, apiKey) {
   const requestSymbol = resolveFinancialsReportedSymbol(symbol);
-  const res = await fetch(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${requestSymbol}&freq=quarterly&token=${apiKey}`);
+  const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${requestSymbol}&freq=quarterly&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
   return Array.isArray(data?.data) ? data.data : [];
