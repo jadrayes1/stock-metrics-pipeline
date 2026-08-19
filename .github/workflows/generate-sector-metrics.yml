@@ -148,27 +148,48 @@ jobs:
       # but comfortably under git's own file-size guidance. Gists are just
       # git repos under the hood, so cloning, committing, and pushing works
       # the same as any other repo.
+      #
+      # Orphan commit each run instead of accumulating full git history —
+      # verified live: committing a fresh multi-ten-MB snapshot on top of
+      # the previous day's history, every day, with nothing ever squashed,
+      # eventually pushed this gist's repo past GitHub's own (undocumented)
+      # size quota ("Repository is above its size quota" pre-receive
+      # rejection, confirmed live 2026-08-19). The gist is only ever read
+      # for its LATEST content by every consumer — nothing depends on its
+      # git history — so resetting to a single fresh commit each run loses
+      # nothing and keeps the repo permanently small. The "no changes"
+      # short-circuit now diffs the source files against the freshly-cloned
+      # ones directly (rather than via `git diff --cached`, which would
+      # always show everything as new against an orphan branch's empty
+      # history) so an unchanged day still skips the force-push.
       - name: Publish to gist
         env:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
         run: |
-          git clone "https://${GIST_TOKEN}@gist.github.com/${GIST_ID}.git" gist-clone
-          cp src/data/marketMetrics.json gist-clone/marketMetrics.json
-          cp src/data/trendsNative.json gist-clone/trendsNative.json
-          cp src/data/trendsQuarterly.json gist-clone/trendsQuarterly.json
-          cp src/data/trendsYearly.json gist-clone/trendsYearly.json
-          cp src/data/trendsTtm.json gist-clone/trendsTtm.json
-          cp coverageAudit.json gist-clone/coverageAudit.json
-          cd gist-clone
-          git config user.email "actions@github.com"
-          git config user.name "stock-metrics-pipeline"
-          git add -A
-          if git diff --cached --quiet; then
+          git clone --depth 1 "https://${GIST_TOKEN}@gist.github.com/${GIST_ID}.git" gist-clone
+          if diff -q src/data/marketMetrics.json gist-clone/marketMetrics.json >/dev/null 2>&1 && \
+             diff -q src/data/trendsNative.json gist-clone/trendsNative.json >/dev/null 2>&1 && \
+             diff -q src/data/trendsQuarterly.json gist-clone/trendsQuarterly.json >/dev/null 2>&1 && \
+             diff -q src/data/trendsYearly.json gist-clone/trendsYearly.json >/dev/null 2>&1 && \
+             diff -q src/data/trendsTtm.json gist-clone/trendsTtm.json >/dev/null 2>&1 && \
+             diff -q coverageAudit.json gist-clone/coverageAudit.json >/dev/null 2>&1; then
             echo "No changes to publish."
           else
+            cp src/data/marketMetrics.json gist-clone/marketMetrics.json
+            cp src/data/trendsNative.json gist-clone/trendsNative.json
+            cp src/data/trendsQuarterly.json gist-clone/trendsQuarterly.json
+            cp src/data/trendsYearly.json gist-clone/trendsYearly.json
+            cp src/data/trendsTtm.json gist-clone/trendsTtm.json
+            cp coverageAudit.json gist-clone/coverageAudit.json
+            cd gist-clone
+            git config user.email "actions@github.com"
+            git config user.name "stock-metrics-pipeline"
+            git checkout --orphan latest-snapshot
+            git add -A
             git commit -m "Update dataset $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            git push
+            git branch -M main
+            git push --force origin main
           fi
 
       - name: Report failure
