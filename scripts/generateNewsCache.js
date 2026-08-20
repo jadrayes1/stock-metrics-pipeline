@@ -34,8 +34,8 @@ const fs = require('fs');
 const path = require('path');
 
 const OUTPUT_FILE = path.join(__dirname, '../newsCache.json');
-const GIST_NEWS_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/newsCache.json';
-const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/marketMetrics.json';
+const GIST_NEWS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/newsCache.json';
+const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/marketMetrics.json';
 
 const REQUEST_SPACING_MS = 1100; // ~54/min, under Finnhub's 60/min free-tier cap — same budget as generateSectorMetrics.js
 const TIME_BUDGET_MS = 5.5 * 60 * 60 * 1000; // leaves headroom under the workflow's 7hr timeout-minutes for setup/publish

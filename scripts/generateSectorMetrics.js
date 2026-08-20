@@ -1861,11 +1861,11 @@ function buildRoicTTMFromFilings(quarterlyReports, annualReports, isBank) {
 // generateNewsCache.js already reads from. Trend caches live in their own
 // files, separate from marketMetrics.json — see OUTPUT_TRENDS_*_FILE above
 // for why.
-const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/marketMetrics.json';
-const GIST_TRENDS_NATIVE_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/trendsNative.json';
-const GIST_TRENDS_QUARTERLY_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/trendsQuarterly.json';
-const GIST_TRENDS_YEARLY_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/trendsYearly.json';
-const GIST_TRENDS_TTM_URL = 'https://gist.githubusercontent.com/jadrayes1/db6fbd96e980118d3c6a63965dc0dc39/raw/trendsTtm.json';
+const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/marketMetrics.json';
+const GIST_TRENDS_NATIVE_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/trendsNative.json';
+const GIST_TRENDS_QUARTERLY_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/trendsQuarterly.json';
+const GIST_TRENDS_YEARLY_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/trendsYearly.json';
+const GIST_TRENDS_TTM_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/trendsTtm.json';
 
 async function fetchJsonSafe(url) {
   try {
