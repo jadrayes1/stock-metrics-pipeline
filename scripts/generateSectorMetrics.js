@@ -246,13 +246,28 @@ const DUAL_CLASS_ALIASES = {
   'BIO.B': 'BIO',
   'BRK.B': 'BRK.A',
   'CRD.A': 'CRD.B',
+  // FOX (Fox Corp Class B, non-voting) redirected to FOXA (Class A,
+  // voting) -- verified live: FOXA's published quarterly trend has all
+  // four metrics (12 points each), FOX has zero across the board.
+  FOX: 'FOXA',
   'GEF.B': 'GEF',
+  // GOOG (Alphabet Class C, non-voting) redirected to GOOGL (Class A,
+  // voting) -- verified live: GOOGL's published quarterly trend has all
+  // four metrics (revenueGrowth/profitMargin/fcfMargin/roic, 12 points
+  // each), while GOOG has only profitMargin and fcfMargin, with zero
+  // revenueGrowth/roic history at all. Same underlying reasoning as every
+  // other entry here: these are company-wide ratios, identical between
+  // share classes regardless of per-share price.
+  GOOG: 'GOOGL',
   'GTN.A': 'GTN',
   'HEI.A': 'HEI',
   'HVT.A': 'HVT',
   'LEN.B': 'LEN',
   'MKC.V': 'MKC',
   'MOG.B': 'MOG.A',
+  // NWS (News Corp Class B, non-voting) redirected to NWSA (Class A,
+  // voting) -- verified live: same zero-vs-full pattern as FOX/FOXA above.
+  NWS: 'NWSA',
   'TAP.A': 'TAP',
   'UHAL.B': 'UHAL',
   'WSO.B': 'WSO',
