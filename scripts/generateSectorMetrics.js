@@ -8,14 +8,19 @@
 // no live Finnhub calls, no waiting, no rate-limit exposure for the
 // person using the app.
 //
-// Also computes `industryLeaders`: up to MAX_LEADERS_PER_INDUSTRY tickers
-// per industry with at least MIN_INDUSTRY_PEERS peers, each required to
-// have all 6 comparable metrics present AND rank top-quintile in at least
-// 5 of them (see computeIndustryLeaders below for why — a ticker with only
-// 1 of 6 metrics present was otherwise winning on a single outlier/likely-
-// erroneous number), lightly biased toward tickers with more reported
-// quarters (see historyWeight). One grouped entry per industry
-// ({industry, peerCount, leaders: [...]}), not a flat per-ticker list — see
+// Also computes `industryLeaders`: EVERY industry gets an entry (no peer-
+// count floor — see computeIndustryLeaders below for why an earlier
+// MIN_INDUSTRY_PEERS=100 cutoff was removed: it silently excluded 30 of 45
+// real industries outright), ranked by a composite "goodness" score across
+// the 6 comparable metrics, lightly biased toward tickers with more
+// reported quarters (see historyWeight). Requires all 6 metrics present
+// (fcfMargin excused for banks, where it isn't a meaningful concept) so a
+// ticker with only 1 of 6 metrics present can't win on a single outlier/
+// likely-erroneous number. Shows up to MAX_LEADERS_PER_INDUSTRY tickers,
+// and at least MIN_LEADERS_PER_INDUSTRY whenever that many qualifying
+// tickers exist for the industry (fewer only when the industry itself
+// doesn't have that many). One grouped entry per industry ({industry,
+// peerCount, leaders: [...]}), not a flat per-ticker list — see
 // IndustryLeaders.js for the per-industry carousel this renders as.
 // Precomputed here rather than on-device so the Home screen's carousels are
 // just reading a small pre-baked list, same "compute once daily, app just
@@ -2105,18 +2110,22 @@ function computeEstimatedFairValue(dcfInputs, current, marketCap, industry) {
 
 const COMPARABLE_KEYS = ['roic', 'revenueGrowth', 'profitMargin', 'fcfMargin', 'peRatio', 'pfcfRatio'];
 const LOWER_IS_BETTER = new Set(['peRatio', 'pfcfRatio']); // mirrors METRIC_DEFS.betterWhen in src/utils/metrics.js
-const MIN_INDUSTRY_PEERS = 100; // narrower industries are excluded — a "top pick" out of a handful of peers isn't statistically meaningful
-// "top tier" bar for a single metric — top quintile among industry peers.
-// Verified against the live full-universe data before picking this number:
-// a 90th-percentile (top-decile) bar left only 2 of 15 qualifying industries
-// with a leader at all — too strict to be a usable Home screen carousel.
-// 80th percentile leaves 10 of 15, still a genuinely high bar (all 6 metrics
-// present, top-quintile in at least MIN_TOP_METRICS of them).
-const TOP_METRIC_PERCENTILE = 80;
-const MIN_TOP_METRICS = 5; // must be top-tier in at least this many of the 6 metrics, not just a good average
 const HISTORY_QUARTERS_FULL_WEIGHT = 8; // ~2 years — no penalty at or above this
 const HISTORY_QUARTERS_FLOOR = 4; // ~1 year — a steeper penalty below this
-const MAX_LEADERS_PER_INDUSTRY = 5; // show up to this many qualifying tickers per industry, not just the single best
+const MAX_LEADERS_PER_INDUSTRY = 5; // show up to this many top-ranked tickers per industry
+// Every industry must show at least this many leaders whenever it has that
+// many eligible tickers at all -- verified live this was NOT happening
+// under the previous design: of 45 real industries, a MIN_INDUSTRY_PEERS=100
+// peer-count floor excluded 30 outright, and among the 15 that passed it, a
+// strict "top-quintile in >=5 of 6 metrics simultaneously" bar left only 4
+// with any leader at all -- 3 of those 4 with just 1. Real companies rarely
+// excel at growth, margins, profitability, AND cheap valuation all at once,
+// so requiring near-universal excellence was structurally almost always
+// going to starve the carousel, not just occasionally. Replaced with a pure
+// ranking (see computeIndustryLeaders) -- always show the best available,
+// never gate the whole industry out of the feature for not being excellent
+// enough.
+const MIN_LEADERS_PER_INDUSTRY = 3;
 
 // Mirrors the percentile-rank + goodness logic in src/utils/metrics.js
 // (percentileRank, percentileTone) — keep in sync if that ever changes.
@@ -2128,12 +2137,17 @@ function percentileRank(value, population) {
   return ((below + 0.5 * tied) / valid.length) * 100;
 }
 
-// A metric only counts toward MIN_TOP_METRICS if the ticker's last 3
-// consecutive quarters for it were all positive — its VALUE still counts
-// fully in the composite average either way (see computeIndustryLeaders),
-// this only gates whether it can count as one of the "top" metrics. Verified
-// live why this matters: SPRO (Spero Therapeutics) had a strong TTM
-// profitMargin (24.9%) built on quarters that were mostly negative
+// Whether a metric's last 3 consecutive quarters were all positive --
+// published per-ticker as trendQualifiedMask (see encodeTrendQualifiedMask)
+// but no longer consumed by computeIndustryLeaders below, which moved from
+// a hard "top-tier AND trend-qualified" gate to a pure composite-score
+// ranking (see MIN_LEADERS_PER_INDUSTRY's own comment for why). Left
+// computed/published rather than removed -- real, accurate per-ticker data,
+// genuinely useful signal (e.g. a metric propped up by one anomalous
+// quarter, not a real trend) that a future feature could still consume.
+// Originally built to guard against exactly that: SPRO (Spero
+// Therapeutics) had a strong TTM profitMargin (24.9%) built on quarters
+// that were mostly negative
 // (-0.12, -1.36, +0.76, -27.92 — that last one from revenue collapsing to
 // $0.0045/share from ~$0.60), so it doesn't reflect 3 consecutive quarters
 // of real, positive performance despite the good-looking trailing number.
@@ -2207,32 +2221,32 @@ function decodeTrendQualifiedMask(mask) {
 }
 
 /**
- * Up to MAX_LEADERS_PER_INDUSTRY qualifying tickers per industry (>=
- * MIN_INDUSTRY_PEERS peers only), one grouped entry per industry rather than
- * a flat per-ticker list — see IndustryLeaders.js for the per-industry
- * carousel this shape is meant to render. A candidate must have:
- *  1. All 6 comparable metrics present — verified live that a ticker with
- *     only 1 of 6 (e.g. SharonAI/SHAZ: fcfMargin present, everything else
- *     null, and that one figure a wildly implausible 2065% margin) could
- *     otherwise "win" an industry on a single outlier/likely-erroneous
- *     number instead of a genuinely complete picture.
- *  2. Top-tier (>= TOP_METRIC_PERCENTILE, currently the 80th) in at least
- *     MIN_TOP_METRICS of those 6, direction-normalized ("goodness" — a low
- *     P/E percentile-ranks as high goodness, same as percentileTone) — not
- *     just a good average across the board, but genuinely excellent in
- *     nearly everything. A metric only counts toward this if it also has
- *     3 consecutive positive quarters (see computeTrendQualification) — its
- *     value still counts fully in the composite average regardless, this
- *     only gates whether it can count as one of the "top" ones. Nothing is
- *     excluded outright for this; a candidate can still win on its other
- *     metrics if one is disqualified from counting as "top."
- * Among qualifying candidates, ranked by composite score (the goodness-
- * averaged score across all 6, unaffected by rule 2's gating), weighted
- * down slightly for thin reporting history (see historyWeight) — the top
- * MAX_LEADERS_PER_INDUSTRY of those make the cut. An industry with no
- * qualifying candidate at all gets no entry, rather than forcing a pick;
- * one with fewer than MAX_LEADERS_PER_INDUSTRY qualifiers just shows
- * however many genuinely qualify, never padded with a non-qualifying pick.
+ * Every real industry gets an entry (no peer-count floor — see
+ * MIN_LEADERS_PER_INDUSTRY's own comment for why an earlier
+ * MIN_INDUSTRY_PEERS=100 cutoff was removed), one grouped entry per industry
+ * rather than a flat per-ticker list — see IndustryLeaders.js for the
+ * per-industry carousel this shape is meant to render. A candidate must
+ * have all 6 comparable metrics present (fcfMargin excused for banks —
+ * see isFinancialIndustry — since capex isn't a meaningful concept for a
+ * depository institution, which was otherwise excluding the entire
+ * "Banking" industry from having ANY eligible candidate at all) —
+ * verified live that a ticker with only 1 of 6 (e.g. SharonAI/SHAZ:
+ * fcfMargin present, everything else null, and that one figure a wildly
+ * implausible 2065% margin) could otherwise "win" an industry on a single
+ * outlier/likely-erroneous number instead of a genuinely complete picture.
+ * Ranked by composite score (the goodness-averaged score across all 6,
+ * direction-normalized — a low P/E percentile-ranks as high goodness, same
+ * as percentileTone), weighted down slightly for thin reporting history
+ * (see historyWeight) — the top MAX_LEADERS_PER_INDUSTRY eligible
+ * candidates make the cut, or fewer only when the industry itself doesn't
+ * have that many eligible tickers to begin with. Deliberately a pure
+ * ranking, not a quality gate — an earlier design additionally required
+ * top-quintile-in->=5-of-6-metrics before a candidate could be shown at
+ * all, which starved the feature almost entirely (see
+ * MIN_LEADERS_PER_INDUSTRY's own comment for the live numbers): showing
+ * the genuinely best-available tickers for every industry serves the
+ * feature's purpose better than showing nothing (or just one pick) for
+ * all but a handful of industries.
  */
 function computeIndustryLeaders(metrics, profiles) {
   const byIndustry = {};
@@ -2243,8 +2257,6 @@ function computeIndustryLeaders(metrics, profiles) {
 
   const leaders = [];
   for (const [industry, symbols] of Object.entries(byIndustry)) {
-    if (symbols.length < MIN_INDUSTRY_PEERS) continue;
-
     const populations = {};
     for (const key of COMPARABLE_KEYS) {
       const raw = symbols.map((s) => metrics[s][key]);
@@ -2259,48 +2271,42 @@ function computeIndustryLeaders(metrics, profiles) {
       populations[key] = LOWER_IS_BETTER.has(key) ? raw.filter((v) => v == null || v >= 0) : raw;
     }
 
-    const eligible = symbols.filter((s) => COMPARABLE_KEYS.every((k) => metrics[s][k] !== null && metrics[s][k] !== undefined));
+    // fcfMargin never applies to banks (see isFinancialIndustry) -- verified
+    // live: requiring it left "Banking" specifically with only 5 of 306
+    // tickers eligible at all (every us-gaap/ifrs-full bank correctly has
+    // fcfMargin === null, same as everywhere else in this codebase that
+    // already excludes banks from that metric), effectively excluding the
+    // entire industry from ever having a real leader.
+    const requiredKeys = isFinancialIndustry(industry) ? COMPARABLE_KEYS.filter((k) => k !== 'fcfMargin') : COMPARABLE_KEYS;
+    const eligible = symbols.filter((s) => requiredKeys.every((k) => metrics[s][k] !== null && metrics[s][k] !== undefined));
+    if (!eligible.length) continue;
 
-    const qualifying = [];
-    for (const symbol of eligible) {
+    const scored = eligible.map((symbol) => {
       const data = metrics[symbol];
-      // Read from metrics[symbol] (published, and restored by main()'s
-      // hard-failure fallback), not profiles[symbol] (ephemeral, computed
-      // fresh every run, never persisted) — a ticker that hard-failed this
-      // run and got its metrics restored from the previous publish still
-      // has a real trendQualifiedMask/historyQuarters to score against,
-      // instead of silently failing every "top metric" check below.
-      const trendQualified = decodeTrendQualifiedMask(data.trendQualifiedMask || 0);
       const goodnessScores = [];
-      let topMetricCount = 0;
-      for (const key of COMPARABLE_KEYS) {
+      for (const key of requiredKeys) {
         const isNegativeLowerIsBetter = LOWER_IS_BETTER.has(key) && data[key] < 0;
         const pct = isNegativeLowerIsBetter ? 100 : percentileRank(data[key], populations[key]);
         const goodness = LOWER_IS_BETTER.has(key) ? 100 - pct : pct;
-        goodnessScores.push(goodness); // counts toward the composite regardless of the trend check below
-        if (goodness >= TOP_METRIC_PERCENTILE && trendQualified[key]) topMetricCount++;
+        goodnessScores.push(goodness);
       }
-      if (topMetricCount < MIN_TOP_METRICS) continue;
-
       const composite = goodnessScores.reduce((a, b) => a + b, 0) / goodnessScores.length;
       const adjustedScore = composite * historyWeight(data.historyQuarters || 0);
-      qualifying.push({ symbol, composite, adjustedScore });
-    }
+      return { symbol, composite, adjustedScore };
+    });
 
-    if (qualifying.length) {
-      qualifying.sort((a, b) => b.adjustedScore - a.adjustedScore);
-      const top = qualifying.slice(0, MAX_LEADERS_PER_INDUSTRY);
-      leaders.push({
-        industry,
-        peerCount: symbols.length,
-        leaders: top.map((t) => ({
-          symbol: t.symbol,
-          name: profiles[t.symbol]?.name || t.symbol,
-          logo: profiles[t.symbol]?.logo || null,
-          composite: t.composite,
-        })),
-      });
-    }
+    scored.sort((a, b) => b.adjustedScore - a.adjustedScore);
+    const top = scored.slice(0, MAX_LEADERS_PER_INDUSTRY);
+    leaders.push({
+      industry,
+      peerCount: symbols.length,
+      leaders: top.map((t) => ({
+        symbol: t.symbol,
+        name: profiles[t.symbol]?.name || t.symbol,
+        logo: profiles[t.symbol]?.logo || null,
+        composite: t.composite,
+      })),
+    });
   }
 
   return leaders.sort((a, b) => b.peerCount - a.peerCount);
@@ -2794,7 +2800,10 @@ async function main() {
 
   const industryLeaders = computeIndustryLeaders(metrics, profiles);
   const totalLeaderTickers = industryLeaders.reduce((sum, entry) => sum + entry.leaders.length, 0);
-  console.log(`\nComputed leaders for ${industryLeaders.length} industries (>= ${MIN_INDUSTRY_PEERS} peers each), ${totalLeaderTickers} leader tickers total.`);
+  const shortLeaderIndustries = industryLeaders.filter((entry) => entry.leaders.length < MIN_LEADERS_PER_INDUSTRY).length;
+  console.log(
+    `\nComputed leaders for ${industryLeaders.length} industries, ${totalLeaderTickers} leader tickers total (${shortLeaderIndustries} industries below the ${MIN_LEADERS_PER_INDUSTRY}-leader floor -- only possible when the industry itself doesn't have that many eligible tickers).`
+  );
 
   const generatedAt = new Date().toISOString();
   // marketMetrics.json stays small — no trends embedded (see
