@@ -376,6 +376,178 @@ function normalizeCikContinuity(symbol, reports) {
   return reports.map((r) => (r?.cik != null && aliasSet.has(canonicalCikDigits(r.cik)) ? { ...r, cik: canonicalCik } : r));
 }
 
+// FDIC BankFind integration for Section 12(i)-exempt banks -- these report
+// periodic financials to the FDIC instead of registering with the SEC, so
+// they have zero XBRL/financials-reported data of any kind, ever (verified
+// live via SEC EDGAR's company-search: no 10-K or 10-Q filing history
+// exists under either ticker below). FDIC's Call Report data
+// (banks.data.fdic.gov, free/public) is a genuinely different, real data
+// source with quarterly financials for these banks, current through the
+// most recent quarter -- but it has no capex/OCF-shaped fields at all, so
+// this can only ever cover revenueGrowth/profitMargin/roic, never
+// fcfMargin/P-FCF (already permanently skipped for every bank-like ticker
+// regardless — see isFinancialIndustry — so this isn't a new gap for these
+// two, just one that stays unfixable same as for every other bank).
+//
+// Curated, hand-verified per-ticker FDIC certificate number (CERT, not a
+// CIK) map -- narrow and explicit like every other ticker-specific alias
+// table in this file, not an auto-discovery mechanism. Verified live via
+// banks.data.fdic.gov/api/institutions before adding an entry (multiple
+// unrelated institutions can share the same NAME across different CERTs —
+// confirmed the CITY/STALP match the real, currently-listed HQ).
+const FDIC_BANK_CERTS = {
+  PFBC: 33539, // Preferred Bank, Los Angeles CA
+  OZK: 110, // Bank OZK, Little Rock AR
+};
+
+const FDIC_FINANCIALS_URL = 'https://api.fdic.gov/banks/financials';
+const FDIC_FETCH_TIMEOUT_MS = 15000;
+const FDIC_QUARTERS_TO_FETCH = 24; // enough for QUARTERS_OF_HISTORY (12) plus a YoY-comparison margin
+
+async function fetchFdicJson(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FDIC_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { headers: { Accept: 'application/json' }, signal: controller.signal });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchFdicQuarterlyFinancials(cert) {
+  const url = `${FDIC_FINANCIALS_URL}?filters=CERT:${cert}&fields=REPDTE,NETINC,INTINC,EINTEXP,NONII,EQ&sort_by=REPDTE&sort_order=DESC&limit=${FDIC_QUARTERS_TO_FETCH}&format=json`;
+  const data = await fetchFdicJson(url);
+  return (data?.data || []).map((row) => row.data).filter((r) => r?.REPDTE);
+}
+
+// FDIC Call Report income-statement fields (NETINC/INTINC/EINTEXP/NONII)
+// are year-to-date cumulative within each calendar year (Schedule RI's own
+// convention, resetting every Q1) -- the same shape Finnhub's
+// financials-reported uses elsewhere in this file, needing the same
+// de-cumulation (Q2 standalone = Q2 YTD − Q1 YTD, etc.). EQ (equity) is a
+// balance-sheet instant snapshot, already point-in-time -- never
+// de-cumulated. REPDTE is a real calendar date (YYYYMMDD), so labels are
+// computed directly from it -- no fiscal-vs-calendar reconciliation needed
+// here, unlike the SEC/Finnhub-sourced builders elsewhere in this file.
+function decumulateFdicQuarters(rows) {
+  const sorted = [...rows].sort((a, b) => a.REPDTE.localeCompare(b.REPDTE));
+  const flowFields = ['NETINC', 'INTINC', 'EINTEXP', 'NONII'];
+  const out = [];
+  let priorYear = null;
+  let priorYtd = null;
+  for (const row of sorted) {
+    const year = Number(row.REPDTE.slice(0, 4));
+    const month = Number(row.REPDTE.slice(4, 6));
+    const quarter = Math.floor((month - 1) / 3) + 1;
+    const ytd = Object.fromEntries(flowFields.map((f) => [f, row[f]]));
+    const standalone = {};
+    if (priorYear === year && priorYtd) {
+      for (const f of flowFields) standalone[f] = ytd[f] != null && priorYtd[f] != null ? ytd[f] - priorYtd[f] : null;
+    } else {
+      Object.assign(standalone, ytd); // Q1 -- YTD equals standalone
+    }
+    const revenue = standalone.INTINC != null && standalone.EINTEXP != null && standalone.NONII != null ? standalone.INTINC - standalone.EINTEXP + standalone.NONII : null;
+    out.push({ year, quarter, netInc: standalone.NETINC, revenue, eq: row.EQ });
+    priorYear = year;
+    priorYtd = ytd;
+  }
+  return out;
+}
+
+function fdicQuarterLabel(year, quarter) {
+  return `Q${quarter} '${String(year).slice(-2)}`;
+}
+function fdicYearLabel(year) {
+  return `FY '${String(year).slice(-2)}`;
+}
+
+// Builds the same {revenueGrowth, profitMargin, roic} x {quarterly, yearly,
+// ttm} shape the normal Finnhub/SEC-sourced builders produce elsewhere in
+// this file, from already-decumulated FDIC records. roic uses NETINC/EQ
+// (return on equity) rather than the usual EBIT/investedCapital formula --
+// FDIC's Call Report has no EBIT-equivalent (pretax operating income)
+// field, and this mirrors the existing bank ROIC convention already used
+// throughout buildRoicQuarterlyFromFilings (debt near-zero and excluded,
+// cash not netted out for banks -- see its own comment), which for a real
+// bank already reduces to something close to a return-on-equity figure.
+function buildFdicTrends(records) {
+  const byKey = new Map(records.map((r) => [`${r.year}-${r.quarter}`, r]));
+
+  const quarterly = { revenueGrowth: [], profitMargin: [], roic: [] };
+  const yearly = { revenueGrowth: [], profitMargin: [], roic: [] };
+  const ttm = { revenueGrowth: [], profitMargin: [], roic: [] };
+
+  for (const r of records) {
+    if (r.revenue != null && r.netInc != null) {
+      const margin = clampImplausible(r.revenue !== 0 ? r.netInc / r.revenue : null);
+      if (margin != null) quarterly.profitMargin.push({ label: fdicQuarterLabel(r.year, r.quarter), value: margin });
+    }
+    if (r.netInc != null && r.eq) {
+      const roic = clampImplausible(r.netInc / r.eq);
+      if (roic != null) quarterly.roic.push({ label: fdicQuarterLabel(r.year, r.quarter), value: roic });
+    }
+    const yearAgo = byKey.get(`${r.year - 1}-${r.quarter}`);
+    if (yearAgo?.revenue != null && r.revenue != null && yearAgo.revenue !== 0) {
+      const growth = clampImplausible((r.revenue - yearAgo.revenue) / yearAgo.revenue);
+      if (growth != null) quarterly.revenueGrowth.push({ label: fdicQuarterLabel(r.year, r.quarter), value: growth });
+    }
+  }
+
+  const q4Records = records.filter((r) => r.quarter === 4);
+  for (const r of q4Records) {
+    if (r.revenue != null && r.netInc != null) {
+      const margin = clampImplausible(r.revenue !== 0 ? r.netInc / r.revenue : null);
+      if (margin != null) yearly.profitMargin.push({ label: fdicYearLabel(r.year), value: margin });
+    }
+    if (r.netInc != null && r.eq) {
+      const roic = clampImplausible(r.netInc / r.eq);
+      if (roic != null) yearly.roic.push({ label: fdicYearLabel(r.year), value: roic });
+    }
+  }
+  for (let i = 1; i < q4Records.length; i++) {
+    const prev = q4Records[i - 1];
+    const curr = q4Records[i];
+    if (curr.year === prev.year + 1 && prev.revenue && curr.revenue != null) {
+      const growth = clampImplausible((curr.revenue - prev.revenue) / prev.revenue);
+      if (growth != null) yearly.revenueGrowth.push({ label: fdicYearLabel(curr.year), value: growth });
+    }
+  }
+
+  const sortedKeys = records.map((r) => ({ year: r.year, quarter: r.quarter })).sort((a, b) => a.year - b.year || a.quarter - b.quarter);
+  const ttmByKey = new Map();
+  for (let i = 3; i < sortedKeys.length; i++) {
+    const window = sortedKeys.slice(i - 3, i + 1).map((k) => byKey.get(`${k.year}-${k.quarter}`));
+    if (window.some((w) => w?.revenue == null || w?.netInc == null)) continue;
+    const revenue = window.reduce((s, w) => s + w.revenue, 0);
+    const netInc = window.reduce((s, w) => s + w.netInc, 0);
+    const anchor = window[3];
+    ttmByKey.set(`${anchor.year}-${anchor.quarter}`, { revenue, netInc, eq: anchor.eq });
+    const margin = clampImplausible(revenue !== 0 ? netInc / revenue : null);
+    if (margin != null) ttm.profitMargin.push({ label: fdicQuarterLabel(anchor.year, anchor.quarter), value: margin });
+    if (anchor.eq) {
+      const roic = clampImplausible(netInc / anchor.eq);
+      if (roic != null) ttm.roic.push({ label: fdicQuarterLabel(anchor.year, anchor.quarter), value: roic });
+    }
+  }
+  for (const [key, curr] of ttmByKey) {
+    const [year, quarter] = key.split('-').map(Number);
+    const yearAgo = ttmByKey.get(`${year - 1}-${quarter}`);
+    if (yearAgo?.revenue) {
+      const growth = clampImplausible((curr.revenue - yearAgo.revenue) / yearAgo.revenue);
+      if (growth != null) ttm.revenueGrowth.push({ label: fdicQuarterLabel(year, quarter), value: growth });
+    }
+  }
+
+  for (const bucket of [quarterly, yearly, ttm]) {
+    for (const key of Object.keys(bucket)) bucket[key] = bucket[key].slice(-QUARTERS_OF_HISTORY);
+  }
+  return { quarterly, yearly, ttm };
+}
+
 async function fetchMetricsFor(symbol, apiKey) {
   const requestSymbol = DUAL_CLASS_ALIASES[symbol] || symbol;
   const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/metric?symbol=${requestSymbol}&metric=all&token=${apiKey}`);
@@ -2725,23 +2897,40 @@ async function processSymbol(symbol, apiKey, ctx) {
   }
 
   const isBankLike = isFinancialIndustry(profile.industry);
+
+  // FDIC fallback for Section 12(i) banks with zero SEC XBRL data of any
+  // kind (see FDIC_BANK_CERTS' own comment) — fetched once, upfront, so the
+  // builders below can stay synchronous like every other builder in this
+  // file. Only spends a request for the small curated list of tickers.
+  let fdicTrends = null;
+  if (FDIC_BANK_CERTS[symbol]) {
+    try {
+      const rows = await fetchFdicQuarterlyFinancials(FDIC_BANK_CERTS[symbol]);
+      if (rows.length) fdicTrends = buildFdicTrends(decumulateFdicQuarters(rows));
+    } catch {
+      // Non-fatal — same graceful-degradation philosophy as every other
+      // fetch in this function; falls through to the normal (empty, for
+      // these tickers) Finnhub/SEC-based builders below.
+    }
+  }
+
   const yearlyBuilders = {
-    revenueGrowth: () => buildRevenueGrowthYearlyFromFilings(annualReportedFinancials),
-    profitMargin: () => buildProfitMarginYearlyFromFilings(annualReportedFinancials),
+    revenueGrowth: () => fdicTrends?.yearly.revenueGrowth || buildRevenueGrowthYearlyFromFilings(annualReportedFinancials),
+    profitMargin: () => fdicTrends?.yearly.profitMargin || buildProfitMarginYearlyFromFilings(annualReportedFinancials),
     fcfMargin: () => (isBankLike ? [] : buildFcfMarginYearlyFromFilings(annualReportedFinancials)),
-    roic: () => buildRoicYearlyFromFilings(annualReportedFinancials, isBankLike),
+    roic: () => fdicTrends?.yearly.roic || buildRoicYearlyFromFilings(annualReportedFinancials, isBankLike),
   };
   const quarterlyBuilders = {
-    revenueGrowth: () => buildRevenueGrowthQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials),
-    profitMargin: () => buildProfitMarginQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials),
+    revenueGrowth: () => fdicTrends?.quarterly.revenueGrowth || buildRevenueGrowthQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials),
+    profitMargin: () => fdicTrends?.quarterly.profitMargin || buildProfitMarginQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials),
     fcfMargin: () => (isBankLike ? [] : buildFcfMarginQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials)),
-    roic: () => buildRoicQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials, isBankLike),
+    roic: () => fdicTrends?.quarterly.roic || buildRoicQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials, isBankLike),
   };
   const ttmBuilders = {
-    revenueGrowth: () => buildRevenueGrowthTTMFromFilings(quarterlyFinancials, annualReportedFinancials),
-    profitMargin: () => buildProfitMarginTTMFromFilings(quarterlyFinancials, annualReportedFinancials),
+    revenueGrowth: () => fdicTrends?.ttm.revenueGrowth || buildRevenueGrowthTTMFromFilings(quarterlyFinancials, annualReportedFinancials),
+    profitMargin: () => fdicTrends?.ttm.profitMargin || buildProfitMarginTTMFromFilings(quarterlyFinancials, annualReportedFinancials),
     fcfMargin: () => (isBankLike ? [] : buildFcfMarginTrendFromFilings(quarterlyFinancials, annualReportedFinancials)),
-    roic: () => buildRoicTTMFromFilings(quarterlyFinancials, annualReportedFinancials, isBankLike),
+    roic: () => fdicTrends?.ttm.roic || buildRoicTTMFromFilings(quarterlyFinancials, annualReportedFinancials, isBankLike),
   };
 
   const mergedYearlyForSymbol = {};
