@@ -2937,6 +2937,18 @@ async function main() {
     `\nComputed leaders for ${industryLeaders.length} industries, ${totalLeaderTickers} leader tickers total (${shortLeaderIndustries} industries below the ${MIN_LEADERS_PER_INDUSTRY}-leader floor -- only possible when the industry itself doesn't have that many eligible tickers).`
   );
 
+  // Tickers with no recent activity in ANY comparable metric, across both
+  // cadences -- same hasRecentTrendActivity gate Industry Leaders already
+  // uses (see its own comment for the CAAS/Form-15-deregistration case
+  // this closes). Published separately from `metrics` itself (never
+  // removes an entry from `metrics`) -- other consumers of a direct
+  // ticker lookup (e.g. a user who already knows a delisted symbol and
+  // types it directly, bypassing the search dropdown) still resolve
+  // normally; this list exists specifically for the app's search-input
+  // coverage filter (fetchCoveredSymbols in src/api/sectorComparison.js)
+  // to subtract, so a stale ticker no longer surfaces as a suggestion.
+  const staleSymbols = Object.keys(metrics).filter((s) => !hasRecentTrendActivity(s, quarterlyTrends, ttmTrends));
+
   const generatedAt = new Date().toISOString();
   // marketMetrics.json stays small — no trends embedded (see
   // OUTPUT_TRENDS_*_FILE above for why they moved to their own files).
@@ -2944,7 +2956,7 @@ async function main() {
   // pretty-printing was adding meaningful overhead for no benefit on a
   // machine-generated, never-hand-edited file, and every byte matters now
   // that these files run into the tens of megabytes at full-universe scale.
-  const output = { generatedAt, metrics, industryLeaders };
+  const output = { generatedAt, metrics, industryLeaders, staleSymbols };
   fs.mkdirSync(path.dirname(OUTPUT_FILE), { recursive: true }); // works regardless of which repo this script runs in
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(output));
   fs.writeFileSync(OUTPUT_TRENDS_NATIVE_FILE, JSON.stringify({ generatedAt, trends: nativeTrends }));
