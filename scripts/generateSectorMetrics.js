@@ -1257,6 +1257,51 @@ function quarterLabelFromPeriod(period) {
   return `Q${q} '${String(d.getFullYear()).slice(-2)}`;
 }
 
+// Finnhub's own `year`/`quarter` fields on a financials-reported entry
+// follow each filer's OWN fiscal-year numbering, not the calendar --
+// verified live: PagerDuty (PD)'s fiscal year ends Jan 31, so its quarter
+// ending April 30, 2026 (real, already filed 2026-05-28) is tagged
+// year=2027/quarter=1 by Finnhub. Every filings-reconstruction builder
+// below groups quarters BY that same fiscal key (decumulateYtdByYear/
+// buildStandaloneFlowQuarters need the filer's own fiscal-year grouping to
+// correctly sum YTD-cumulative reports), so year/quarter can't just be
+// overwritten -- this builds a SEPARATE lookup from that same fiscal key
+// to the real CALENDAR label, computed from the period's own real end
+// date, for DISPLAY only. Q4 has no standalone report of its own (always
+// derived: annual - 9mo YTD) -- its real end date IS that fiscal year's
+// own annual report end date, by definition.
+function buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports) {
+  const labels = new Map();
+  for (const q of quarterlyReports || []) {
+    if (!q?.quarter || !q?.endDate) continue;
+    const key = `${q.year}-${q.quarter}`;
+    if (!labels.has(key)) labels.set(key, quarterLabelFromPeriod(q.endDate));
+  }
+  for (const a of annualReports || []) {
+    if (!a?.year || !a?.endDate) continue;
+    const key = `${a.year}-4`;
+    if (!labels.has(key)) labels.set(key, quarterLabelFromPeriod(a.endDate));
+  }
+  return labels;
+}
+
+// Falls back to the old fiscal-key-derived label only if no real end date
+// was available to compute a calendar one -- never silently drops a point.
+function calendarQuarterLabel(labels, year, quarter) {
+  return labels.get(`${year}-${quarter}`) || `Q${quarter} '${String(year).slice(-2)}`;
+}
+
+// Annual counterpart -- same fiscal-year-vs-calendar-year gap can apply to
+// a "FY 'XX" label too (a fiscal year ending in a genuinely future
+// calendar year would be just as misleading as a future quarter).
+function calendarYearlyLabel(labels, year) {
+  const calendarLabel = labels.get(`${year}-4`);
+  if (!calendarLabel) return yearlyLabel(year);
+  // calendarLabel is "Qn 'YY" -- take just the year portion for an annual point.
+  const match = calendarLabel.match(/'(\d{2})$/);
+  return match ? `FY '${match[1]}` : yearlyLabel(year);
+}
+
 // ---------------------------------------------------------------------------
 // Native quarterly-series capture (all 6 metrics) — Finnhub's stock/metric
 // response (already fetched for every ticker's card values) includes the
@@ -1316,6 +1361,7 @@ function buildNativeTrendsForTicker(quarterly) {
 // findReportedCapexQ/findReportedRevenue/decumulateYtdByYear/
 // isConsecutiveQuarterWindow already defined above for the latest-value case.
 function buildFcfMarginTrendFromFilings(quarterlyReports, annualReports) {
+  const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
   const ocf = decumulateYtdByYear(quarterlyReports, annualReports, findReportedOperatingCashFlowQ, 'cf');
   const capex = decumulateYtdByYear(quarterlyReports, annualReports, findReportedCapexQ, 'cf');
   const revenue = decumulateYtdByYear(quarterlyReports, annualReports, findReportedRevenue, 'ic');
@@ -1336,7 +1382,7 @@ function buildFcfMarginTrendFromFilings(quarterlyReports, annualReports) {
     const ttmFcf = quarters.reduce((sum, q) => sum + q.fcf, 0);
     const ttmRevenue = quarters.reduce((sum, q) => sum + q.revenue, 0);
     const { year, quarter } = anchor;
-    return { label: `Q${quarter} '${String(year).slice(-2)}`, value: ttmRevenue ? ttmFcf / ttmRevenue : null, partial, quartersUsed: quarters.length };
+    return { label: calendarQuarterLabel(calendarLabels, year, quarter), value: ttmRevenue ? ttmFcf / ttmRevenue : null, partial, quartersUsed: quarters.length };
   });
   return points.slice(-QUARTERS_OF_HISTORY);
 }
@@ -1596,25 +1642,27 @@ function yearlyLabel(year) {
 // --- FCF Margin: Quarterly + Yearly (TTM already exists above) ---
 
 function buildFcfMarginQuarterlyFromFilings(quarterlyReports, annualReports) {
+  const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
   const records = buildStandaloneFlowQuarters(quarterlyReports, annualReports, {
     ocf: { fn: findReportedOperatingCashFlowQ, section: 'cf' },
     capex: { fn: findReportedCapexQ, section: 'cf' },
     revenue: { fn: findReportedRevenue, section: 'ic' },
   });
   return records
-    .map((r) => ({ label: `Q${r.quarter} '${String(r.year).slice(-2)}`, value: clampImplausible(r.revenue ? (r.ocf - r.capex) / r.revenue : null) }))
+    .map((r) => ({ label: calendarQuarterLabel(calendarLabels, r.year, r.quarter), value: clampImplausible(r.revenue ? (r.ocf - r.capex) / r.revenue : null) }))
     .filter((p) => p.value != null)
     .slice(-QUARTERS_OF_HISTORY);
 }
 
 function buildFcfMarginYearlyFromFilings(annualReports) {
+  const calendarLabels = buildCalendarLabelsByFiscalKey(null, annualReports);
   const records = buildAnnualFlowPoints(annualReports, {
     ocf: { fn: findReportedOperatingCashFlowQ, section: 'cf' },
     capex: { fn: findReportedCapexQ, section: 'cf' },
     revenue: { fn: findReportedRevenue, section: 'ic' },
   });
   return records
-    .map((r) => ({ label: yearlyLabel(r.year), value: clampImplausible(r.revenue ? (r.ocf - r.capex) / r.revenue : null) }))
+    .map((r) => ({ label: calendarYearlyLabel(calendarLabels, r.year), value: clampImplausible(r.revenue ? (r.ocf - r.capex) / r.revenue : null) }))
     .filter((p) => p.value != null)
     .slice(-QUARTERS_OF_HISTORY);
 }
@@ -1622,6 +1670,7 @@ function buildFcfMarginYearlyFromFilings(annualReports) {
 // --- Revenue Growth: Quarterly (single-quarter YoY), Yearly, TTM ---
 
 function buildRevenueGrowthQuarterlyFromFilings(quarterlyReports, annualReports) {
+  const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
   const standalone = decumulateYtdByYear(quarterlyReports, annualReports, findReportedRevenue, 'ic');
   const chronological = Object.keys(standalone)
     .map((key) => {
@@ -1645,23 +1694,25 @@ function buildRevenueGrowthQuarterlyFromFilings(quarterlyReports, annualReports)
     const yearAgo = byKey.get(`${current.year - 1}-${current.quarter}`);
     if (!yearAgo) continue;
     const value = clampImplausible(yearAgo.value ? (current.value - yearAgo.value) / yearAgo.value : null);
-    if (value != null) points.push({ label: `Q${current.quarter} '${String(current.year).slice(-2)}`, value });
+    if (value != null) points.push({ label: calendarQuarterLabel(calendarLabels, current.year, current.quarter), value });
   }
   return points.slice(-QUARTERS_OF_HISTORY);
 }
 
 function buildRevenueGrowthYearlyFromFilings(annualReports) {
+  const calendarLabels = buildCalendarLabelsByFiscalKey(null, annualReports);
   const records = buildAnnualFlowPoints(annualReports, { revenue: { fn: findReportedRevenue, section: 'ic' } });
   const points = [];
   for (let i = 1; i < records.length; i++) {
     if (records[i].year !== records[i - 1].year + 1) continue;
     const value = clampImplausible(records[i - 1].revenue ? (records[i].revenue - records[i - 1].revenue) / records[i - 1].revenue : null);
-    if (value != null) points.push({ label: yearlyLabel(records[i].year), value });
+    if (value != null) points.push({ label: calendarYearlyLabel(calendarLabels, records[i].year), value });
   }
   return points.slice(-QUARTERS_OF_HISTORY);
 }
 
 function buildRevenueGrowthTTMFromFilings(quarterlyReports, annualReports) {
+  const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
   const records = buildStandaloneFlowQuarters(quarterlyReports, annualReports, { revenue: { fn: findReportedRevenue, section: 'ic' } });
   const windows = buildTrailingWindows(records, 4).filter((w) => !w.partial);
 
@@ -1683,7 +1734,7 @@ function buildRevenueGrowthTTMFromFilings(quarterlyReports, annualReports) {
     const currTTM = ttmByKey[`${curr.year}-${curr.quarter}`];
     const yearAgoTTM = ttmByKey[yearAgoKey];
     const value = clampImplausible(yearAgoTTM ? (currTTM - yearAgoTTM) / yearAgoTTM : null);
-    if (value != null) points.push({ label: `Q${curr.quarter} '${String(curr.year).slice(-2)}`, value });
+    if (value != null) points.push({ label: calendarQuarterLabel(calendarLabels, curr.year, curr.quarter), value });
   }
   return points.slice(-QUARTERS_OF_HISTORY);
 }
@@ -1691,6 +1742,7 @@ function buildRevenueGrowthTTMFromFilings(quarterlyReports, annualReports) {
 // --- Profit Margin: Quarterly, Yearly, TTM ---
 
 function buildProfitMarginQuarterlyFromFilings(quarterlyReports, annualReports) {
+  const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
   const revenue = decumulateYtdByYear(quarterlyReports, annualReports, findReportedRevenue, 'ic');
   const netIncome = decumulateYtdByYear(quarterlyReports, annualReports, findReportedNetIncome, 'ic');
   const chronological = Object.keys(revenue)
@@ -1701,21 +1753,23 @@ function buildProfitMarginQuarterlyFromFilings(quarterlyReports, annualReports) 
     })
     .filter((p) => p.value != null)
     .sort((a, b) => a.year - b.year || a.quarter - b.quarter);
-  return chronological.map((p) => ({ label: `Q${p.quarter} '${String(p.year).slice(-2)}`, value: p.value })).slice(-QUARTERS_OF_HISTORY);
+  return chronological.map((p) => ({ label: calendarQuarterLabel(calendarLabels, p.year, p.quarter), value: p.value })).slice(-QUARTERS_OF_HISTORY);
 }
 
 function buildProfitMarginYearlyFromFilings(annualReports) {
+  const calendarLabels = buildCalendarLabelsByFiscalKey(null, annualReports);
   const records = buildAnnualFlowPoints(annualReports, {
     netIncome: { fn: findReportedNetIncome, section: 'ic' },
     revenue: { fn: findReportedRevenue, section: 'ic' },
   });
   return records
-    .map((r) => ({ label: yearlyLabel(r.year), value: clampImplausible(r.revenue ? r.netIncome / r.revenue : null) }))
+    .map((r) => ({ label: calendarYearlyLabel(calendarLabels, r.year), value: clampImplausible(r.revenue ? r.netIncome / r.revenue : null) }))
     .filter((p) => p.value != null)
     .slice(-QUARTERS_OF_HISTORY);
 }
 
 function buildProfitMarginTTMFromFilings(quarterlyReports, annualReports) {
+  const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
   const records = buildStandaloneFlowQuarters(quarterlyReports, annualReports, {
     netIncome: { fn: findReportedNetIncome, section: 'ic' },
     revenue: { fn: findReportedRevenue, section: 'ic' },
@@ -1725,7 +1779,7 @@ function buildProfitMarginTTMFromFilings(quarterlyReports, annualReports) {
       const income = quarters.reduce((sum, q) => sum + q.netIncome, 0);
       const rev = quarters.reduce((sum, q) => sum + q.revenue, 0);
       const value = clampImplausible(rev ? income / rev : null);
-      return value != null ? { label: `Q${anchor.quarter} '${String(anchor.year).slice(-2)}`, value, partial, quartersUsed: quarters.length } : null;
+      return value != null ? { label: calendarQuarterLabel(calendarLabels, anchor.year, anchor.quarter), value, partial, quartersUsed: quarters.length } : null;
     })
     .filter(Boolean)
     .slice(-QUARTERS_OF_HISTORY);
@@ -1734,6 +1788,7 @@ function buildProfitMarginTTMFromFilings(quarterlyReports, annualReports) {
 // --- ROIC: Quarterly, Yearly, TTM (none of these existed in this pipeline before) ---
 
 function buildRoicQuarterlyFromFilings(quarterlyReports, annualReports, isBank) {
+  const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
   const ebitRecords = buildStandaloneFlowQuarters(quarterlyReports, annualReports, { ebit: { fn: findReportedEBIT, section: 'ic' } });
 
   const investedCapitalByQuarter = {};
@@ -1782,7 +1837,7 @@ function buildRoicQuarterlyFromFilings(quarterlyReports, annualReports, isBank) 
       // identical note in buildRoicQuarterlyFromFilings in src/utils/metrics.js.
       const annualizedNopat = r.ebit * (1 - ROIC_ASSUMED_TAX_RATE) * 4;
       const value = clampImplausible(annualizedNopat / investedCapitalByQuarter[`${r.year}-${r.quarter}`]);
-      return value != null ? { label: `Q${r.quarter} '${String(r.year).slice(-2)}`, value } : null;
+      return value != null ? { label: calendarQuarterLabel(calendarLabels, r.year, r.quarter), value } : null;
     })
     .filter(Boolean)
     .slice(-QUARTERS_OF_HISTORY);
@@ -1792,6 +1847,7 @@ function buildRoicYearlyFromFilings(annualReports, isBank) {
   const currentCik = annualReports?.[0]?.cik;
   const sameCik = (r) => currentCik == null || r.cik === currentCik;
   const filtered = (annualReports || []).filter(sameCik);
+  const calendarLabels = buildCalendarLabelsByFiscalKey(null, filtered);
 
   const ebitRecords = buildAnnualFlowPoints(filtered, { ebit: { fn: findReportedEBIT, section: 'ic' } });
 
@@ -1808,13 +1864,14 @@ function buildRoicYearlyFromFilings(annualReports, isBank) {
       if (!(investedCapital > 0)) return null;
       const nopat = r.ebit * (1 - ROIC_ASSUMED_TAX_RATE);
       const value = clampImplausible(nopat / investedCapital);
-      return value != null ? { label: yearlyLabel(r.year), value } : null;
+      return value != null ? { label: calendarYearlyLabel(calendarLabels, r.year), value } : null;
     })
     .filter(Boolean)
     .slice(-QUARTERS_OF_HISTORY);
 }
 
 function buildRoicTTMFromFilings(quarterlyReports, annualReports, isBank) {
+  const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
   const ebit = decumulateYtdByYear(quarterlyReports, annualReports, findReportedEBIT, 'ic');
 
   const investedCapitalByQuarter = {};
@@ -1862,7 +1919,7 @@ function buildRoicTTMFromFilings(quarterlyReports, annualReports, isBank) {
       // for the same quarter was correctly clamped as implausible.
       const ttmNopat = partial ? rawNopat * (4 / quarters.length) : rawNopat;
       const value = clampImplausible(ttmNopat / anchor.investedCapital);
-      return value != null ? { label: `Q${anchor.quarter} '${String(anchor.year).slice(-2)}`, value, partial, quartersUsed: quarters.length } : null;
+      return value != null ? { label: calendarQuarterLabel(calendarLabels, anchor.year, anchor.quarter), value, partial, quartersUsed: quarters.length } : null;
     })
     .filter(Boolean)
     .slice(-QUARTERS_OF_HISTORY);
