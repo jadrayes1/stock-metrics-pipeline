@@ -312,6 +312,70 @@ function resolveFinancialsReportedSymbol(symbol) {
   return RENAMED_TICKER_FINANCIALS_ALIASES[symbol] || DUAL_CLASS_ALIASES[symbol] || symbol;
 }
 
+// Explicit CIK-continuity map for a ticker that underwent a real corporate
+// reorg (typically a one-step holdco merger) resulting in a NEW SEC CIK for
+// the SAME continuous company, keeping the SAME ticker symbol throughout.
+// The opposite shape from RENAMED_TICKER_FINANCIALS_ALIASES above (symbol
+// changed, CIK didn't) -- here the CIK changed, the symbol didn't.
+//
+// Every one of decumulateYtdByYear's ~6 call sites guards against "ticker
+// recycling" -- an unrelated company later reusing an old, unrelated
+// filer's ticker symbol (the real CEG case: genuine unrelated filings from
+// 2010-2011 under an old CIK, alongside the real current company since a
+// 2022 spinoff) -- by only trusting reports whose CIK matches whichever
+// report happens to be first in the array. That guard is exactly right for
+// CEG, but wrongly blocks a LEGITIMATE reorg's new-CIK data (or, depending
+// on merge order, its old-CIK history) from ever being used together.
+//
+// Kept as a narrow, explicit, hand-verified allowlist rather than an
+// automatic "CIKs with a close filing handoff must be the same company"
+// heuristic -- deliberately not trying to auto-detect this, since a wrong
+// auto-merge would silently blend two unrelated filers' financials. Only
+// add an entry here after confirming via SEC's own submissions data that:
+// (a) the old CIK was formally deregistered (Form 15-12G) with its ticker
+// removed, and (b) the new CIK's earliest filing period picks up where the
+// old CIK's last filing period left off, with no overlapping or
+// conflicting fiscal period between them.
+//
+// DMRC verified live 2026-08-24: old CIK 1438231 ("Old Digimarc CORP" per
+// SEC's own current name-on-record) filed its last 10-Q for period
+// 2026-03-31 (Q1'26) on 2026-05-13, then deregistered via Form 15-12G on
+// 2026-05-18 with its ticker list now empty. New CIK 2119322 ("Digimarc
+// Corp") carries the DMRC ticker exclusively since, and its first 10-Q
+// covers period 2026-06-30 (Q2'26) -- picking up the very next quarter
+// after the old CIK's last one, with zero overlap.
+const CIK_CONTINUITY_ALIASES = {
+  DMRC: ['1438231', '2119322'],
+};
+
+// CIKs show up in two different string formats across this file's own data
+// sources -- Finnhub's financials-reported returns them unpadded ("1438231"),
+// while SEC's own company_tickers.json-derived secTickerToCikMap zero-pads
+// to 10 digits ("0002119322", which fetchSecUsGaapFacts' URL construction
+// requires). Stripping leading zeros makes both formats compare equal
+// without having to guess which one a given CIK_CONTINUITY_ALIASES entry
+// or report's raw `.cik` field happens to be in.
+function canonicalCikDigits(cik) {
+  return String(cik).replace(/^0+/, '');
+}
+
+// Rewrites `.cik` on every report to a single canonical value whenever the
+// ticker has a CIK_CONTINUITY_ALIASES entry and the report's real CIK is
+// one of the aliased ones -- applied ONCE, early (right after Finnhub +
+// SEC-synthesized reports are assembled, before any of decumulateYtdByYear's
+// guard sites see them), so every downstream `r.cik === currentCik` check
+// keeps working completely unmodified for every ticker, INCLUDING this one.
+// Canonicalizes to the LAST alias (the newest CIK) since that's the one
+// future filings will keep using. Reports for a ticker with no alias entry
+// are returned as-is -- zero behavior change for every other ticker.
+function normalizeCikContinuity(symbol, reports) {
+  const aliases = CIK_CONTINUITY_ALIASES[symbol];
+  if (!aliases || !reports || !reports.length) return reports;
+  const aliasSet = new Set(aliases.map(canonicalCikDigits));
+  const canonicalCik = aliases[aliases.length - 1];
+  return reports.map((r) => (r?.cik != null && aliasSet.has(canonicalCikDigits(r.cik)) ? { ...r, cik: canonicalCik } : r));
+}
+
 async function fetchMetricsFor(symbol, apiKey) {
   const requestSymbol = DUAL_CLASS_ALIASES[symbol] || symbol;
   const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/metric?symbol=${requestSymbol}&metric=all&token=${apiKey}`);
@@ -2589,14 +2653,37 @@ async function processSymbol(symbol, apiKey, ctx) {
   ) {
     if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG enrichment triggered for', symbol, 'q=', quarterlyFinancials.length, 'a=', annualReportedFinancials.length);
     try {
-      const cik = ctx.secTickerToCikMap?.get(symbol.toUpperCase());
-      if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG cik lookup', symbol.toUpperCase(), '->', cik);
-      if (cik) {
+      const mappedCik = ctx.secTickerToCikMap?.get(symbol.toUpperCase());
+      if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG cik lookup', symbol.toUpperCase(), '->', mappedCik);
+      // Normally just the one ticker-mapped CIK. For a CIK_CONTINUITY_ALIASES
+      // ticker, ALSO enrich from every other aliased CIK -- verified live
+      // for DMRC: the ticker-mapped (newest) CIK's companyfacts alone only
+      // covers Q2'26 onward, but Finnhub's own crawl for the OLD CIK is
+      // separately stale too (missing Q4'25/Q1'26, which SEC has had since
+      // 2026-05-13) -- without this, decumulateYtdByYear has no real Q1'26
+      // standalone quarter to subtract the new CIK's H1'26 cumulative
+      // synthetic entry against, and the gap silently doesn't close.
+      // fetchSecUsGaapFacts requires a 10-digit zero-padded CIK (its URL
+      // construction does no padding itself) -- pad every candidate before
+      // deduping, since mappedCik already arrives padded (from
+      // secTickerToCikMap) while CIK_CONTINUITY_ALIASES entries are plain
+      // unpadded numeric strings.
+      const ciksToEnrich = new Set(
+        [mappedCik, ...(CIK_CONTINUITY_ALIASES[symbol] || [])].filter(Boolean).map((cik) => canonicalCikDigits(cik).padStart(10, '0'))
+      );
+      let combinedSynthesized = { quarterlyReports: [], annualReports: [] };
+      for (const cik of ciksToEnrich) {
         const gaapFacts = await fetchSecUsGaapFacts(cik);
-        if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG gaapFacts concepts', Object.keys(gaapFacts).length);
+        if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG gaapFacts concepts for cik', cik, Object.keys(gaapFacts).length);
         const synthesized = buildSecSyntheticReports(gaapFacts, cik);
-        if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG synthesized', synthesized.quarterlyReports.length, synthesized.annualReports.length);
-        const merged = mergeSyntheticReports(quarterlyFinancials, annualReportedFinancials, synthesized);
+        if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG synthesized for cik', cik, synthesized.quarterlyReports.length, synthesized.annualReports.length);
+        combinedSynthesized = {
+          quarterlyReports: [...combinedSynthesized.quarterlyReports, ...synthesized.quarterlyReports],
+          annualReports: [...combinedSynthesized.annualReports, ...synthesized.annualReports],
+        };
+      }
+      if (combinedSynthesized.quarterlyReports.length || combinedSynthesized.annualReports.length) {
+        const merged = mergeSyntheticReports(quarterlyFinancials, annualReportedFinancials, combinedSynthesized);
         quarterlyFinancials = merged.quarterlyReports;
         annualReportedFinancials = merged.annualReports;
         if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG merged totals', quarterlyFinancials.length, annualReportedFinancials.length);
@@ -2606,6 +2693,15 @@ async function processSymbol(symbol, apiKey, ctx) {
       // Non-fatal — same graceful-degradation philosophy as the fetches above.
     }
   }
+
+  // CIK-continuity normalization — see CIK_CONTINUITY_ALIASES' own comment.
+  // A no-op for every ticker except the small explicit allowlist; applied
+  // after SEC enrichment (so a reorg's new-CIK synthesized reports are
+  // included) and before cross-cadence derivation / the 12 builders (so
+  // every decumulateYtdByYear ticker-recycling guard sees one consistent
+  // CIK for both the old and new filer entity).
+  quarterlyFinancials = normalizeCikContinuity(symbol, quarterlyFinancials);
+  annualReportedFinancials = normalizeCikContinuity(symbol, annualReportedFinancials);
 
   // Cross-cadence derivation — fills a missing quarter/year using ONLY real
   // arithmetic on already-known real (or SEC-enriched, from above) facts,
