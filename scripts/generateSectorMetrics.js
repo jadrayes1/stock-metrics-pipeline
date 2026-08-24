@@ -1148,7 +1148,21 @@ function findReportedCapexQ(cfItems) {
   const labelMatch = cfItems.find((item) =>
     /purchases? of property|payments? (for|to) acquire (other )?property|capital expenditures|capital spending|capital improvements|flight equipment/i.test(item.label || '')
   );
-  return labelMatch ? labelMatch.value : null;
+  if (labelMatch) return labelMatch.value;
+  // No capex line found -- treat as a real $0 (not missing data) ONLY when
+  // this filer's cash-flow statement has no "Investing Activities" section
+  // at all, rather than genuinely lacking a capex line within a section
+  // that DOES exist. Verified live: Spero Therapeutics (SPRO), an early-
+  // stage biotech with no property/equipment purchases of any kind, has
+  // literally no investing-activities subtotal in 6 consecutive quarters
+  // checked -- fcfMargin/P-FCF were permanently null for a real, current
+  // company with nothing wrong except capex being genuinely zero. A filer
+  // that DOES have an investing section but whose capex line just isn't
+  // recognized by the patterns above still correctly returns null here --
+  // this only fires when there's no investing section to have missed a
+  // line in.
+  const hasInvestingSection = cfItems.some((item) => /investing activities/i.test(item.label || ''));
+  return hasInvestingSection ? null : 0;
 }
 
 // Mirrors decumulateYtdByYear in src/utils/metrics.js — a 10-Q reports P&L
