@@ -51,8 +51,20 @@ function applyDcfCap(metrics, targets) {
       }
     } else if (target?.reason === 'fallback') {
       if (entry.estimatedFairValue == null) {
+        // Skip a target where high === low (both present) -- verified
+        // live: JTAI's real yfinance analyst_price_targets returns
+        // high=low=mean=median=$80 from exactly ONE analyst opinion, a
+        // stale figure never adjusted for a later reverse split, ~50x the
+        // real price. Independent analysts essentially never land on the
+        // exact same price, so an identical high/low is a reliable, free
+        // (no extra API call needed) signal of single/degenerate coverage
+        // not worth trusting as a fair-value fill. Doesn't affect the
+        // 'cap' path above -- that only ever LOWERS an already-too-high
+        // DCF estimate, a fundamentally safer use of a shaky target than
+        // fabricating a brand-new estimate from it.
+        const degenerateCoverage = typeof target.high === 'number' && typeof target.low === 'number' && target.high === target.low;
         const midRange = computeMidRange(target);
-        if (midRange != null) {
+        if (midRange != null && !degenerateCoverage) {
           entry.estimatedFairValue = midRange;
           entry.estimatedFairValueSource = 'analystConsensus';
           filled++;

@@ -125,19 +125,29 @@ function findReportedOperatingCashFlowQ(cfItems) {
 // Mirrors findReportedCapex in src/utils/metrics.js — see that file for the
 // full rationale behind each concept (Ford's distinct
 // PaymentsToAcquireProductiveAssets, REITs' PaymentsForCapitalImprovements,
-// NUTX's PaymentsToAcquireOtherPropertyPlantAndEquipment).
+// NUTX's PaymentsToAcquireOtherPropertyPlantAndEquipment,
+// PaymentsForFlightEquipment/PaymentsToAcquireOtherProductiveAssets for
+// airlines like DAL).
 function findReportedCapexQ(cfItems) {
-  for (const concept of [
+  const concepts = [
     'us-gaap_PaymentsToAcquirePropertyPlantAndEquipment',
     'us-gaap_PaymentsToAcquireProductiveAssets',
     'us-gaap_PaymentsForCapitalImprovements',
     'us-gaap_PaymentsToAcquireOtherPropertyPlantAndEquipment',
-  ]) {
-    const match = cfItems.find((item) => item.concept === concept);
-    if (match) return match.value;
-  }
+    'us-gaap_PaymentsForFlightEquipment',
+    'us-gaap_PaymentsToAcquireOtherProductiveAssets',
+  ];
+  // Summed rather than first-match — verified live: DAL splits its real
+  // capex across TWO simultaneous lines ("Flight equipment, including
+  // advance payments" + "Ground property and equipment, including
+  // technology"), never a single combined figure. Returning just the
+  // first match would understate real capex by ~15-20% for DAL
+  // specifically; summing is a no-op for the common case where a filer
+  // only ever tags one of these concepts.
+  const matches = cfItems.filter((item) => concepts.includes(item.concept));
+  if (matches.length) return matches.reduce((sum, item) => sum + item.value, 0);
   const labelMatch = cfItems.find((item) =>
-    /purchases? of property|payments? (for|to) acquire (other )?property|capital expenditures|capital spending|capital improvements/i.test(item.label || '')
+    /purchases? of property|payments? (for|to) acquire (other )?property|capital expenditures|capital spending|capital improvements|flight equipment/i.test(item.label || '')
   );
   return labelMatch ? labelMatch.value : null;
 }
