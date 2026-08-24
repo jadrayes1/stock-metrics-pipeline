@@ -2313,7 +2313,31 @@ function decodeTrendQualifiedMask(mask) {
  * feature's purpose better than showing nothing (or just one pick) for
  * all but a handful of industries.
  */
-function computeIndustryLeaders(metrics, profiles) {
+// A ticker whose SEC reporting has permanently stopped (e.g. Form 15-12G
+// deregistration -- verified live: CAAS filed one 2025-09-17, its last
+// real 10-Q was 2025-08-13, nothing since and legally nothing more will
+// come) still carries real, non-null scalar metrics.[symbol] values --
+// pickMetricValue has no recency check, by design (see its own comment:
+// a transient gap shouldn't blank a real published value), so a
+// permanently-stale ticker's LAST real numbers just sit there forever,
+// looking exactly like a healthy, current company to a naive eligibility
+// check. Reuses the SAME isRecentEnough gate already built for trend
+// series, checked across every comparable metric (not just
+// revenueGrowth) -- verified live this matters: NEE's own revenueGrowth/
+// profitMargin/fcfMargin trends (quarterly AND TTM) are all genuinely
+// empty due to a narrow, unrelated extraction gap, while its ROIC trend
+// reaches Q1 '26 (clearly a current, actively-reporting company, not a
+// delisted one) -- checking revenueGrowth alone would have wrongly
+// excluded it. A ticker with NO recent activity in ANY of the 6
+// comparable metrics, across both cadences, is excluded.
+function hasRecentTrendActivity(symbol, quarterlyTrends, ttmTrends) {
+  for (const key of COMPARABLE_KEYS) {
+    if (isRecentEnough(quarterlyTrends?.[symbol]?.[key]) || isRecentEnough(ttmTrends?.[symbol]?.[key])) return true;
+  }
+  return false;
+}
+
+function computeIndustryLeaders(metrics, profiles, quarterlyTrends, ttmTrends) {
   const byIndustry = {};
   for (const [symbol, data] of Object.entries(metrics)) {
     if (!data.industry) continue;
@@ -2343,7 +2367,9 @@ function computeIndustryLeaders(metrics, profiles) {
     // already excludes banks from that metric), effectively excluding the
     // entire industry from ever having a real leader.
     const requiredKeys = isFinancialIndustry(industry) ? COMPARABLE_KEYS.filter((k) => k !== 'fcfMargin') : COMPARABLE_KEYS;
-    const eligible = symbols.filter((s) => requiredKeys.every((k) => metrics[s][k] !== null && metrics[s][k] !== undefined));
+    const eligible = symbols.filter(
+      (s) => requiredKeys.every((k) => metrics[s][k] !== null && metrics[s][k] !== undefined) && hasRecentTrendActivity(s, quarterlyTrends, ttmTrends)
+    );
     if (!eligible.length) continue;
 
     const scored = eligible.map((symbol) => {
@@ -2361,7 +2387,48 @@ function computeIndustryLeaders(metrics, profiles) {
     });
 
     scored.sort((a, b) => b.adjustedScore - a.adjustedScore);
-    const top = scored.slice(0, MAX_LEADERS_PER_INDUSTRY);
+    // Dedupe dual-class share pairs (e.g. BF.A/BF.B, MKC/MKC.V) -- verified
+    // live in Beverages/Food Products: these appear as separate leaders
+    // with the IDENTICAL composite score (DUAL_CLASS_ALIASES redirects
+    // them to the same underlying ratios, so they're never genuinely
+    // distinguishable candidates), wasting a slot that could go to a
+    // different real company. Two tiers:
+    //  1. For a pair listed in DUAL_CLASS_ALIASES, always prefer the
+    //     declared canonical (the map's VALUE) -- "keep whichever sorted
+    //     first" alone isn't enough: verified live MKC.V got kept over
+    //     MKC purely from tie-break happenstance in equal-score sort
+    //     order, even though the alias map explicitly designates MKC
+    //     as canonical.
+    //  2. A pair that shares the EXACT same composite score but isn't in
+    //     the static alias list at all (verified live: SENEA/SENEB --
+    //     Seneca Foods -- not currently listed) is still almost
+    //     certainly the same underlying company; grouped by composite
+    //     as a general safety net, preferring the alphabetically-first
+    //     symbol since there's no declared canonical to defer to.
+    const byIdentity = new Map();
+    const order = [];
+    for (const s of scored) {
+      const key = DUAL_CLASS_ALIASES[s.symbol] || s.symbol;
+      const existing = byIdentity.get(key);
+      if (!existing) {
+        byIdentity.set(key, s);
+        order.push(key);
+      } else if (DUAL_CLASS_ALIASES[existing.symbol] && !DUAL_CLASS_ALIASES[s.symbol]) {
+        byIdentity.set(key, s); // swap in the true canonical form
+      }
+    }
+    let deduped = order.map((k) => byIdentity.get(k));
+    // Choose the alphabetically-first symbol to REPRESENT each identical-
+    // composite-score group first, then filter -- doing filter-then-sort
+    // instead would keep whichever symbol happened to appear first in
+    // processing order, not a deterministic choice.
+    const bestForComposite = new Map();
+    for (const s of deduped) {
+      const existing = bestForComposite.get(s.composite);
+      if (!existing || s.symbol.localeCompare(existing.symbol) < 0) bestForComposite.set(s.composite, s);
+    }
+    deduped = deduped.filter((s) => bestForComposite.get(s.composite) === s);
+    const top = deduped.slice(0, MAX_LEADERS_PER_INDUSTRY);
     leaders.push({
       industry,
       peerCount: symbols.length,
@@ -2863,7 +2930,7 @@ async function main() {
     console.log(`Recovered ${recoveredFromFailure} hard-failed tickers' previously-published data (never regress a ticker to nothing).`);
   }
 
-  const industryLeaders = computeIndustryLeaders(metrics, profiles);
+  const industryLeaders = computeIndustryLeaders(metrics, profiles, quarterlyTrends, ttmTrends);
   const totalLeaderTickers = industryLeaders.reduce((sum, entry) => sum + entry.leaders.length, 0);
   const shortLeaderIndustries = industryLeaders.filter((entry) => entry.leaders.length < MIN_LEADERS_PER_INDUSTRY).length;
   console.log(
