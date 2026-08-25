@@ -46,7 +46,13 @@ const OUTPUT_FILE = path.join(__dirname, '../pfcfTrendCache.json');
 const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/marketMetrics.json';
 const GIST_PFCF_TREND_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/pfcfTrendCache.json';
 
-const FINNHUB_REQUEST_SPACING_MS = 1100; // ~54/min, under Finnhub's 60/min free-tier cap — same budget as generateSectorMetrics.js
+// Widened from 1100ms (~54.5/min, a ~9% margin) to match
+// generateSectorMetrics.js's 2026-08-25 change — that pipeline's own runs
+// showed a flat inter-request delay isn't a hard token-bucket, so normal
+// jitter can still trip 429s even under a nominal 60/min average. This
+// script's overall pacing is dominated by TWELVEDATA_REQUEST_SPACING_MS
+// below regardless, so the extra margin here is nearly free.
+const FINNHUB_REQUEST_SPACING_MS = 1350; // ~44.4/min, ~26% margin under Finnhub's 60/min free-tier cap — same budget as generateSectorMetrics.js
 const TWELVEDATA_REQUEST_SPACING_MS = 8000; // ~7.5/min, under Twelve Data's free-tier 8/min cap
 const MAX_TWELVEDATA_CALLS_PER_RUN = 700; // leaves buffer under Twelve Data's 800/day free-tier cap for this key
 const TIME_BUDGET_MS = 6 * 60 * 60 * 1000; // safety net alongside the call cap above; leaves headroom under the workflow's 7hr timeout-minutes

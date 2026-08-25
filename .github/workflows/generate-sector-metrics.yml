@@ -35,19 +35,32 @@
 # for two reasons:
 #   1. A Gist's visibility doesn't depend on the repo that updates it, so
 #      the app's source can stay private while this feed stays public.
-#   2. This job takes ~6.5-7.5 hours on a single Finnhub key (four calls per
-#      ticker — the third is for the estimated-fair-value DCF, the fourth
-#      is quarterly financials-reported, now fetched for every ticker
-#      rather than just ones with a native-data gap, so every metric's
-#      Quarterly/Yearly/TTM trend chart can load from a precomputed cache
-#      instead of live-reconstructing on first tap — rate-limited to stay
-#      under the free-tier 60/min cap PER KEY). If a second repository
-#      secret, FINNHUB_API_KEY_2, is set (a second, independent free
-#      Finnhub account), the script splits the ticker universe across one
-#      worker per key running concurrently, each pacing its own calls
-#      against its own key's 60/min budget — this roughly halves the
-#      runtime to ~3.25-3.75hrs. Optional: the job runs fine on one key,
-#      just slower. Public repos get unlimited free GitHub Actions minutes
+#   2. This job's pure API-pacing time is ~7.7hrs on a single Finnhub key
+#      (four calls per ticker — the third is for the estimated-fair-value
+#      DCF, the fourth is quarterly financials-reported, now fetched for
+#      every ticker rather than just ones with a native-data gap, so every
+#      metric's Quarterly/Yearly/TTM trend chart can load from a
+#      precomputed cache instead of live-reconstructing on first tap — see
+#      REQUEST_SPACING_MS in generateSectorMetrics.js for the pacing/cap
+#      math). If a second repository secret, FINNHUB_API_KEY_2, is set (a
+#      second, independent free Finnhub account), the script splits the
+#      ticker universe across one worker per key running concurrently, each
+#      pacing its own calls against its own key's budget — this roughly
+#      halves the pure-pacing time to ~3.9hrs. Optional: the job runs fine
+#      on one key, just slower.
+#
+#      IMPORTANT — pure pacing is not the whole story: real 2-key runs have
+#      consistently taken 4.7-4.9hrs even when nothing 429s, and multiple
+#      runs have exceeded GitHub's hard 6-hour per-job ceiling for hosted
+#      runners (confirmed live 2026-08-25 — this is a platform limit, NOT
+#      this job's own `timeout-minutes: 600` below, which is longer and
+#      irrelevant here) after a 429-driven retry/backoff cascade (see
+#      fetchFinnhub's own comment) added another 60-90+ min on top. The
+#      ~3.25-3.75hr figure that used to be documented here was a pure-pacing
+#      estimate that was never actually observed in a real run — treat any
+#      estimate in this comment with real live runs, not just arithmetic,
+#      until it's re-verified after the REQUEST_SPACING_MS widening above.
+#      Public repos get unlimited free GitHub Actions minutes
 #      on standard runners; private repos only get a limited monthly
 #      allowance, which a daily multi-hour job would blow through fast.
 #
@@ -79,15 +92,17 @@ on:
   schedule:
     # 00:00 UTC (~8pm US Eastern the prior night). Moved earlier from 02:00
     # UTC (which itself was moved from 08:00 — see git history) after adding
-    # full Quarterly/Yearly/TTM trend caching pushed runtime from ~5.5hrs to
-    # an estimated ~6.5-7.5hrs (quarterly financials-reported is now fetched
-    # for every ticker, not just gap ones). Combined with GitHub's observed
-    # 2h36m-3h24m scheduled-run start delay on this public repo, the old
-    # 02:00 UTC start risked landing at or after 9am ET market open in a
-    # worst case instead of comfortably before it. This start time is a
-    # proactive estimate, not yet measured against a real run at the new
-    # runtime — re-tune if the actual finish time cuts it closer than
-    # expected once real data comes in.
+    # full Quarterly/Yearly/TTM trend caching pushed runtime up (quarterly
+    # financials-reported is now fetched for every ticker, not just gap
+    # ones). Real 2-key runs land in the 4.7-4.9hr range on a clean run, up
+    # to GitHub's hard 6-hour per-job ceiling on a bad one (see the runtime
+    # note near the top of this file) — even the worst case (00:00 UTC +
+    # GitHub's observed 2h36m-3h24m scheduled-run start delay + a full 6hr
+    # run) still lands around 09:24 UTC / ~5:24am ET, comfortably before
+    # 9:30am ET market open. Re-tune this start time if that margin ever
+    # tightens (a 3rd Finnhub key, or splitting this into two scheduled
+    # workflows, are the next levers if the 6-hour ceiling keeps getting hit
+    # after REQUEST_SPACING_MS's 2026-08-25 widening).
     - cron: '0 0 * * *'
   workflow_dispatch: {}
 

@@ -126,7 +126,19 @@ const OUTPUT_TRENDS_TTM_FILE = path.join(__dirname, '../src/data/trendsTtm.json'
 // separate workflow steps between "Generate dataset" and "Publish to gist"
 // so a yfinance failure never blocks the rest of the pipeline.
 const OUTPUT_DCF_CAP_CANDIDATES_FILE = path.join(__dirname, '../dcfCapCandidates.json');
-const REQUEST_SPACING_MS = 1100; // ~54/min, under Finnhub's 60/min free-tier cap
+// Finnhub's documented free-tier cap is 60 calls/min (confirmed against
+// their own docs and API — no documented sub-minute burst allowance).
+// 1100ms (~54.5/min, a ~9% margin) was tuned to that cap directly, but real
+// runs have repeatedly hit scattered 429s even at this pace on a single,
+// otherwise-idle key (see fetchFinnhub's own comment on run 31755628636) —
+// setTimeout-based spacing isn't a hard token-bucket, so normal network/GC
+// jitter across a multi-hour run can burst a request or two past the
+// nominal rate even when the AVERAGE stays under it. Each 429 that
+// exhausts FINNHUB_MAX_429_RETRIES' backoff costs 14+ seconds before
+// giving up on that ticker entirely — cheap margin here is far cheaper
+// than paying for backoff cascades, so this trades a bit of steady-state
+// throughput for real headroom: ~44.4/min, a ~26% margin under the cap.
+const REQUEST_SPACING_MS = 1350;
 
 const ALLOWED_MICS = new Set(['XNAS', 'XNYS', 'XASE']); // NASDAQ, NYSE, NYSE American
 const ALLOWED_TYPES = new Set(['Common Stock', 'REIT']);
