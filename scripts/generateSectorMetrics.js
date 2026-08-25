@@ -1202,7 +1202,7 @@ function findSecValueForFyFp(gaapFacts, concepts, fy, fp, kind) {
   for (const concept of concepts) {
     const facts = gaapFacts[concept]?.units?.USD || [];
     const fact = kind === 'instant' ? pickInstantFact(facts, fy, fp) : pickDurationFact(facts, fy, fp);
-    if (fact) return { value: fact.val, concept: `us-gaap_${concept}` };
+    if (fact) return { value: fact.val, concept: `us-gaap_${concept}`, end: fact.end };
   }
   return null;
 }
@@ -1254,25 +1254,45 @@ function buildSecSyntheticReports(gaapFacts, cik) {
   const quarterNumber = { Q1: 1, Q2: 2, Q3: 3, Q4: 4 };
 
   for (const { fy, fp } of fyFpKeys) {
-    const icItems = [findSecValueForFyFp(gaapFacts, SEC_REVENUE_CONCEPTS, fy, fp, 'duration'), findSecValueForFyFp(gaapFacts, SEC_NET_INCOME_CONCEPTS, fy, fp, 'duration')]
-      .filter(Boolean)
-      .map((r) => ({ concept: r.concept, label: `${r.concept} (SEC XBRL enrichment)`, value: r.value }));
+    const revenueFact = findSecValueForFyFp(gaapFacts, SEC_REVENUE_CONCEPTS, fy, fp, 'duration');
+    const netIncomeFact = findSecValueForFyFp(gaapFacts, SEC_NET_INCOME_CONCEPTS, fy, fp, 'duration');
+    const icItems = [revenueFact, netIncomeFact].filter(Boolean).map((r) => ({ concept: r.concept, label: `${r.concept} (SEC XBRL enrichment)`, value: r.value }));
     const ebitFact = findSecValueForFyFp(gaapFacts, SEC_EBIT_CONCEPTS, fy, fp, 'duration') || findSecValueForFyFp(gaapFacts, SEC_PRETAX_INCOME_CONCEPTS, fy, fp, 'duration');
     if (ebitFact) icItems.push({ concept: ebitFact.concept, label: `${ebitFact.concept} (SEC XBRL enrichment)`, value: ebitFact.value });
 
-    const cfItems = [findSecValueForFyFp(gaapFacts, SEC_OCF_CONCEPTS, fy, fp, 'duration'), findSecValueForFyFp(gaapFacts, SEC_CAPEX_CONCEPTS, fy, fp, 'duration')]
-      .filter(Boolean)
-      .map((r) => ({ concept: r.concept, label: `${r.concept} (SEC XBRL enrichment)`, value: r.value }));
+    const ocfFact = findSecValueForFyFp(gaapFacts, SEC_OCF_CONCEPTS, fy, fp, 'duration');
+    const capexFact = findSecValueForFyFp(gaapFacts, SEC_CAPEX_CONCEPTS, fy, fp, 'duration');
+    const cfItems = [ocfFact, capexFact].filter(Boolean).map((r) => ({ concept: r.concept, label: `${r.concept} (SEC XBRL enrichment)`, value: r.value }));
 
-    const bsItems = [findSecValueForFyFp(gaapFacts, SEC_EQUITY_CONCEPTS, fy, fp, 'instant'), findSecValueForFyFp(gaapFacts, SEC_CASH_CONCEPTS, fy, fp, 'instant')].filter(Boolean);
+    const equityFact = findSecValueForFyFp(gaapFacts, SEC_EQUITY_CONCEPTS, fy, fp, 'instant');
+    const cashFact = findSecValueForFyFp(gaapFacts, SEC_CASH_CONCEPTS, fy, fp, 'instant');
+    const bsItems = [equityFact, cashFact].filter(Boolean);
+    let debtFact = null;
     for (const debtConcept of SEC_DEBT_CONCEPTS) {
-      const debtFact = findSecValueForFyFp(gaapFacts, [debtConcept], fy, fp, 'instant');
-      if (debtFact) bsItems.push(debtFact); // one item per matched debt concept — sumDebt already sums across concepts, not pre-summed here
+      const fact = findSecValueForFyFp(gaapFacts, [debtConcept], fy, fp, 'instant');
+      if (fact) {
+        bsItems.push(fact); // one item per matched debt concept — sumDebt already sums across concepts, not pre-summed here
+        debtFact = debtFact || fact;
+      }
     }
     const bsReportItems = bsItems.map((r) => ({ concept: r.concept, label: `${r.concept} (SEC XBRL enrichment)`, value: r.value }));
 
     if (!icItems.length && !cfItems.length && !bsReportItems.length) continue;
-    const entry = { cik: normalizedCik, form: 'SEC-XBRL', report: { ic: icItems, cf: cfItems, bs: bsReportItems } };
+
+    // A real end date lets buildCalendarLabelsByFiscalKey compute a
+    // calendar-correct label for a synthesized entry exactly the same way
+    // it already does for real Finnhub reports -- without this, a
+    // synthesized entry silently fell back to the raw fiscal Q/year label
+    // (the very bug this whole mechanism exists to fix), verified live for
+    // STZ: its most recent quarter is Finnhub-crawl-stale and gets filled
+    // in here, but was showing "Q1 '27" (STZ's raw fiscal tag) instead of
+    // the real calendar quarter it ends in. Every candidate fact for the
+    // same (fy, fp) covers the same real period, so the first one found is
+    // as good as any other -- duration facts checked first since income-
+    // statement concepts are the most commonly available.
+    const endDate = revenueFact?.end || netIncomeFact?.end || ebitFact?.end || ocfFact?.end || capexFact?.end || equityFact?.end || cashFact?.end || debtFact?.end || null;
+
+    const entry = { cik: normalizedCik, form: 'SEC-XBRL', report: { ic: icItems, cf: cfItems, bs: bsReportItems }, endDate };
     if (fp === 'FY') annualReports.push({ ...entry, year: fy });
     else if (quarterNumber[fp]) quarterlyReports.push({ ...entry, year: fy, quarter: quarterNumber[fp] });
   }
