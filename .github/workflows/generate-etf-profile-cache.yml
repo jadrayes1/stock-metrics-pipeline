@@ -1,0 +1,111 @@
+# Pre-fetches ETF Expense Ratio + AUM from Alpha Vantage, published to the
+# SAME public Gist as marketMetrics.json (see generate-sector-metrics.yml)
+# as a second file, etfProfileCache.json — see scripts/generateEtfProfileCache.js
+# for the full rationale (Alpha Vantage's free tier is a hard 25 requests/day,
+# shared across every app user through one server-side key, so a live-only
+# design would only ever serve the first 25 distinct ETF lookups each day).
+#
+# Runs on its own daily schedule rather than as a step on the main
+# sector-metrics job — different provider/budget entirely (Alpha Vantage,
+# not Finnhub), no reason to couple their timing or let one job's failure
+# affect the other.
+#
+# One-time setup required (this workflow can't do it for you):
+#   1. Add a repository secret named ALPHA_VANTAGE_API_KEY — free signup,
+#      no card, at https://www.alphavantage.co/support/#api-key. This is a
+#      SEPARATE secret from the one already set on the stock-analyzer-proxy
+#      Vercel project (same key value works fine in both places, but each
+#      platform needs its own copy).
+#   2. Uses the existing GIST_ID/GIST_TOKEN secrets already configured for
+#      generate-sector-metrics.yml — no additional setup needed for those.
+
+name: Generate ETF profile cache
+
+on:
+  schedule:
+    - cron: '0 20 * * *' # ~4pm US Eastern — offset from the other jobs sharing this repo's runners
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Generate ETF profile cache
+        env:
+          ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
+        run: node scripts/generateEtfProfileCache.js
+
+      - name: Publish to gist
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          gh gist edit "${{ secrets.GIST_ID }}" --filename etfProfileCache.json etfProfileCache.json || \
+          gh gist edit "${{ secrets.GIST_ID }}" --add etfProfileCache.json
+
+      - name: Report failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = 'etf-profile-pipeline-failure';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: label,
+            });
+            if (open.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: open[0].number,
+                body: `Failed again: ${runUrl}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'ETF-profile-cache pipeline failed',
+                body: `The ETF profile cache generation run failed.\n\nRun: ${runUrl}\n\nCheck the ALPHA_VANTAGE_API_KEY, GIST_TOKEN, and GIST_ID secrets, and Alpha Vantage's API status. Note: this is separate from the main sector-metrics pipeline — that one is unaffected.`,
+                labels: [label],
+              });
+            }
+
+      - name: Close failure issue on success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = 'etf-profile-pipeline-failure';
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: label,
+            });
+            for (const issue of open) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: 'ETF-profile-cache pipeline succeeded again — closing.',
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+              });
+            }
