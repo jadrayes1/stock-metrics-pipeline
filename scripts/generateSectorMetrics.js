@@ -851,7 +851,16 @@ function extractDcfInputs(reportedFinancials, industry) {
 // plural "Revenues" label; an open-ended prefix match catches that AND any
 // future suffix variant we haven't individually seen yet, rather than
 // growing an exact-match list one ticker at a time).
-const REVENUE_CONCEPT_CANDIDATES = ['us-gaap_RevenuesNetOfInterestExpense', 'us-gaap_Revenues', 'us-gaap_SalesRevenueNet'];
+// "RevenuesExcludingInterestAndDividends" added -- verified live: UVV
+// (Universal Corp) tags its real revenue line ("Sales and other operating
+// revenues") under this concept, not covered by any of the other
+// candidates, the contract-revenue prefix check, or the anchored label
+// pattern below (that label doesn't match any of them). Every revenue-
+// dependent metric (revenueGrowth, fcfMargin's revenue denominator, etc.)
+// silently stopped at whatever year UVV adopted this concept, while
+// earlier years (tagged under a covered concept) kept working -- looked
+// like a hard cutoff, not a "no data" gap.
+const REVENUE_CONCEPT_CANDIDATES = ['us-gaap_RevenuesNetOfInterestExpense', 'us-gaap_Revenues', 'us-gaap_SalesRevenueNet', 'us-gaap_RevenuesExcludingInterestAndDividends'];
 
 // ---------------------------------------------------------------------------
 // SEC XBRL fallback for revenue-growth gaps — Finnhub's own financials-
