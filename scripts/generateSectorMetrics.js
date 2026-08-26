@@ -860,7 +860,16 @@ function extractDcfInputs(reportedFinancials, industry) {
 // silently stopped at whatever year UVV adopted this concept, while
 // earlier years (tagged under a covered concept) kept working -- looked
 // like a hard cutoff, not a "no data" gap.
-const REVENUE_CONCEPT_CANDIDATES = ['us-gaap_RevenuesNetOfInterestExpense', 'us-gaap_Revenues', 'us-gaap_SalesRevenueNet', 'us-gaap_RevenuesExcludingInterestAndDividends'];
+// "RegulatedAndUnregulatedOperatingRevenue" added -- verified live: NJR
+// (New Jersey Resources) and NEE (NextEra Energy), both regulated
+// utilities, tag their real total-revenue line under this concept instead
+// of any of the others (their real labels, "Total operating revenues" /
+// "OPERATING REVENUES", don't match the anchored label pattern below
+// either, which only allows optional "total"/"net" prefixes, not
+// "operating"). A widespread utility-industry gap, not ticker-specific --
+// affects revenueGrowth directly and profitMargin/fcfMargin through their
+// shared revenue denominator.
+const REVENUE_CONCEPT_CANDIDATES = ['us-gaap_RevenuesNetOfInterestExpense', 'us-gaap_Revenues', 'us-gaap_SalesRevenueNet', 'us-gaap_RevenuesExcludingInterestAndDividends', 'us-gaap_RegulatedAndUnregulatedOperatingRevenue'];
 
 // ---------------------------------------------------------------------------
 // SEC XBRL fallback for revenue-growth gaps — Finnhub's own financials-
