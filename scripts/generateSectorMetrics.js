@@ -1137,7 +1137,7 @@ const SEC_PRETAX_INCOME_CONCEPTS = [
 ];
 const SEC_OCF_CONCEPTS = OPERATING_SUBTOTAL_CONCEPTS.map((c) => c.replace(/^us-gaap_/, ''));
 const SEC_CAPEX_CONCEPTS = ['PaymentsToAcquirePropertyPlantAndEquipment', 'PaymentsToAcquireProductiveAssets', 'PaymentsForCapitalImprovements', 'PaymentsToAcquireOtherPropertyPlantAndEquipment'];
-const SEC_EQUITY_CONCEPTS = ['StockholdersEquity'];
+const SEC_EQUITY_CONCEPTS = ['StockholdersEquity', 'StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest'];
 const SEC_DEBT_CONCEPTS = DEBT_CONCEPTS.map((c) => c.replace(/^us-gaap_/, ''));
 const SEC_CASH_CONCEPTS = ['CashAndCashEquivalentsAtCarryingValue', 'CashAndCashEquivalentsAtFairValue', 'Cash'];
 
@@ -1735,8 +1735,17 @@ function findReportedEBIT(icItems) {
   return preTaxConceptMatch ? preTaxConceptMatch.value : null;
 }
 
+// "IncludingPortionAttributableToNoncontrollingInterest" added -- verified
+// live: TPB (Turning Point Brands, which has a real minority interest —
+// see us-gaap_MinorityInterest in its own bs array) tags its TOTAL equity
+// line (including NCI) under this concept instead of plain
+// us-gaap_StockholdersEquity (attributable-to-parent-only), starting at
+// some point in its filing history -- older quarters still use the plain
+// concept, which is why only RECENT quarters were affected. The label
+// fallback below can't catch this either: Finnhub returns an EMPTY label
+// for this specific concept for TPB (verified live), not natural text.
 function findReportedTotalEquity(bsItems) {
-  const match = bsItems.find((item) => item.concept === 'us-gaap_StockholdersEquity');
+  const match = bsItems.find((item) => item.concept === 'us-gaap_StockholdersEquity' || item.concept === 'us-gaap_StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest');
   if (match) return match.value;
   const labelMatch = bsItems.find((item) => /total (share|stock)holders.{0,5}equity/i.test(item.label || ''));
   return labelMatch ? labelMatch.value : null;
