@@ -1694,7 +1694,16 @@ function findReportedNetIncome(icItems) {
 function findReportedEBIT(icItems) {
   const match = icItems.find((item) => item.concept === 'us-gaap_OperatingIncomeLoss');
   if (match) return match.value;
-  const labelMatch = icItems.find((item) => /operating income|income from operations/i.test(item.label || ''));
+  // Anchored to the WHOLE (trimmed) label, not a loose substring test --
+  // verified live this was a real bug: NECB (a bank) has a real line
+  // "Noninterest Income, Other Operating Income" ($40K, a small noninterest-
+  // income sub-category) which the old unanchored /operating income/i test
+  // matched as if it were the real Operating Income subtotal ($11.8M for
+  // the same quarter) -- a ~300x understatement that made ROIC compute to
+  // ~0.02% instead of the real ~10%, displaying as "0%". Same bug existed
+  // in src/utils/metrics.js's mirror and stock-analyzer's copy of this
+  // file -- fixed in all three.
+  const labelMatch = icItems.find((item) => /^(total\s+)?operating (income|loss)(\s*\(loss\))?$|^income\s*(\(loss\))?\s*from operations$/i.test((item.label || '').trim()));
   if (labelMatch) return labelMatch.value;
 
   // Banks and other financial-services filers don't report a standard
