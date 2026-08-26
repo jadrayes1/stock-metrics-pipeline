@@ -1360,7 +1360,19 @@ function mergeSyntheticReports(quarterlyReports, annualReports, synthesized) {
 }
 
 const REVENUE_CONTRACT_CONCEPT_PREFIX = 'us-gaap_RevenueFromContractWithCustomer';
-const REVENUE_CONTRACT_CONCEPT_EXCLUDE = /RemainingPerformanceObligation|Disaggregation|PolicyTextBlock|TableTextBlock|Liability|Asset|Member|Axis|Domain/i;
+// "ExtensibleList" added -- verified live: TASK (TaskUs) tags
+// us-gaap_RevenueFromContractWithCustomerProductAndServiceExtensibleList
+// with a spurious value of 0 (an XBRL "Extensible Enumeration" -- a
+// qualifying/dimensional tag describing WHICH revenue stream a line item
+// belongs to, not a real dollar amount) alongside its real revenue concept
+// (RevenueFromContractWithCustomerExcludingAssessedTax, real value
+// $306.3M). Since this bogus concept comes FIRST in Finnhub's array and
+// .find() returns the first match, revenue was resolving to a literal 0
+// instead of the real figure -- everything downstream that divides BY
+// revenue (profitMargin, fcfMargin) or diffs it (revenueGrowth) silently
+// produced Infinity/NaN, which then gets filtered out entirely, looking
+// like "no data" rather than a wrong-value bug.
+const REVENUE_CONTRACT_CONCEPT_EXCLUDE = /RemainingPerformanceObligation|Disaggregation|PolicyTextBlock|TableTextBlock|Liability|Asset|Member|Axis|Domain|ExtensibleList/i;
 const REVENUE_LABEL_PATTERN = /^(total\s+)?(net\s+)?revenues?(,?\s*net)?$|^(total\s+)?net\s+sales$/i;
 
 function findReportedRevenue(icItems) {
