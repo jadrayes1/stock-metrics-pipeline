@@ -49,6 +49,10 @@ const ETF_UNIVERSE = [
   'SPY', 'VOO', 'IVV', 'VTI', 'QQQ', 'QQQM', 'DIA', 'IWM', 'IWB', 'IJH', 'IJR', 'VUG', 'VTV', 'VB', 'VO', 'MDY',
   // Sector SPDRs
   'XLK', 'XLF', 'XLE', 'XLV', 'XLY', 'XLP', 'XLI', 'XLB', 'XLU', 'XLRE', 'XLC',
+  // Sector alternatives (Vanguard/iShares) -- mirrors SECTOR_ETF_GROUPS in
+  // stock-analyzer's src/api/etfData.js, kept in sync manually (same
+  // cross-repo duplication precedent as DUAL_CLASS_ALIASES)
+  'VGT', 'IYW', 'VFH', 'IYF', 'VDE', 'IYE', 'VHT', 'IYH', 'VCR', 'IYC', 'VDC', 'IYK', 'VIS', 'IYJ', 'VAW', 'IYM', 'VPU', 'IDU', 'VOX', 'IYZ',
   // Sector / thematic (semis, software, biotech)
   'SOXX', 'SMH', 'IGV', 'XBI', 'IBB', 'KRE', 'XOP', 'XHB', 'ITB',
   // Bonds
