@@ -27,10 +27,23 @@ Writes: analystPriceTargets.json (repo root)
 
 import json
 import os
+import random
 import sys
 import time
 
 import yfinance as yf
+
+# Unbuffered stdout/stderr -- verified live 2026-08-26: this script's print()
+# calls were fully buffered (not line-buffered) once GitHub Actions
+# redirects stdout to a file rather than a TTY, so EVERY progress/error line
+# for the whole run only appeared in the log at process exit, all stamped
+# with the same exit timestamp. That made a real ~72-minute-and-growing
+# bottleneck (see TIME_BUDGET_SECONDS below) completely invisible while
+# investigating why the overall pipeline kept hitting GitHub's 6-hour job
+# ceiling -- this fixes the blind spot itself, not just the timing bug it
+# was hiding.
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 REPO_ROOT = os.path.join(os.path.dirname(__file__), "..")
 CANDIDATES_FILE = os.path.join(REPO_ROOT, "dcfCapCandidates.json")
@@ -39,6 +52,23 @@ OUTPUT_FILE = os.path.join(REPO_ROOT, "analystPriceTargets.json")
 # Conservative pacing against an unofficial, undocumented endpoint — no
 # published rate limit to target, just spacing requests out defensively.
 REQUEST_SLEEP_SECONDS = 1.0
+
+# Verified live 2026-08-26: 4,154 of 5,161 tickers (80%!) were flagged as
+# candidates in one real run -- at 1 request/sec that alone is ~70 minutes
+# BEFORE real per-request network latency, with no ceiling if the candidate
+# count grows further (e.g. from a future DCF-quality gate rejecting more
+# estimates into the 'fallback' bucket). Combined with the main Node
+# script's own multi-hour runtime, this unbounded step was a direct
+# contributor to the overall pipeline repeatedly hitting GitHub Actions'
+# hard 6-hour per-job ceiling (confirmed live: two consecutive runs
+# cancelled at exactly 6h0m20s). A capped, resumable-next-run budget here
+# mirrors the exact pattern already used for generateNewsCache.js's own
+# unbounded-candidate-set problem -- see that file's own TIME_BUDGET_MS.
+# applyDcfCap.js already treats a missing analyst target as a no-op (leaves
+# whatever estimatedFairValue was already there), so skipping some
+# candidates this run is not a correctness problem, same as it already
+# wasn't for generateNewsCache.js's own rotation.
+TIME_BUDGET_SECONDS = 45 * 60
 
 
 def main():
@@ -51,12 +81,26 @@ def main():
     with open(CANDIDATES_FILE) as f:
         candidates = json.load(f).get("candidates", {})
 
-    symbols = sorted(candidates.keys())
-    print(f"{len(symbols)} candidates to look up.")
+    # Shuffled, not alphabetical -- this script has no persistent state
+    # between runs (unlike generateNewsCache.js's least-recently-cached-
+    # first rotation), so a fixed order combined with a time budget would
+    # mean alphabetically-early tickers always get processed and
+    # alphabetically-late ones (Z-*, etc.) never do. A random seed each run
+    # gives every candidate a fair, roughly-equal chance of being covered
+    # over successive daily runs instead.
+    symbols = list(candidates.keys())
+    random.shuffle(symbols)
+    print(f"{len(symbols)} candidates to look up (budget: {TIME_BUDGET_SECONDS / 60:.0f} min).")
 
+    start_time = time.monotonic()
     targets = {}
     failed = 0
-    for i, symbol in enumerate(symbols):
+    processed = 0
+    for symbol in symbols:
+        if time.monotonic() - start_time > TIME_BUDGET_SECONDS:
+            print(f"Time budget ({TIME_BUDGET_SECONDS / 60:.0f} min) reached after {processed}/{len(symbols)} — stopping for this run.")
+            break
+
         try:
             info = yf.Ticker(symbol).analyst_price_targets
             high = info.get("high") if info else None
@@ -75,11 +119,11 @@ def main():
             failed += 1
             print(f"  skip {symbol}: {err}", file=sys.stderr)
 
-        if (i + 1) % 25 == 0 or i == len(symbols) - 1:
-            print(f"  {i + 1}/{len(symbols)} ({len(targets)} resolved, {failed} failed)")
+        processed += 1
+        if processed % 25 == 0 or processed == len(symbols):
+            print(f"  {processed}/{len(symbols)} ({len(targets)} resolved, {failed} failed)")
 
-        if i < len(symbols) - 1:
-            time.sleep(REQUEST_SLEEP_SECONDS)
+        time.sleep(REQUEST_SLEEP_SECONDS)
 
     with open(OUTPUT_FILE, "w") as f:
         json.dump({"generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "targets": targets}, f)
