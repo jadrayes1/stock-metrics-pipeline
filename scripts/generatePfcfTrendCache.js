@@ -188,9 +188,19 @@ function findReportedDilutedShares(icItems) {
   const basicLabelMatch = icItems.find((item) => /basic.*shares|weighted average.*basic/i.test(item.label || ''));
   if (basicLabelMatch) return basicLabelMatch.value;
 
+  // Falls back to EarningsPerShareBasic when EarningsPerShareDiluted isn't
+  // tagged at all -- verified live: SMID's real annual 10-K only discloses
+  // one combined line, "Basic and diluted earnings per share" (tagged as
+  // EarningsPerShareBasic — the filer has no dilutive securities, so basic
+  // and diluted genuinely are the same figure, not an approximation here).
+  // Without this, the yearly P/FCF trend was entirely empty despite the
+  // quarterly trend working fine (quarterly reports DO tag the real share
+  // count directly) — verified the derived value (netIncome/basicEps =
+  // 5,293,103) against SMID's own real quarterly diluted share count
+  // (5,307,000, same fiscal year) — within 0.3%.
   const netIncome = icItems.find((item) => item.concept === 'us-gaap_NetIncomeLoss');
-  const dilutedEps = icItems.find((item) => item.concept === 'us-gaap_EarningsPerShareDiluted');
-  if (netIncome?.value != null && dilutedEps?.value) return netIncome.value / dilutedEps.value;
+  const eps = icItems.find((item) => item.concept === 'us-gaap_EarningsPerShareDiluted') || icItems.find((item) => item.concept === 'us-gaap_EarningsPerShareBasic');
+  if (netIncome?.value != null && eps?.value) return netIncome.value / eps.value;
 
   return null;
 }
