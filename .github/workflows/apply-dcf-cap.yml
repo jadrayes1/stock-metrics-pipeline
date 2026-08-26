@@ -1,0 +1,156 @@
+# Applies the DCF cap/fallback treatment (real analyst price targets via
+# yfinance) that used to run as steps inside generate-sector-metrics.yml,
+# split out into its own workflow on 2026-08-26 — see that workflow's own
+# comment for why: the yfinance lookup alone was taking ~72 minutes with no
+# time budget (4,154 of ~5,161 tickers needed one), a direct contributor to
+# that job repeatedly hitting GitHub Actions' hard 6-hour ceiling.
+#
+# Splitting this out has a real correctness benefit beyond just timing: a
+# budget-capped version bolted onto the main job would only get through a
+# rotating SUBSET of candidates each day (whichever the random shuffle
+# picked before the budget ran out), leaving the rest stuck with whatever
+# they had until a later day's turn. Running standalone with a generous
+# budget (see TIME_BUDGET_SECONDS in fetchDcfCapTargets.py — 3 hours,
+# comfortably covers the current ~4,150-candidate volume with room to grow)
+# means EVERY candidate gets a fresh check on EVERY run instead.
+#
+# Reads dcfCapCandidates.json and marketMetrics.json from the gist (both
+# published by generate-sector-metrics.js's own run earlier the same day —
+# see that workflow's "Publish to gist" step), applies the cap/fallback,
+# and republishes the updated marketMetrics.json — same git-clone,
+# preserve-everything-else-untouched approach as the main workflow.
+#
+# Scheduled at 10:00 UTC — comfortably after the main pipeline's worst
+# realistic combined start-delay + runtime (00:00 UTC start + up to ~3h24m
+# GitHub scheduling delay + up to ~6h runtime lands around 09:24 UTC at the
+# very worst; this workflow doesn't need split-second freshness the way
+# "trending" data does, so the extra margin costs nothing). Re-tune if the
+# main pipeline's own schedule ever moves.
+#
+# One-time setup required (this workflow can't do these for you): none —
+# reuses the same GIST_ID/GIST_TOKEN secrets already configured for
+# generate-sector-metrics.yml. No Finnhub/Twelve Data/Alpha Vantage key
+# needed (yfinance requires no key; applyDcfCap.js is pure local JSON
+# manipulation).
+
+name: Apply DCF cap
+
+on:
+  schedule:
+    - cron: '0 10 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install yfinance
+        run: pip install yfinance
+
+      - name: Fetch candidates and current metrics from gist
+        run: |
+          mkdir -p src/data
+          curl -sf "https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/dcfCapCandidates.json" -o dcfCapCandidates.json
+          curl -sf "https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/marketMetrics.json" -o src/data/marketMetrics.json
+
+      - name: Fetch analyst price targets for DCF cap/fallback candidates
+        run: python3 scripts/fetchDcfCapTargets.py
+
+      - name: Apply DCF cap and mid-range fallback
+        run: node scripts/applyDcfCap.js
+
+      # Only marketMetrics.json changes here -- everything else in the gist
+      # (trend caches, coverageAudit.json, dcfCapCandidates.json itself)
+      # comes along unmodified from the fresh clone, since it's never
+      # touched locally before the orphan commit below.
+      - name: Publish updated metrics to gist
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: |
+          git clone --depth 1 "https://${GIST_TOKEN}@gist.github.com/${GIST_ID}.git" gist-clone
+          if diff -q src/data/marketMetrics.json gist-clone/marketMetrics.json >/dev/null 2>&1; then
+            echo "No changes to publish."
+          else
+            cp src/data/marketMetrics.json gist-clone/marketMetrics.json
+            cd gist-clone
+            git config user.email "actions@github.com"
+            git config user.name "stock-metrics-pipeline"
+            git checkout --orphan latest-snapshot
+            git add -A
+            git commit -m "Apply DCF cap $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git branch -M main
+            git push --force origin main
+          fi
+
+      - name: Report failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = 'dcf-cap-pipeline-failure';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: label,
+            });
+            if (open.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: open[0].number,
+                body: `Failed again: ${runUrl}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'Apply-DCF-cap pipeline failed',
+                body: `The DCF cap/fallback run failed.\n\nRun: ${runUrl}\n\nCheck the GIST_TOKEN/GIST_ID secrets, that generate-sector-metrics.yml published dcfCapCandidates.json today, and Yahoo Finance's status. Note: this is separate from the main sector-metrics pipeline — that one is unaffected.`,
+                labels: [label],
+              });
+            }
+
+      - name: Close failure issue on success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = 'dcf-cap-pipeline-failure';
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: label,
+            });
+            for (const issue of open) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: 'Apply-DCF-cap pipeline succeeded again — closing.',
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+              });
+            }

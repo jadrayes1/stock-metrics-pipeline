@@ -55,20 +55,25 @@ REQUEST_SLEEP_SECONDS = 1.0
 
 # Verified live 2026-08-26: 4,154 of 5,161 tickers (80%!) were flagged as
 # candidates in one real run -- at 1 request/sec that alone is ~70 minutes
-# BEFORE real per-request network latency, with no ceiling if the candidate
-# count grows further (e.g. from a future DCF-quality gate rejecting more
-# estimates into the 'fallback' bucket). Combined with the main Node
-# script's own multi-hour runtime, this unbounded step was a direct
-# contributor to the overall pipeline repeatedly hitting GitHub Actions'
-# hard 6-hour per-job ceiling (confirmed live: two consecutive runs
-# cancelled at exactly 6h0m20s). A capped, resumable-next-run budget here
-# mirrors the exact pattern already used for generateNewsCache.js's own
-# unbounded-candidate-set problem -- see that file's own TIME_BUDGET_MS.
+# BEFORE real per-request network latency. This used to run as a step
+# inside the main sector-metrics job, where it was a direct contributor to
+# that job repeatedly hitting GitHub Actions' hard 6-hour per-job ceiling
+# (confirmed live: two consecutive runs cancelled at exactly 6h0m20s) --
+# fixed THEN by capping this at 45 minutes, mirroring generateNewsCache.js's
+# own unbounded-candidate-set budget.
+#
+# Since then, this step was pulled out into its own standalone workflow
+# (apply-dcf-cap.yml) specifically so it no longer has to share a time
+# budget with the main pipeline at all -- see that workflow's own comment.
+# The budget here is now sized to comfortably finish the WHOLE candidate
+# list every run (current volume needs ~1.75hrs at 1 req/sec; 3hrs leaves
+# room for real growth) rather than to protect a neighbor's timing. Still
+# not fully unbounded -- a real ceiling is cheap insurance against a
+# genuinely runaway candidate count or Yahoo-side slowdown, and
 # applyDcfCap.js already treats a missing analyst target as a no-op (leaves
-# whatever estimatedFairValue was already there), so skipping some
-# candidates this run is not a correctness problem, same as it already
-# wasn't for generateNewsCache.js's own rotation.
-TIME_BUDGET_SECONDS = 45 * 60
+# whatever estimatedFairValue was already there), so hitting this budget on
+# a bad day is still not a correctness problem.
+TIME_BUDGET_SECONDS = 3 * 60 * 60
 
 
 def main():

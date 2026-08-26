@@ -127,32 +127,18 @@ jobs:
           FINNHUB_API_KEY_2: ${{ secrets.FINNHUB_API_KEY_2 }}
         run: node scripts/generateSectorMetrics.js
 
-      # DCF cap + fallback: for tickers whose DCF estimate came out >= 2x the
-      # current price (see DCF_CAP_CANDIDATE_MULTIPLE in
-      # generateSectorMetrics.js), or where DCF wasn't computable at all,
-      # look up the real analyst-consensus price target via yfinance and
-      # either cap the outlier estimate or fill the gap with the analyst
-      # mid-range. yfinance scrapes an undocumented Yahoo endpoint (no
-      # official API/rate limit for this data on Finnhub's free tier, which
-      # is what the rest of this pipeline uses) — `continue-on-error` on
-      # both steps below so a Yahoo-side failure (blocked IP, layout change,
-      # etc.) never blocks the rest of the pipeline from publishing;
-      # applyDcfCap.js also no-ops cleanly if analystPriceTargets.json was
-      # never written.
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install yfinance
-        continue-on-error: true
-        run: pip install yfinance
-
-      - name: Fetch analyst price targets for DCF cap/fallback candidates
-        continue-on-error: true
-        run: python3 scripts/fetchDcfCapTargets.py
-
-      - name: Apply DCF cap and mid-range fallback
-        run: node scripts/applyDcfCap.js
+      # DCF cap + fallback (real analyst price targets via yfinance,
+      # capping outlier estimates or filling gaps where DCF wasn't
+      # computable) used to run right here, but was pulled out into its own
+      # separate workflow (see apply-dcf-cap.yml) on 2026-08-26 — verified
+      # live that step alone was taking ~72 minutes (4,154 of ~5,161
+      # tickers needed a lookup) with no time budget, a direct contributor
+      # to this job repeatedly hitting GitHub Actions' hard 6-hour ceiling.
+      # Splitting it out also means EVERY candidate gets checked on every
+      # run of that workflow, rather than a bounded/rotating subset each
+      # day the way a budget-capped version bolted on here would have
+      # required. This job now only needs to publish dcfCapCandidates.json
+      # (below) so that workflow knows which tickers to look up.
 
       - name: Audit metric coverage
         run: node scripts/auditMetricsCoverage.js
@@ -188,7 +174,8 @@ jobs:
              diff -q src/data/trendsQuarterly.json gist-clone/trendsQuarterly.json >/dev/null 2>&1 && \
              diff -q src/data/trendsYearly.json gist-clone/trendsYearly.json >/dev/null 2>&1 && \
              diff -q src/data/trendsTtm.json gist-clone/trendsTtm.json >/dev/null 2>&1 && \
-             diff -q coverageAudit.json gist-clone/coverageAudit.json >/dev/null 2>&1; then
+             diff -q coverageAudit.json gist-clone/coverageAudit.json >/dev/null 2>&1 && \
+             diff -q dcfCapCandidates.json gist-clone/dcfCapCandidates.json >/dev/null 2>&1; then
             echo "No changes to publish."
           else
             cp src/data/marketMetrics.json gist-clone/marketMetrics.json
@@ -197,6 +184,12 @@ jobs:
             cp src/data/trendsYearly.json gist-clone/trendsYearly.json
             cp src/data/trendsTtm.json gist-clone/trendsTtm.json
             cp coverageAudit.json gist-clone/coverageAudit.json
+            # dcfCapCandidates.json is small (well under the Gist API's 1MB
+            # cap) but published via this same git-clone step, not a
+            # separate `gh gist edit` call, purely so it lands in the SAME
+            # commit/snapshot as marketMetrics.json — apply-dcf-cap.yml
+            # reads both together and they need to describe the same run.
+            cp dcfCapCandidates.json gist-clone/dcfCapCandidates.json
             cd gist-clone
             git config user.email "actions@github.com"
             git config user.name "stock-metrics-pipeline"
