@@ -1522,12 +1522,44 @@ function findReportedCapexQ(cfItems) {
   return hasInvestingSection ? null : 0;
 }
 
-// Mirrors decumulateYtdByYear in src/utils/metrics.js — a 10-Q reports P&L
-// and cash-flow line items as year-to-date cumulative, so each quarter is
-// de-cumulated against the prior one to get a standalone 3-month figure;
-// Q4 = the 10-K's full-year figure minus the Q3 YTD figure, since there's
-// no standalone Q4 filing. CIK-filtered first to guard against "ticker
-// recycling" (an old, unrelated company that once shared this symbol).
+// A real quarter is ~90-92 days; a YTD-cumulative Q2/Q3 report spans ~181/272
+// days -- comfortable separation for telling the two apart from a report's
+// own startDate/endDate.
+const STANDALONE_QUARTER_MAX_DAYS = 120;
+function reportDurationDays(report) {
+  if (!report?.startDate || !report?.endDate) return null;
+  const start = new Date(report.startDate);
+  const end = new Date(report.endDate);
+  if (isNaN(start) || isNaN(end)) return null;
+  return (end - start) / (1000 * 60 * 60 * 24);
+}
+
+// Mirrors decumulateYtdByYear in src/utils/metrics.js — a 10-Q USUALLY
+// reports P&L and cash-flow line items as year-to-date cumulative, so each
+// quarter is de-cumulated against the prior one to get a standalone 3-month
+// figure; Q4 = the 10-K's full-year figure minus the Q3 YTD figure, since
+// there's no standalone Q4 filing. CIK-filtered first to guard against
+// "ticker recycling" (an old, unrelated company that once shared this
+// symbol).
+//
+// "Usually" above is load-bearing -- verified live for SHAK: its own 10-Qs
+// disclosed genuine YTD-cumulative figures through 2021 (Q2'21 spans Dec
+// 2020-Jun 2021, 181 days; Q3'21 spans Dec 2020-Sep 2021, 272 days), then
+// switched to disclosing an already-standalone ~90-day figure for EVERY
+// quarter from 2022 onward -- a real reporting-convention change, not a
+// Finnhub crawl error. Blindly subtracting the prior quarter from an
+// already-standalone Q2/Q3 (as this function always did before) silently
+// produced a corrupted, even NEGATIVE, "standalone" revenue figure (Q3'22
+// computed to -$2.9M against a real, positive ~$228M actual), which then
+// cascaded into wildly implausible revenueGrowth values for every
+// subsequent year that compared against it (confirmed live: this exact
+// mechanism explained ~400 implausible revenueGrowth points found across
+// the published gist, not just SHAK). Each report's own startDate/endDate
+// (reportDurationDays above) tells us directly which shape it actually is,
+// so this now decides per-quarter instead of assuming — a report with no
+// startDate/endDate (an SEC-XBRL-synthesized entry; see
+// buildSecSyntheticReports) always defaults to "cumulative", since
+// pickDurationFact deliberately selects the cumulative fact for those.
 function decumulateYtdByYear(quarterlyReports, annualReports, findValue, section = 'ic') {
   const currentCik = quarterlyReports?.[0]?.cik ?? annualReports?.[0]?.cik;
   const sameCik = (r) => currentCik == null || r.cik === currentCik;
@@ -1535,6 +1567,7 @@ function decumulateYtdByYear(quarterlyReports, annualReports, findValue, section
   annualReports = (annualReports || []).filter(sameCik);
 
   const ytdByYear = {};
+  const isStandaloneDisclosure = {};
   const annualByYear = {};
 
   for (const q of quarterlyReports || []) {
@@ -1543,6 +1576,9 @@ function decumulateYtdByYear(quarterlyReports, annualReports, findValue, section
     if (value == null) continue;
     ytdByYear[q.year] = ytdByYear[q.year] || {};
     ytdByYear[q.year][q.quarter] = value;
+    const duration = reportDurationDays(q);
+    isStandaloneDisclosure[q.year] = isStandaloneDisclosure[q.year] || {};
+    isStandaloneDisclosure[q.year][q.quarter] = duration != null && duration <= STANDALONE_QUARTER_MAX_DAYS;
   }
   for (const a of annualReports || []) {
     const value = findValue(a?.report?.[section] || []);
@@ -1552,10 +1588,38 @@ function decumulateYtdByYear(quarterlyReports, annualReports, findValue, section
   const standalone = {};
   for (const [yearStr, q] of Object.entries(ytdByYear)) {
     const year = Number(yearStr);
+    const standaloneFlags = isStandaloneDisclosure[year] || {};
+    // cumulativeThrough[n] = the true YTD-cumulative total through fiscal
+    // quarter n, regardless of whether quarter n's OWN report happened to
+    // disclose a cumulative or already-standalone figure — needed to
+    // decumulate a LATER quarter correctly even when an EARLIER one in the
+    // same fiscal year switched disclosure style.
+    const cumulativeThrough = {};
+    if (q[1] != null) cumulativeThrough[1] = q[1]; // Q1 is inherently the same whether "cumulative" or "standalone"
+
     if (q[1] != null) standalone[`${year}-1`] = q[1];
-    if (q[1] != null && q[2] != null) standalone[`${year}-2`] = q[2] - q[1];
-    if (q[2] != null && q[3] != null) standalone[`${year}-3`] = q[3] - q[2];
-    if (q[3] != null && annualByYear[year] != null) standalone[`${year}-4`] = annualByYear[year] - q[3];
+
+    if (q[2] != null) {
+      if (standaloneFlags[2]) {
+        standalone[`${year}-2`] = q[2];
+        if (cumulativeThrough[1] != null) cumulativeThrough[2] = cumulativeThrough[1] + q[2];
+      } else {
+        cumulativeThrough[2] = q[2];
+        if (cumulativeThrough[1] != null) standalone[`${year}-2`] = q[2] - cumulativeThrough[1];
+      }
+    }
+
+    if (q[3] != null) {
+      if (standaloneFlags[3]) {
+        standalone[`${year}-3`] = q[3];
+        if (cumulativeThrough[2] != null) cumulativeThrough[3] = cumulativeThrough[2] + q[3];
+      } else {
+        cumulativeThrough[3] = q[3];
+        if (cumulativeThrough[2] != null) standalone[`${year}-3`] = q[3] - cumulativeThrough[2];
+      }
+    }
+
+    if (cumulativeThrough[3] != null && annualByYear[year] != null) standalone[`${year}-4`] = annualByYear[year] - cumulativeThrough[3];
   }
   return standalone;
 }

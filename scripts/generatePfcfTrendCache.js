@@ -442,11 +442,24 @@ function findReportedDilutedShares(icItems) {
   return null;
 }
 
-// Mirrors decumulateYtdByYear in src/utils/metrics.js — see that file for
-// the full rationale (10-Qs report P&L/cash-flow lines as year-to-date
-// cumulative; each quarter is de-cumulated against the prior one; Q4 = the
-// 10-K's full-year figure minus the Q3 YTD figure; CIK-filtered first to
-// guard against "ticker recycling").
+// A real quarter is ~90-92 days; a YTD-cumulative Q2/Q3 report spans ~181/272
+// days -- comfortable separation for telling the two apart from a report's
+// own startDate/endDate.
+const STANDALONE_QUARTER_MAX_DAYS = 120;
+function reportDurationDays(report) {
+  if (!report?.startDate || !report?.endDate) return null;
+  const start = new Date(report.startDate);
+  const end = new Date(report.endDate);
+  if (isNaN(start) || isNaN(end)) return null;
+  return (end - start) / (1000 * 60 * 60 * 24);
+}
+
+// Mirrors decumulateYtdByYear in src/utils/metrics.js / generateSectorMetrics.js
+// — see generateSectorMetrics.js's own copy for the full verified-live
+// rationale on why this can't just assume every quarter is cumulative
+// (SHAK switched to already-standalone 90-day disclosures from 2022
+// onward, which the old blind-subtraction logic corrupted into a negative
+// "standalone" quarter).
 function decumulateYtdByYear(quarterlyReports, annualReports, findValue, section) {
   const currentCik = quarterlyReports?.[0]?.cik ?? annualReports?.[0]?.cik;
   const sameCik = (r) => currentCik == null || r.cik === currentCik;
@@ -454,6 +467,7 @@ function decumulateYtdByYear(quarterlyReports, annualReports, findValue, section
   annualReports = (annualReports || []).filter(sameCik);
 
   const ytdByYear = {};
+  const isStandaloneDisclosure = {};
   const annualByYear = {};
 
   for (const q of quarterlyReports || []) {
@@ -462,6 +476,9 @@ function decumulateYtdByYear(quarterlyReports, annualReports, findValue, section
     if (value == null) continue;
     ytdByYear[q.year] = ytdByYear[q.year] || {};
     ytdByYear[q.year][q.quarter] = value;
+    const duration = reportDurationDays(q);
+    isStandaloneDisclosure[q.year] = isStandaloneDisclosure[q.year] || {};
+    isStandaloneDisclosure[q.year][q.quarter] = duration != null && duration <= STANDALONE_QUARTER_MAX_DAYS;
   }
   for (const a of annualReports || []) {
     const value = findValue(a?.report?.[section] || []);
@@ -471,10 +488,33 @@ function decumulateYtdByYear(quarterlyReports, annualReports, findValue, section
   const standalone = {};
   for (const [yearStr, q] of Object.entries(ytdByYear)) {
     const year = Number(yearStr);
+    const standaloneFlags = isStandaloneDisclosure[year] || {};
+    const cumulativeThrough = {};
+    if (q[1] != null) cumulativeThrough[1] = q[1];
+
     if (q[1] != null) standalone[`${year}-1`] = q[1];
-    if (q[1] != null && q[2] != null) standalone[`${year}-2`] = q[2] - q[1];
-    if (q[2] != null && q[3] != null) standalone[`${year}-3`] = q[3] - q[2];
-    if (q[3] != null && annualByYear[year] != null) standalone[`${year}-4`] = annualByYear[year] - q[3];
+
+    if (q[2] != null) {
+      if (standaloneFlags[2]) {
+        standalone[`${year}-2`] = q[2];
+        if (cumulativeThrough[1] != null) cumulativeThrough[2] = cumulativeThrough[1] + q[2];
+      } else {
+        cumulativeThrough[2] = q[2];
+        if (cumulativeThrough[1] != null) standalone[`${year}-2`] = q[2] - cumulativeThrough[1];
+      }
+    }
+
+    if (q[3] != null) {
+      if (standaloneFlags[3]) {
+        standalone[`${year}-3`] = q[3];
+        if (cumulativeThrough[2] != null) cumulativeThrough[3] = cumulativeThrough[2] + q[3];
+      } else {
+        cumulativeThrough[3] = q[3];
+        if (cumulativeThrough[2] != null) standalone[`${year}-3`] = q[3] - cumulativeThrough[2];
+      }
+    }
+
+    if (cumulativeThrough[3] != null && annualByYear[year] != null) standalone[`${year}-4`] = annualByYear[year] - cumulativeThrough[3];
   }
   return standalone;
 }
