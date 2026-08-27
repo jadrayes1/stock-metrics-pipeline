@@ -127,7 +127,15 @@ function findReportedOperatingCashFlowQ(cfItems) {
   const match = cfItems.find((item) => item.concept === 'us-gaap_NetCashProvidedByUsedInOperatingActivities');
   if (match) return match.value;
   const labelMatch = cfItems.find((item) => /net cash.*operating activities/i.test(item.label || ''));
-  return labelMatch ? labelMatch.value : null;
+  if (labelMatch) return labelMatch.value;
+  // Mirrors generateSectorMetrics.js's own findReportedOperatingCashFlowQ —
+  // verified live: Village Farms (VFF) tags OCF under this concept with the
+  // label "Cash Provided by (Used in) Operating Activity, Continuing
+  // Operation(s)", which the label regex above doesn't match (no "net cash",
+  // singular "Activity"/"Operation"). Without this, VFF's yearly/TTM P/FCF
+  // were entirely empty despite real, current OCF/capex data being present.
+  const continuingOpsMatch = cfItems.find((item) => item.concept === 'us-gaap_NetCashProvidedByUsedInOperatingActivitiesContinuingOperations');
+  return continuingOpsMatch ? continuingOpsMatch.value : null;
 }
 
 // Mirrors findReportedCapex in src/utils/metrics.js — see that file for the
