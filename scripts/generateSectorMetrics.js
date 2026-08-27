@@ -1492,6 +1492,9 @@ function findReportedCapexQ(cfItems) {
     'us-gaap_PaymentsToAcquireOtherPropertyPlantAndEquipment',
     'us-gaap_PaymentsForFlightEquipment',
     'us-gaap_PaymentsToAcquireOtherProductiveAssets',
+    // Verified live: JTAI (Jet.AI) tags capitalized software/IP spend under
+    // this standard concept in its 2023-2024 10-Qs instead of any PP&E variant.
+    'us-gaap_PaymentsToAcquireIntangibleAssets',
   ];
   // Summed rather than first-match — verified live: DAL splits its real
   // capex across TWO simultaneous lines ("Flight equipment, including
@@ -1502,8 +1505,15 @@ function findReportedCapexQ(cfItems) {
   // only ever tags one of these concepts.
   const matches = cfItems.filter((item) => concepts.includes(item.concept));
   if (matches.length) return matches.reduce((sum, item) => sum + item.value, 0);
+  // "deposits? (on|for) aircraft" added for JTAI (Jet.AI) -- verified live:
+  // its 2025 10-Qs tag real cash paid toward acquiring aircraft under a
+  // company-specific extension concept, never a standard us-gaap one, so
+  // only a label match can catch it -- same class of gap "flight equipment"
+  // was added for DAL, just a different phrasing.
   const labelMatch = cfItems.find((item) =>
-    /purchases? of property|payments? (for|to) acquire (other )?property|capital expenditures|capital spending|capital improvements|flight equipment/i.test(item.label || '')
+    /purchases? of property|payments? (for|to) acquire (other )?property|capital expenditures|capital spending|capital improvements|flight equipment|deposits? (on|for) aircraft/i.test(
+      item.label || ''
+    )
   );
   if (labelMatch) return labelMatch.value;
   // No capex line found -- treat as a real $0 (not missing data) ONLY when
