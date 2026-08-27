@@ -308,6 +308,7 @@ const DUAL_CLASS_ALIASES = {
 const RENAMED_TICKER_FINANCIALS_ALIASES = {
   BNY: 'BK',
   AD: 'USM',
+  IA: 'ISSC',
 };
 
 // financials-reported also needs the dual-class redirect (DUAL_CLASS_ALIASES

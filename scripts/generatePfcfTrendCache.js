@@ -65,6 +65,8 @@ const QUARTERS_OF_HISTORY = 12; // mirrors src/utils/metrics.js
 // verified-live rationale (BNY/BK, CIK 1390777).
 const RENAMED_TICKER_FINANCIALS_ALIASES = {
   BNY: 'BK',
+  AD: 'USM',
+  IA: 'ISSC',
 };
 
 // Mirrors FINANCIAL_INDUSTRIES/isFinancialIndustry in generateSectorMetrics.js
