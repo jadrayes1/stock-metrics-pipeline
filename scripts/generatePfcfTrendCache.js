@@ -69,6 +69,222 @@ const RENAMED_TICKER_FINANCIALS_ALIASES = {
   IA: 'ISSC',
 };
 
+// ---------------------------------------------------------------------------
+// SEC-XBRL enrichment for sparse/stale Finnhub coverage — a narrower port of
+// the same mechanism already built and verified in generateSectorMetrics.js
+// (fetchSecUsGaapFacts/buildSecSyntheticReports/pickDurationFact/
+// findSecValueForFyFp — see that file for the full rationale on each design
+// choice referenced in comments below). This was deliberately left out of
+// this script's first version to bound that session's change size (see the
+// cross-cadence-consistency plan's "Scope note"), which meant any ticker
+// whose Finnhub financials-reported coverage is sparse or stale (verified
+// live for SENEA: quarterly coverage stalls at 2022-07-02, annual at
+// 2020-03-31, even though SEC's own filings are current through 2026-08-06)
+// got P/FCF permanently stuck empty even after this script's own concept-
+// matching fixes, since there was simply no fresher data to extract from.
+//
+// Narrower than generateSectorMetrics.js's copy in one respect (only cf
+// items - ocf/capex - plus ic shares are synthesized, no revenue/netIncome/
+// ebit/bs since P/FCF doesn't need them) and wider in another (a SHARES
+// concept, which that file's ROIC/margin builders never needed but
+// buildPfcfTrendFromFilingsAndPrices/its Quarterly/Yearly siblings do, via
+// findReportedDilutedShares).
+const SEC_COMPANYFACTS_BASE = 'https://data.sec.gov/api/xbrl/companyfacts';
+const SEC_TICKERS_URL = 'https://www.sec.gov/files/company_tickers.json';
+const SEC_USER_AGENT = 'stock-analyzer-app stock-metrics-pipeline contact:jadrayescpp@gmail.com';
+const SEC_FETCH_TIMEOUT_MS = 30000;
+// Same values as generateSectorMetrics.js's own constants of the same name —
+// kept in sync deliberately, not re-derived, since both scripts are
+// answering the identical question ("is this ticker's Finnhub coverage too
+// sparse/stale to trust without a SEC assist?").
+const SEC_ENRICHMENT_SPARSE_QUARTERLY_THRESHOLD = 4;
+const SEC_ENRICHMENT_SPARSE_ANNUAL_THRESHOLD = 2;
+const RECENT_GAP_SCAN_ENTRIES = 16;
+const EXPECTED_QUARTERLY_GAP_DAYS = 200;
+const MID_SEQUENCE_GAP_RECENT_YEARS = 2;
+const SEC_OCF_CONCEPTS = ['NetCashProvidedByUsedInOperatingActivities', 'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'];
+const SEC_CAPEX_CONCEPTS = ['PaymentsToAcquirePropertyPlantAndEquipment', 'PaymentsToAcquireProductiveAssets', 'PaymentsForCapitalImprovements', 'PaymentsToAcquireOtherPropertyPlantAndEquipment'];
+const SEC_INVESTING_SUBTOTAL_CONCEPTS = ['NetCashProvidedByUsedInInvestingActivities', 'NetCashProvidedByUsedInInvestingActivitiesContinuingOperations'];
+// Diluted checked first, same preference order as findReportedDilutedShares
+// below (basic is only a fallback there too).
+const SEC_SHARES_CONCEPTS = ['WeightedAverageNumberOfDilutedSharesOutstanding', 'WeightedAverageNumberOfSharesOutstandingBasic'];
+// Verified live: SENEA's OWN filing history tags this exact concept in TWO
+// different scales across different years — 10-Qs filed 2023-2024 report
+// val ~7000-8000 ("in thousands", i.e. really ~7-8 million shares), while
+// 10-Qs filed 2025+ report val ~6,900,000-6,949,000 (already an absolute
+// count) for the same real company (SENECA FOODS has always had roughly 7
+// million shares outstanding — this is a filer-side XBRL scale-tagging
+// drift, not a real 1000x share count change). A raw ~7000-count value fed
+// straight into FCF-per-share would understate shares by ~1000x and produce
+// a wildly wrong P/FCF ratio. Rather than guess at correcting the scale
+// (this pipeline's hard rule is verify exactly, never estimate/infer), a
+// value this far below any real NYSE/NASDAQ-listed company's plausible
+// share count is simply treated as unusable, same as if it were missing —
+// the newer, correctly-scaled facts still get through untouched.
+const MIN_PLAUSIBLE_SHARES = 100000;
+
+async function fetchSecJson(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SEC_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { headers: { 'User-Agent': SEC_USER_AGENT, Accept: 'application/json' }, signal: controller.signal });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchSecTickerToCikMap() {
+  const data = await fetchSecJson(SEC_TICKERS_URL);
+  const map = new Map();
+  for (const entry of Object.values(data || {})) {
+    if (entry?.ticker && entry?.cik_str != null) {
+      const ticker = String(entry.ticker).toUpperCase();
+      const cik = String(entry.cik_str).padStart(10, '0');
+      map.set(ticker, cik);
+      // See generateSectorMetrics.js's own fetchSecTickerToCikMap for why
+      // both spellings are registered (SEC hyphenates share-class suffixes,
+      // e.g. BRK-A, while Finnhub/this script's callers use a period).
+      if (ticker.includes('-')) map.set(ticker.replace(/-/g, '.'), cik);
+    }
+  }
+  return map;
+}
+
+async function fetchSecUsGaapFacts(cik) {
+  const data = await fetchSecJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
+  return data?.facts?.['us-gaap'] || {};
+}
+
+// Same cumulative-vs-exact / same-fy-fp-comparative disambiguation as
+// generateSectorMetrics.js's pickDurationFact — see that function's own
+// comment for the full verified-live rationale (BRK.A, ELF).
+function pickDurationFact(facts, fy, fp) {
+  const matches = (facts || []).filter((f) => f.fy === fy && f.fp === fp && f.start && f.end && f.val != null);
+  if (!matches.length) return null;
+  matches.sort((a, b) => new Date(b.end) - new Date(a.end) || new Date(a.start) - new Date(b.start) || new Date(b.filed || 0) - new Date(a.filed || 0));
+  return matches[0];
+}
+
+function findSecValueForFyFp(gaapFacts, concepts, fy, fp, unit) {
+  for (const concept of concepts) {
+    const facts = gaapFacts[concept]?.units?.[unit] || [];
+    const fact = pickDurationFact(facts, fy, fp);
+    if (fact) return { value: fact.val, concept: `us-gaap_${concept}`, end: fact.end };
+  }
+  return null;
+}
+
+// Mirrors generateSectorMetrics.js's own hasRecentQuarterlyGap — real report
+// entries here carry startDate/endDate the same way (Finnhub's financials-
+// reported shape is identical across both scripts).
+function hasRecentQuarterlyGap(quarterlyFinancials, scanEntries = RECENT_GAP_SCAN_ENTRIES) {
+  const endDates = (quarterlyFinancials || [])
+    .map((r) => (r?.endDate ? new Date(r.endDate) : null))
+    .filter((d) => d instanceof Date && !isNaN(d))
+    .sort((a, b) => b - a);
+  if (!endDates.length) return false;
+  const checkpoints = [new Date(), ...endDates.slice(0, scanEntries)];
+  for (let i = 0; i < checkpoints.length - 1; i++) {
+    const gapDays = (checkpoints[i] - checkpoints[i + 1]) / (1000 * 60 * 60 * 24);
+    if (gapDays > EXPECTED_QUARTERLY_GAP_DAYS) return true;
+  }
+  return false;
+}
+
+// Mirrors generateSectorMetrics.js's own hasMidSequenceQuarterGap (the SGLY
+// fix) — a missing MIDDLE quarter blocks decumulateYtdByYear from ever
+// standalone-izing every later quarter in that fiscal year, even when
+// hasRecentQuarterlyGap's date-gap threshold doesn't trip.
+function hasMidSequenceQuarterGap(quarterlyFinancials) {
+  const years = [...new Set((quarterlyFinancials || []).map((r) => r?.year).filter((y) => y != null))].sort((a, b) => b - a);
+  const recentYears = new Set(years.slice(0, MID_SEQUENCE_GAP_RECENT_YEARS));
+  const quartersByYear = {};
+  for (const r of quarterlyFinancials || []) {
+    if (!r?.year || !r?.quarter || !recentYears.has(r.year)) continue;
+    quartersByYear[r.year] = quartersByYear[r.year] || new Set();
+    quartersByYear[r.year].add(r.quarter);
+  }
+  for (const quarters of Object.values(quartersByYear)) {
+    if (quarters.has(3) && !quarters.has(2)) return true;
+    if (quarters.has(2) && !quarters.has(1)) return true;
+  }
+  return false;
+}
+
+// Builds report entries shaped exactly like the real Finnhub ones
+// buildPfcfTrendFromFilingsAndPrices/its siblings already consume (only
+// .year/.quarter/.cik/.report are ever read downstream) — see
+// generateSectorMetrics.js's own buildSecSyntheticReports for why no
+// startDate/endDate is needed and why cik must be normalized to Finnhub's
+// unpadded numeric-string format (the ELF ticker-recycling-guard bug that
+// fix addressed applies identically here, since decumulateYtdByYear's own
+// `r.cik === currentCik` check is the same function, imported unchanged).
+function buildSecSyntheticPfcfReports(gaapFacts, cik) {
+  const normalizedCik = cik != null ? String(Number(cik)) : cik;
+  const quarterNumber = { Q1: 1, Q2: 2, Q3: 3, Q4: 4 };
+
+  const fyFpKeys = new Map();
+  for (const concept of [...SEC_OCF_CONCEPTS, ...SEC_CAPEX_CONCEPTS]) {
+    for (const fact of gaapFacts[concept]?.units?.USD || []) {
+      if (fact.fy == null || !fact.fp || fact.val == null) continue;
+      fyFpKeys.set(`${fact.fy}-${fact.fp}`, { fy: fact.fy, fp: fact.fp });
+    }
+  }
+  for (const concept of SEC_SHARES_CONCEPTS) {
+    for (const fact of gaapFacts[concept]?.units?.shares || []) {
+      if (fact.fy == null || !fact.fp || fact.val == null) continue;
+      fyFpKeys.set(`${fact.fy}-${fact.fp}`, { fy: fact.fy, fp: fact.fp });
+    }
+  }
+
+  const quarterlyReports = [];
+  const annualReports = [];
+  for (const { fy, fp } of fyFpKeys.values()) {
+    const ocfFact = findSecValueForFyFp(gaapFacts, SEC_OCF_CONCEPTS, fy, fp, 'USD');
+    let capexFact = findSecValueForFyFp(gaapFacts, SEC_CAPEX_CONCEPTS, fy, fp, 'USD');
+    if (!capexFact && findSecValueForFyFp(gaapFacts, SEC_INVESTING_SUBTOTAL_CONCEPTS, fy, fp, 'USD')) {
+      capexFact = { concept: 'ImpliedZeroCapex', value: 0 };
+    }
+    const cfItems = [ocfFact, capexFact].filter(Boolean).map((r) => ({ concept: r.concept, label: `${r.concept} (SEC XBRL enrichment)`, value: r.value }));
+
+    let sharesFact = findSecValueForFyFp(gaapFacts, SEC_SHARES_CONCEPTS, fy, fp, 'shares');
+    if (sharesFact && sharesFact.value < MIN_PLAUSIBLE_SHARES) sharesFact = null; // see MIN_PLAUSIBLE_SHARES above
+    const icItems = sharesFact ? [{ concept: sharesFact.concept, label: `${sharesFact.concept} (SEC XBRL enrichment)`, value: sharesFact.value }] : [];
+
+    if (!cfItems.length && !icItems.length) continue;
+
+    const entry = { cik: normalizedCik, form: 'SEC-XBRL', report: { ic: icItems, cf: cfItems } };
+    if (fp === 'FY') annualReports.push({ ...entry, year: fy });
+    else if (quarterNumber[fp]) quarterlyReports.push({ ...entry, year: fy, quarter: quarterNumber[fp] });
+  }
+  return { quarterlyReports, annualReports };
+}
+
+// Additive merge — real Finnhub entries always win on a (year, quarter)/
+// (year) conflict, same idiom as generateSectorMetrics.js's own
+// mergeSyntheticReports, minus the narrow-stub-replacement case (this script
+// has no equivalent of that file's backfillRevenueGapsFromSec pre-pass, so
+// every existing entry here is a real Finnhub one).
+function mergeSyntheticPfcfReports(quarterlyReports, annualReports, synthesized) {
+  const mergedQuarterlyReports = [...(quarterlyReports || [])];
+  const existingQuarterKeys = new Set(mergedQuarterlyReports.filter((r) => r?.year && r?.quarter).map((r) => `${r.year}-${r.quarter}`));
+  for (const r of synthesized.quarterlyReports) {
+    if (!existingQuarterKeys.has(`${r.year}-${r.quarter}`)) mergedQuarterlyReports.push(r);
+  }
+
+  const mergedAnnualReports = [...(annualReports || [])];
+  const existingAnnualYears = new Set(mergedAnnualReports.filter((r) => r?.year).map((r) => r.year));
+  for (const r of synthesized.annualReports) {
+    if (!existingAnnualYears.has(r.year)) mergedAnnualReports.push(r);
+  }
+
+  return { quarterlyReports: mergedQuarterlyReports, annualReports: mergedAnnualReports };
+}
+
 // Mirrors FINANCIAL_INDUSTRIES/isFinancialIndustry in generateSectorMetrics.js
 // (kept in sync) — verified live: BAC's real reported cash-flow statement
 // has ZERO capex-related line items under any concept this file checks (no
@@ -188,15 +404,25 @@ function findReportedCapexQ(cfItems) {
 // shares only; verified live: BlackSky/BKSY matched diluted shares for just
 // 7 of 22 reported quarters).
 function findReportedDilutedShares(icItems) {
+  // Verified live: SENEA tags this concept (and the basic equivalent) "in
+  // thousands" across its 2022-2024 filings (val ~7000-8000 for a company
+  // with ~7 million real shares outstanding), then switches to absolute
+  // units in 2025+ filings for the SAME concept — a filer-side XBRL scale
+  // drift, not a real share-count change. Skipping (rather than trusting)
+  // any candidate below MIN_PLAUSIBLE_SHARES and falling through to the
+  // next one prevents a ~1000x-understated share count from silently
+  // producing a wildly wrong FCF-per-share/P-FCF ratio.
+  const plausible = (v) => v != null && v >= MIN_PLAUSIBLE_SHARES;
+
   const match = icItems.find((item) => item.concept === 'us-gaap_WeightedAverageNumberOfDilutedSharesOutstanding');
-  if (match) return match.value;
+  if (plausible(match?.value)) return match.value;
   const labelMatch = icItems.find((item) => /diluted.*shares|weighted average.*diluted/i.test(item.label || ''));
-  if (labelMatch) return labelMatch.value;
+  if (plausible(labelMatch?.value)) return labelMatch.value;
 
   const basicMatch = icItems.find((item) => item.concept === 'us-gaap_WeightedAverageNumberOfSharesOutstandingBasic');
-  if (basicMatch) return basicMatch.value;
+  if (plausible(basicMatch?.value)) return basicMatch.value;
   const basicLabelMatch = icItems.find((item) => /basic.*shares|weighted average.*basic/i.test(item.label || ''));
-  if (basicLabelMatch) return basicLabelMatch.value;
+  if (plausible(basicLabelMatch?.value)) return basicLabelMatch.value;
 
   // Falls back to EarningsPerShareBasic when EarningsPerShareDiluted isn't
   // tagged at all -- verified live: SMID's real annual 10-K only discloses
@@ -210,7 +436,8 @@ function findReportedDilutedShares(icItems) {
   // (5,307,000, same fiscal year) — within 0.3%.
   const netIncome = icItems.find((item) => item.concept === 'us-gaap_NetIncomeLoss');
   const eps = icItems.find((item) => item.concept === 'us-gaap_EarningsPerShareDiluted') || icItems.find((item) => item.concept === 'us-gaap_EarningsPerShareBasic');
-  if (netIncome?.value != null && eps?.value) return netIncome.value / eps.value;
+  const derived = netIncome?.value != null && eps?.value ? netIncome.value / eps.value : null;
+  if (plausible(derived)) return derived;
 
   return null;
 }
@@ -458,9 +685,10 @@ async function main() {
   const twelveDataKey = readTwelveDataApiKey();
 
   console.log('Fetching current ticker universe + P/FCF gap list from the published sector-metrics feed...');
-  const [metricsDataset, existingTrendCache] = await Promise.all([
+  const [metricsDataset, existingTrendCache, secTickerToCikMap] = await Promise.all([
     fetchJson(GIST_METRICS_URL),
     fetchJson(GIST_PFCF_TREND_URL).catch(() => ({ trends: {} })), // first-ever run: no existing cache yet
+    fetchSecTickerToCikMap().catch(() => new Map()), // non-fatal — SEC enrichment below just never triggers without it
   ]);
 
   const cache = existingTrendCache.trends || {};
@@ -517,9 +745,33 @@ async function main() {
       // apart, then one Twelve Data call spaced TWELVEDATA_REQUEST_SPACING_MS
       // after the last Finnhub call (comfortably more than either provider's
       // minimum spacing, so it doubles as this ticker's Finnhub cooldown too).
-      const quarterlyReports = await fetchReportedFinancials(symbol, 'quarterly', finnhubKey);
+      let quarterlyReports = await fetchReportedFinancials(symbol, 'quarterly', finnhubKey);
       await sleep(FINNHUB_REQUEST_SPACING_MS);
-      const annualReports = await fetchReportedFinancials(symbol, 'annual', finnhubKey);
+      let annualReports = await fetchReportedFinancials(symbol, 'annual', finnhubKey);
+
+      // SEC-XBRL enrichment for sparse/stale Finnhub coverage — see this
+      // file's own comment block above buildSecSyntheticPfcfReports for the
+      // full rationale (SENEA verified live: Finnhub's own quarterly/annual
+      // financials-reported stall at 2022/2020 respectively, while SEC's
+      // filings are current). Free to check (array/date inspection); only
+      // spends a real network call when a gap is actually found, so the
+      // vast majority of already-healthy gap tickers pay nothing extra.
+      if (
+        quarterlyReports.length < SEC_ENRICHMENT_SPARSE_QUARTERLY_THRESHOLD ||
+        annualReports.length < SEC_ENRICHMENT_SPARSE_ANNUAL_THRESHOLD ||
+        hasRecentQuarterlyGap(quarterlyReports) ||
+        hasMidSequenceQuarterGap(quarterlyReports)
+      ) {
+        const cik = secTickerToCikMap.get((RENAMED_TICKER_FINANCIALS_ALIASES[symbol] || symbol).toUpperCase()) || secTickerToCikMap.get(symbol.toUpperCase());
+        if (cik) {
+          const gaapFacts = await fetchSecUsGaapFacts(cik);
+          const synthesized = buildSecSyntheticPfcfReports(gaapFacts, quarterlyReports[0]?.cik ?? annualReports[0]?.cik ?? cik);
+          const merged = mergeSyntheticPfcfReports(quarterlyReports, annualReports, synthesized);
+          quarterlyReports = merged.quarterlyReports;
+          annualReports = merged.annualReports;
+        }
+      }
+
       await sleep(TWELVEDATA_REQUEST_SPACING_MS);
       const monthlyPrices = await fetchMonthlyPrices(symbol, twelveDataKey);
       twelveDataCalls++;
@@ -569,6 +821,12 @@ module.exports = {
   findReportedOperatingCashFlowQ,
   findReportedCapexQ,
   findReportedDilutedShares,
+  fetchSecTickerToCikMap,
+  fetchSecUsGaapFacts,
+  buildSecSyntheticPfcfReports,
+  mergeSyntheticPfcfReports,
+  hasRecentQuarterlyGap,
+  hasMidSequenceQuarterGap,
 };
 
 // Matches the require.main guard already used in the sibling
