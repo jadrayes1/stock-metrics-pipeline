@@ -3514,6 +3514,7 @@ module.exports = {
   encodeTrendQualifiedMask,
   decodeTrendQualifiedMask,
   hasRecentQuarterlyGap,
+  hasMidSequenceQuarterGap,
   pickDurationFact,
   pickInstantFact,
   decumulateYtdByYear,
