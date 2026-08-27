@@ -1214,6 +1214,19 @@ const SEC_INVESTING_SUBTOTAL_CONCEPTS = ['NetCashProvidedByUsedInInvestingActivi
 const SEC_EQUITY_CONCEPTS = ['StockholdersEquity', 'StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest'];
 const SEC_DEBT_CONCEPTS = DEBT_CONCEPTS.map((c) => c.replace(/^us-gaap_/, ''));
 const SEC_CASH_CONCEPTS = ['CashAndCashEquivalentsAtCarryingValue', 'CashAndCashEquivalentsAtFairValue', 'Cash'];
+// Mirrors findReportedRevenue's own bank fallback (netInterestIncome +
+// nonInterestIncome) -- verified live: WAL (a bank) DOES tag a standard
+// us-gaap_RevenueFromContractWithCustomerExcludingAssessedTax fact (real,
+// not zero/junk), but it's only ~$113M/quarter against ~$2B of real total
+// revenue -- ASC-606-scope fee income is a small SLICE of a bank's revenue,
+// not a substitute for it, the same way it correctly IS the whole picture
+// for a normal operating company. Using it as buildSecSyntheticReports'
+// revenue fact understated WAL's Q2'26 revenue by ~18x, producing a
+// nonsensical -207% "growth" quarter. findReportedRevenue's own bank
+// fallback never got a chance to run, since the (wrong but present)
+// standard concept match short-circuits it first.
+const SEC_BANK_NII_CONCEPTS = ['InterestIncomeExpenseNet'];
+const SEC_BANK_NONINTEREST_INCOME_CONCEPTS = ['NoninterestIncome'];
 
 async function fetchSecUsGaapFacts(cik) {
   const data = await fetchSecJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
@@ -1320,7 +1333,7 @@ function collectSecFyFpKeys(gaapFacts, seedConcepts) {
 // severely-sparse tickers before, where quarterlyReports[0] was ITSELF
 // often a synthesized entry, so the mismatch never had a real Finnhub CIK
 // to disagree with.
-function buildSecSyntheticReports(gaapFacts, cik) {
+function buildSecSyntheticReports(gaapFacts, cik, isFinancial = false) {
   const normalizedCik = cik != null ? String(Number(cik)) : cik;
   const fyFpKeys = collectSecFyFpKeys(gaapFacts, [...SEC_REVENUE_CONCEPTS, ...SEC_NET_INCOME_CONCEPTS, ...SEC_EBIT_CONCEPTS, ...SEC_PRETAX_INCOME_CONCEPTS]);
   const quarterlyReports = [];
@@ -1328,9 +1341,25 @@ function buildSecSyntheticReports(gaapFacts, cik) {
   const quarterNumber = { Q1: 1, Q2: 2, Q3: 3, Q4: 4 };
 
   for (const { fy, fp } of fyFpKeys) {
-    const revenueFact = findSecValueForFyFp(gaapFacts, SEC_REVENUE_CONCEPTS, fy, fp, 'duration');
+    // For financial-industry filers, prefer the real NII+noninterest-income
+    // pair over any standard revenue concept -- see SEC_BANK_NII_CONCEPTS
+    // above for why the standard concept can be present but badly
+    // understated for a bank. Pushed as their OWN separate concepts (not
+    // pre-summed) so findReportedRevenue's own existing bank fallback
+    // combines them exactly the way it already does for real Finnhub
+    // reports -- only used when BOTH halves resolve for this exact period;
+    // otherwise falls through to the normal concept search (still better
+    // than nothing for a bank that happens to lack one half this quarter).
+    const niiFact = isFinancial ? findSecValueForFyFp(gaapFacts, SEC_BANK_NII_CONCEPTS, fy, fp, 'duration') : null;
+    const nonInterestFact = isFinancial ? findSecValueForFyFp(gaapFacts, SEC_BANK_NONINTEREST_INCOME_CONCEPTS, fy, fp, 'duration') : null;
+    const useBankRevenue = !!(niiFact && nonInterestFact);
+    const revenueFact = useBankRevenue ? null : findSecValueForFyFp(gaapFacts, SEC_REVENUE_CONCEPTS, fy, fp, 'duration');
     const netIncomeFact = findSecValueForFyFp(gaapFacts, SEC_NET_INCOME_CONCEPTS, fy, fp, 'duration');
     const icItems = [revenueFact, netIncomeFact].filter(Boolean).map((r) => ({ concept: r.concept, label: `${r.concept} (SEC XBRL enrichment)`, value: r.value }));
+    if (useBankRevenue) {
+      icItems.push({ concept: 'us-gaap_InterestIncomeExpenseNet', label: 'us-gaap_InterestIncomeExpenseNet (SEC XBRL enrichment)', value: niiFact.value });
+      icItems.push({ concept: 'us-gaap_NoninterestIncome', label: 'us-gaap_NoninterestIncome (SEC XBRL enrichment)', value: nonInterestFact.value });
+    }
     const ebitFact = findSecValueForFyFp(gaapFacts, SEC_EBIT_CONCEPTS, fy, fp, 'duration') || findSecValueForFyFp(gaapFacts, SEC_PRETAX_INCOME_CONCEPTS, fy, fp, 'duration');
     if (ebitFact) icItems.push({ concept: ebitFact.concept, label: `${ebitFact.concept} (SEC XBRL enrichment)`, value: ebitFact.value });
 
@@ -1367,7 +1396,7 @@ function buildSecSyntheticReports(gaapFacts, cik) {
     // same (fy, fp) covers the same real period, so the first one found is
     // as good as any other -- duration facts checked first since income-
     // statement concepts are the most commonly available.
-    const endDate = revenueFact?.end || netIncomeFact?.end || ebitFact?.end || ocfFact?.end || capexFact?.end || equityFact?.end || cashFact?.end || debtFact?.end || null;
+    const endDate = revenueFact?.end || niiFact?.end || netIncomeFact?.end || ebitFact?.end || ocfFact?.end || capexFact?.end || equityFact?.end || cashFact?.end || debtFact?.end || null;
 
     const entry = { cik: normalizedCik, form: 'SEC-XBRL', report: { ic: icItems, cf: cfItems, bs: bsReportItems }, endDate };
     if (fp === 'FY') annualReports.push({ ...entry, year: fy });
@@ -3061,7 +3090,7 @@ async function processSymbol(symbol, apiKey, ctx) {
       for (const cik of ciksToEnrich) {
         const gaapFacts = await fetchSecUsGaapFacts(cik);
         if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG gaapFacts concepts for cik', cik, Object.keys(gaapFacts).length);
-        const synthesized = buildSecSyntheticReports(gaapFacts, cik);
+        const synthesized = buildSecSyntheticReports(gaapFacts, cik, isFinancialIndustry(profile.industry));
         if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG synthesized for cik', cik, synthesized.quarterlyReports.length, synthesized.annualReports.length);
         combinedSynthesized = {
           quarterlyReports: [...combinedSynthesized.quarterlyReports, ...synthesized.quarterlyReports],
