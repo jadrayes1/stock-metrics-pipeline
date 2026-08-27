@@ -1139,6 +1139,51 @@ function hasRecentQuarterlyGap(quarterlyFinancials, scanEntries = RECENT_GAP_SCA
   return false;
 }
 
+// A single missing MIDDLE quarter (fiscal Q2 present its neighbors, Q1 and
+// Q3, both real) is a different failure shape than hasRecentQuarterlyGap
+// above catches -- verified live for SGLY: fiscal Q1 (ending 2025-09-30)
+// and Q3 (ending 2026-03-31) are both real Finnhub entries, but fiscal Q2
+// (ending 2025-12-31, real and present in SEC's own companyfacts) is
+// missing from Finnhub's crawl entirely. The gap between Q1 and Q3's own
+// end dates is only ~182 days -- under EXPECTED_QUARTERLY_GAP_DAYS (200),
+// so hasRecentQuarterlyGap never fires -- but decumulateYtdByYear NEEDS
+// the missing Q2's cumulative value to subtract Q1 from it to get
+// standalone Q2, AND needs that same Q2 value to subtract from Q3's
+// cumulative to get standalone Q3 -- so ONE missing middle quarter blocks
+// EVERY later quarter in that fiscal year from ever being computed, even
+// though real, current data exists for them. Checked by quarter NUMBER
+// contiguity within each fiscal year, not a date threshold — a precise
+// signal for exactly this failure mode, not a broader heuristic that could
+// false-positive on a company with a genuinely irregular but complete
+// filing cadence.
+// Scoped to the 2 most recent fiscal years present, not the ticker's whole
+// history -- verified live this matters: AAPL and MSFT both false-
+// triggered against their FULL history (some old fiscal year, likely from
+// a spinoff/restatement/M&A event years ago, genuinely has this exact
+// "quarter 3 but no quarter 2" shape) even though their CURRENT reporting
+// is completely healthy. Unscoped, this would trip the SEC-enrichment
+// fetch for a large, wasteful fraction of the universe over stale gaps
+// nobody needs filled -- exactly the kind of broad per-ticker overhead
+// growth this file's own REQUEST_SPACING_MS/fetchDcfCapTargets.py fixes
+// were about eliminating, not reintroducing.
+const MID_SEQUENCE_GAP_RECENT_YEARS = 2;
+function hasMidSequenceQuarterGap(quarterlyFinancials) {
+  const years = [...new Set((quarterlyFinancials || []).map((r) => r?.year).filter((y) => y != null))].sort((a, b) => b - a);
+  const recentYears = new Set(years.slice(0, MID_SEQUENCE_GAP_RECENT_YEARS));
+
+  const quartersByYear = {};
+  for (const r of quarterlyFinancials || []) {
+    if (!r?.year || !r?.quarter || !recentYears.has(r.year)) continue;
+    quartersByYear[r.year] = quartersByYear[r.year] || new Set();
+    quartersByYear[r.year].add(r.quarter);
+  }
+  for (const quarters of Object.values(quartersByYear)) {
+    if (quarters.has(3) && !quarters.has(2)) return true;
+    if (quarters.has(2) && !quarters.has(1)) return true;
+  }
+  return false;
+}
+
 // Same 2 concepts as NET_INCOME_CONCEPT_CANDIDATES further down in this
 // file (kept as a plain literal here, not a reference to that const,
 // purely because it's declared after this point and JS's temporal dead
@@ -1155,6 +1200,16 @@ const SEC_PRETAX_INCOME_CONCEPTS = [
 ];
 const SEC_OCF_CONCEPTS = OPERATING_SUBTOTAL_CONCEPTS.map((c) => c.replace(/^us-gaap_/, ''));
 const SEC_CAPEX_CONCEPTS = ['PaymentsToAcquirePropertyPlantAndEquipment', 'PaymentsToAcquireProductiveAssets', 'PaymentsForCapitalImprovements', 'PaymentsToAcquireOtherPropertyPlantAndEquipment'];
+// Same "no Investing Activities section at all -> capex defaults to $0"
+// reasoning as findReportedCapexQ's own comment (the SPRO fix), applied at
+// the SEC-synthesis layer -- verified live: SGLY never tags ANY of
+// SEC_CAPEX_CONCEPTS across its entire filing history, but DOES tag this
+// investing-activities subtotal every quarter, confirming a real investing
+// section genuinely exists with no material PP&E line in it (not a
+// disclosure gap). Without this, a synthesized quarter with real OCF but
+// no matched capex concept just drops capex as "not found," blocking
+// fcfMargin/P-FCF for that quarter even though $0 is the real answer.
+const SEC_INVESTING_SUBTOTAL_CONCEPTS = ['NetCashProvidedByUsedInInvestingActivities', 'NetCashProvidedByUsedInInvestingActivitiesContinuingOperations'];
 const SEC_EQUITY_CONCEPTS = ['StockholdersEquity', 'StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest'];
 const SEC_DEBT_CONCEPTS = DEBT_CONCEPTS.map((c) => c.replace(/^us-gaap_/, ''));
 const SEC_CASH_CONCEPTS = ['CashAndCashEquivalentsAtCarryingValue', 'CashAndCashEquivalentsAtFairValue', 'Cash'];
@@ -1279,7 +1334,10 @@ function buildSecSyntheticReports(gaapFacts, cik) {
     if (ebitFact) icItems.push({ concept: ebitFact.concept, label: `${ebitFact.concept} (SEC XBRL enrichment)`, value: ebitFact.value });
 
     const ocfFact = findSecValueForFyFp(gaapFacts, SEC_OCF_CONCEPTS, fy, fp, 'duration');
-    const capexFact = findSecValueForFyFp(gaapFacts, SEC_CAPEX_CONCEPTS, fy, fp, 'duration');
+    let capexFact = findSecValueForFyFp(gaapFacts, SEC_CAPEX_CONCEPTS, fy, fp, 'duration');
+    if (!capexFact && findSecValueForFyFp(gaapFacts, SEC_INVESTING_SUBTOTAL_CONCEPTS, fy, fp, 'duration')) {
+      capexFact = { concept: 'ImpliedZeroCapex', value: 0 };
+    }
     const cfItems = [ocfFact, capexFact].filter(Boolean).map((r) => ({ concept: r.concept, label: `${r.concept} (SEC XBRL enrichment)`, value: r.value }));
 
     const equityFact = findSecValueForFyFp(gaapFacts, SEC_EQUITY_CONCEPTS, fy, fp, 'instant');
@@ -2901,7 +2959,8 @@ async function processSymbol(symbol, apiKey, ctx) {
   if (
     quarterlyFinancials.length < SEC_ENRICHMENT_SPARSE_QUARTERLY_THRESHOLD ||
     annualReportedFinancials.length < SEC_ENRICHMENT_SPARSE_ANNUAL_THRESHOLD ||
-    hasRecentQuarterlyGap(quarterlyFinancials)
+    hasRecentQuarterlyGap(quarterlyFinancials) ||
+    hasMidSequenceQuarterGap(quarterlyFinancials)
   ) {
     if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG enrichment triggered for', symbol, 'q=', quarterlyFinancials.length, 'a=', annualReportedFinancials.length);
     try {
