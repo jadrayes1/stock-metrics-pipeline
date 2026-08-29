@@ -20,12 +20,26 @@
 # and republishes the updated marketMetrics.json — same git-clone,
 # preserve-everything-else-untouched approach as the main workflow.
 #
-# Scheduled at 10:00 UTC — comfortably after the main pipeline's worst
-# realistic combined start-delay + runtime (00:00 UTC start + up to ~3h24m
-# GitHub scheduling delay + up to ~6h runtime lands around 09:24 UTC at the
-# very worst; this workflow doesn't need split-second freshness the way
-# "trending" data does, so the extra margin costs nothing). Re-tune if the
-# main pipeline's own schedule ever moves.
+# Triggered by generate-sector-metrics.yml's own completion (workflow_run
+# below) instead of an independent cron guess — verified live this matters:
+# a cron aimed at "comfortably after the main pipeline's worst realistic
+# runtime" doesn't account for GitHub's own scheduling delay on the
+# TRIGGER itself, which observed live pushed this workflow's actual start
+# 10-14 hours later than its nominal 10:00 UTC (21:08 UTC, 20:14 UTC,
+# 23:33 UTC on three consecutive days). Since estimatedFairValue is
+# deliberately NOT merge-protected across runs (see generateSectorMetrics.js's
+# pickMetricValue comment — a fresh null there is usually the sanity guard
+# correctly rejecting a bad DCF, not a data gap to paper over), every one
+# of generate-sector-metrics.yml's daily runs wipes the previous day's
+# cap/fallback fixes back to raw values, and this workflow is the only
+# thing that restores them — so that 10-14hr cron-relative delay was a
+# real multi-hour daily window where ~70% of tickers showed no DCF
+# estimate at all and outliers (verified live: SKYW at ~6x its real price)
+# stayed uncapped. A workflow_run trigger fires as soon as the upstream
+# run's OWN completion webhook lands, cutting that window down to just
+# this workflow's own ~1.5hr runtime. Gated on the upstream run actually
+# succeeding (see the job-level `if` below) — never cap/fill against a
+# marketMetrics.json from a failed, possibly-incomplete run.
 #
 # One-time setup required (this workflow can't do these for you): none —
 # reuses the same GIST_ID/GIST_TOKEN secrets already configured for
@@ -36,9 +50,15 @@
 name: Apply DCF cap
 
 on:
-  schedule:
-    - cron: '0 10 * * *'
-  workflow_dispatch: {}
+  workflow_run:
+    workflows: ['Generate sector metrics']
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: 'Optional: process only this one ticker (debugging), ignoring the normal candidate list'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -48,6 +68,11 @@ jobs:
   apply:
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    # Only run on a successful upstream completion -- never cap/fill against
+    # a marketMetrics.json from a failed or cancelled generate-sector-metrics
+    # run. Always runs for a manual workflow_dispatch (github.event.workflow_run
+    # is unset there, so the workflow_run-specific check is skipped).
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     steps:
       - uses: actions/checkout@v4
 
@@ -69,6 +94,8 @@ jobs:
           curl -sf "https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/marketMetrics.json" -o src/data/marketMetrics.json
 
       - name: Fetch analyst price targets for DCF cap/fallback candidates
+        env:
+          TARGET_SYMBOL: ${{ inputs.symbol }}
         run: python3 scripts/fetchDcfCapTargets.py
 
       - name: Apply DCF cap and mid-range fallback

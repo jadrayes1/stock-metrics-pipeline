@@ -86,6 +86,19 @@ def main():
     with open(CANDIDATES_FILE) as f:
         candidates = json.load(f).get("candidates", {})
 
+    # Manual single-symbol override (apply-dcf-cap.yml's "symbol"
+    # workflow_dispatch input) -- lets debugging one ticker's cap/fallback
+    # outcome take a couple minutes instead of the full multi-hour candidate
+    # sweep. Bypasses the normal candidate list entirely; if the symbol
+    # isn't a current candidate at all, still looks it up under a synthetic
+    # 'cap' reason (a real target is only ever applied by applyDcfCap.js
+    # when it actually improves on the existing estimate, so a wrong guess
+    # here is harmless -- see that file's own conservative gating).
+    target_symbol = os.environ.get("TARGET_SYMBOL", "").strip().upper()
+    if target_symbol:
+        candidates = {target_symbol: candidates.get(target_symbol, {"reason": "cap"})}
+        print(f"TARGET_SYMBOL set — processing only {target_symbol}, ignoring the normal candidate list.")
+
     # Shuffled, not alphabetical -- this script has no persistent state
     # between runs (unlike generateNewsCache.js's least-recently-cached-
     # first rotation), so a fixed order combined with a time budget would
