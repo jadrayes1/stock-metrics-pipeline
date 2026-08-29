@@ -759,10 +759,21 @@ async function main() {
   // Least-recently-attempted first (never-attempted sorts first, via epoch
   // 0) — always makes forward progress on whatever's stalest, same rotation
   // strategy as generateNewsCache.js.
-  const priority = gapSymbols
+  let priority = gapSymbols
     .map((symbol) => ({ symbol, attemptedAt: cache[symbol]?.fetchedAt ? new Date(cache[symbol].fetchedAt).getTime() : 0 }))
     .sort((a, b) => a.attemptedAt - b.attemptedAt)
     .map((x) => x.symbol);
+
+  // Manual single-symbol override (workflow_dispatch's "symbol" input, wired
+  // to this env var) — lets debugging one ticker's P/FCF gap take seconds
+  // instead of a full multi-hour run through the entire gap list. Bypasses
+  // the gap filter too (a ticker can be force-tested even if it currently
+  // has a real pfcfRatio/cached TTM point), since the whole point is to
+  // isolate exactly what happens for THIS symbol.
+  if (process.env.TARGET_SYMBOL) {
+    priority = [process.env.TARGET_SYMBOL.toUpperCase()];
+    console.log(`TARGET_SYMBOL set — processing only ${priority[0]}, ignoring the normal gap list/rotation.`);
+  }
 
   const alreadyCovered = priority.filter((s) => cache[s]?.ttm?.length).length;
   console.log(

@@ -31,7 +31,12 @@ name: Generate P/FCF trend cache
 on:
   schedule:
     - cron: '0 12 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: 'Optional: process only this one ticker (debugging), ignoring the normal gap list/rotation'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -52,6 +57,7 @@ jobs:
         env:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           TWELVEDATA_PIPELINE_API_KEY: ${{ secrets.TWELVEDATA_PIPELINE_API_KEY }}
+          TARGET_SYMBOL: ${{ inputs.symbol }}
         run: node scripts/generatePfcfTrendCache.js
 
       - name: Publish to gist
