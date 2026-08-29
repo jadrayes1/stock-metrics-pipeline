@@ -47,6 +47,13 @@ function applyDcfCap(metrics, targets) {
       const high = target.high;
       if (typeof high === 'number' && entry.estimatedFairValue != null && entry.estimatedFairValue > high) {
         entry.estimatedFairValue = high;
+        // Tagged the same way a 'fallback' fill already is, for the same
+        // reason: generateSectorMetrics.js's own next run needs to tell a
+        // "this was capped against a real analyst high" value apart from a
+        // genuinely fresh DCF output, so it can preserve THIS value instead
+        // of wiping it back to that day's raw (still-outlier) DCF estimate
+        // before this workflow gets a chance to re-cap it again.
+        entry.estimatedFairValueSource = 'dcfCapped';
         capped++;
       }
     } else if (target?.reason === 'fallback') {

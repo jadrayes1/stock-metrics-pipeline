@@ -3243,19 +3243,76 @@ async function processSymbol(symbol, apiKey, ctx) {
     }
   }
 
+  // A ticker whose PUBLISHED estimate is currently anchored to a real
+  // analyst target (either an analystConsensus fallback fill, or a
+  // dcfCapped value — see applyDcfCap.js) needs a SECOND outlier check
+  // beyond the plain price-based multiple below, or a fresh DCF could
+  // silently replace a trustworthy analyst-anchored number with a wildly
+  // divergent one. Concretely: price $100, DCF_CAP_CANDIDATE_MULTIPLE 1.8
+  // means anything up to $180 looks "in range" against price — but if
+  // analysts anchored yesterday's value at $110, a fresh $175 DCF would
+  // sail through the price check while still being ~60% above what
+  // analysts actually think, with no cap applied at all (it is not even
+  // flagged as a 'cap' candidate this run, so apply-dcf-cap.yml never gets
+  // a chance to weigh in either). isOutlierVsAnchor extends the identical
+  // divergence check to the previous analyst-anchored value, not just
+  // price, so a fresh DCF has to be reasonably close to BOTH before it is
+  // trusted to replace what analysts said.
+  const previousAnchorSources = new Set(['analystConsensus', 'dcfCapped']);
+  const previousAnchor = previousAnchorSources.has(previous?.estimatedFairValueSource) ? previous.estimatedFairValue : null;
+  const isOutlierVsPrice = estimatedFairValue != null && impliedPrice != null && estimatedFairValue > impliedPrice * DCF_CAP_CANDIDATE_MULTIPLE;
+  const isOutlierVsAnchor = estimatedFairValue != null && previousAnchor != null && estimatedFairValue > previousAnchor * DCF_CAP_CANDIDATE_MULTIPLE;
+
   // Two distinct reasons a ticker goes to the analyst-target lookup step
   // (scripts/fetchDcfCapTargets.py + applyDcfCap.js): our own DCF estimate
-  // is a >= DCF_CAP_CANDIDATE_MULTIPLE outlier vs. price ('cap' — real
-  // analyst high used as a ceiling), or DCF wasn't computable at all for
-  // this ticker ('fallback' — real analyst mid-range used to fill the gap
-  // rather than leaving estimatedFairValue empty). Mutually exclusive:
-  // 'fallback' only applies when there's no DCF estimate to even evaluate
-  // against the multiple.
+  // is a >= DCF_CAP_CANDIDATE_MULTIPLE outlier vs. price OR the previous
+  // analyst anchor ('cap' — real analyst high used as a ceiling), or DCF
+  // wasn't computable at all for this ticker ('fallback' — real analyst
+  // mid-range used to fill the gap rather than leaving estimatedFairValue
+  // empty). Mutually exclusive: 'fallback' only applies when there's no
+  // DCF estimate to even evaluate. Deliberately based on the RAW
+  // freshly-computed estimatedFairValue, not the published/preserved value
+  // further down — a ticker keeps getting a daily re-check against a fresh
+  // analyst target regardless of what's currently published, so a real
+  // shift in analyst sentiment (or the DCF itself becoming computable)
+  // still gets picked up; only the PUBLISHED value changes, not whether
+  // this fires.
   let dcfCapCandidate = null;
-  if (estimatedFairValue != null && impliedPrice != null && estimatedFairValue > impliedPrice * DCF_CAP_CANDIDATE_MULTIPLE) {
+  if (estimatedFairValue != null && (isOutlierVsPrice || isOutlierVsAnchor)) {
     dcfCapCandidate = { reason: 'cap', estimatedFairValue, currentPrice: impliedPrice };
   } else if (estimatedFairValue == null) {
     dcfCapCandidate = { reason: 'fallback', currentPrice: impliedPrice };
+  }
+
+  // estimatedFairValue was deliberately excluded from the pickMetricValue
+  // regression guard above (see that function's own comment) — a fresh
+  // null/outlier here is usually the DCF sanity guard correctly rejecting
+  // a bad estimate, and republishing a stale DCF number the current code
+  // would itself reject defeats the point of that guard.
+  //
+  // That reasoning only ever applied to a genuinely DCF-computed value,
+  // though — an analyst-anchored value (fallback or capped) was never
+  // rejected by anything. It's a real, independently-sourced number that
+  // exists specifically because the DCF guard had nothing to offer
+  // (fallback) or offered something implausible (capped). Since this field
+  // predates the whole cap/fallback mechanism and was never updated for
+  // it, an anchored value got silently wiped back to null/the raw outlier
+  // by every single run of this pipeline, regardless of how quickly
+  // apply-dcf-cap.yml itself re-ran that same day — verified live this was
+  // a real, live problem: 3,616 of 5,109 tickers (70%) showed no DCF
+  // estimate at all, and outliers like SKYW (~6.2x its real price, $615 vs
+  // $98.87) stayed uncapped for however long that gap lasted, every day.
+  // Preserving the anchor here (never the reverse — a genuinely fresh DCF
+  // that is in range against BOTH price and the anchor always wins, since
+  // it's more current and specific than either fallback) closes that gap
+  // entirely instead of just shrinking the window between runs, without
+  // reopening the door to a wildly-divergent fresh DCF silently overwriting
+  // a trustworthy analyst number the moment it happens to duck under the
+  // price-based ceiling alone.
+  let estimatedFairValueSource;
+  if (previousAnchor != null && (estimatedFairValue == null || isOutlierVsPrice || isOutlierVsAnchor)) {
+    estimatedFairValue = previousAnchor;
+    estimatedFairValueSource = previous.estimatedFairValueSource;
   }
 
   return {
@@ -3265,6 +3322,7 @@ async function processSymbol(symbol, apiKey, ctx) {
       industry: profile.industry,
       ...values,
       estimatedFairValue,
+      estimatedFairValueSource,
       // Published alongside the comparable metrics (not just kept in
       // profileEntry, which never persists across runs) specifically so
       // computeIndustryLeaders can still score a ticker that's recovered
