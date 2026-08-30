@@ -269,17 +269,47 @@ function buildSecSyntheticPfcfReports(gaapFacts, cik) {
 // mergeSyntheticReports, minus the narrow-stub-replacement case (this script
 // has no equivalent of that file's backfillRevenueGapsFromSec pre-pass, so
 // every existing entry here is a real Finnhub one).
+// Augments a real Finnhub entry's EMPTY sections with the synthesized
+// entry's own items, rather than the old all-or-nothing "real entry
+// occupies this slot, skip synthesizing" rule -- verified live: BNC's
+// three most recent 10-Qs (a fiscal-year-change transition, filed as
+// amended 10-Q/As) crawled with ic:0/cf:0 items on Finnhub's side (only
+// balance-sheet content came through), so the old rule silently discarded
+// real, current SEC data for those exact quarters just because a
+// technically-real-but-empty Finnhub entry already claimed the slot. Only
+// ever fills a section that's COMPLETELY empty -- a real entry with SOME
+// content in a section (even partial) still wins outright for that
+// section, same "real wins" philosophy as before.
+function fillEmptySections(existing, synthesized) {
+  if (!(existing.report.ic || []).length && (synthesized.report.ic || []).length) {
+    existing.report.ic = synthesized.report.ic;
+  }
+  if (!(existing.report.cf || []).length && (synthesized.report.cf || []).length) {
+    existing.report.cf = synthesized.report.cf;
+  }
+}
+
 function mergeSyntheticPfcfReports(quarterlyReports, annualReports, synthesized) {
   const mergedQuarterlyReports = [...(quarterlyReports || [])];
-  const existingQuarterKeys = new Set(mergedQuarterlyReports.filter((r) => r?.year && r?.quarter).map((r) => `${r.year}-${r.quarter}`));
+  const existingQuarterByKey = new Map(mergedQuarterlyReports.filter((r) => r?.year && r?.quarter).map((r) => [`${r.year}-${r.quarter}`, r]));
   for (const r of synthesized.quarterlyReports) {
-    if (!existingQuarterKeys.has(`${r.year}-${r.quarter}`)) mergedQuarterlyReports.push(r);
+    const existing = existingQuarterByKey.get(`${r.year}-${r.quarter}`);
+    if (!existing) {
+      mergedQuarterlyReports.push(r);
+    } else {
+      fillEmptySections(existing, r);
+    }
   }
 
   const mergedAnnualReports = [...(annualReports || [])];
-  const existingAnnualYears = new Set(mergedAnnualReports.filter((r) => r?.year).map((r) => r.year));
+  const existingAnnualByYear = new Map(mergedAnnualReports.filter((r) => r?.year).map((r) => [r.year, r]));
   for (const r of synthesized.annualReports) {
-    if (!existingAnnualYears.has(r.year)) mergedAnnualReports.push(r);
+    const existing = existingAnnualByYear.get(r.year);
+    if (!existing) {
+      mergedAnnualReports.push(r);
+    } else {
+      fillEmptySections(existing, r);
+    }
   }
 
   return { quarterlyReports: mergedQuarterlyReports, annualReports: mergedAnnualReports };

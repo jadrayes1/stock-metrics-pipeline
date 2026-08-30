@@ -1419,6 +1419,25 @@ function buildSecSyntheticReports(gaapFacts, cik, isFinancial = false) {
 // roic with a hole the broader enrichment could have closed, until this
 // replacement step was added. A slot with no existing entry at all is
 // filled in as before.
+// A real (non-stub) Finnhub entry can still have a completely EMPTY
+// section -- verified live: BNC/CEA Industries' three most recent 10-Qs
+// (an amended filing following a fiscal-year-change transition) crawled
+// with ic:0/cf:0 items on Finnhub's side, only balance-sheet content came
+// through. The old rule treated any real entry as claiming the whole
+// slot, silently discarding real, current SEC data for those quarters
+// just because a technically-real-but-empty Finnhub entry got there
+// first. Only ever fills a section that's COMPLETELY empty -- a real
+// entry with SOME content in a section (even partial) still wins outright
+// for that section, same "real wins" philosophy as everywhere else in
+// this merge.
+function fillEmptySections(existing, synthesized) {
+  for (const section of ['ic', 'cf', 'bs']) {
+    if (!(existing.report[section] || []).length && (synthesized.report[section] || []).length) {
+      existing.report[section] = synthesized.report[section];
+    }
+  }
+}
+
 function mergeSyntheticReports(quarterlyReports, annualReports, synthesized) {
   const isNarrowStub = (r) => r?.form === 'SEC-XBRL-narrow';
 
@@ -1430,6 +1449,8 @@ function mergeSyntheticReports(quarterlyReports, annualReports, synthesized) {
       mergedQuarterlyReports.push(r);
     } else if (isNarrowStub(existing)) {
       mergedQuarterlyReports[mergedQuarterlyReports.indexOf(existing)] = r;
+    } else {
+      fillEmptySections(existing, r);
     }
   }
 
@@ -1441,6 +1462,8 @@ function mergeSyntheticReports(quarterlyReports, annualReports, synthesized) {
       mergedAnnualReports.push(r);
     } else if (isNarrowStub(existing)) {
       mergedAnnualReports[mergedAnnualReports.indexOf(existing)] = r;
+    } else {
+      fillEmptySections(existing, r);
     }
   }
 
