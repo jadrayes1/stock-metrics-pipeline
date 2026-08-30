@@ -3260,17 +3260,6 @@ async function processSymbol(symbol, apiKey, ctx) {
     }
   }
 
-  if (process.env.DEBUG_YEAR_FIX && symbol === process.env.DEBUG_YEAR_FIX) {
-    console.error('DEBUG_YEAR_FIX annual years:', (annualReportedFinancials || []).map((r) => r.year));
-    for (const r of annualReportedFinancials || []) {
-      const equity = findReportedTotalEquity(r.report?.bs || []);
-      const debt = sumDebt(r.report?.bs || []);
-      const cash = findReportedCashBalance(r.report?.bs || []);
-      const ebit = findReportedEBIT(r.report?.ic || []);
-      console.error('DEBUG_YEAR_FIX', r.year, 'form=', r.form, 'equity=', equity, 'debt=', debt, 'cash=', cash, 'ebit=', ebit);
-    }
-  }
-
   const yearlyBuilders = {
     revenueGrowth: () => fdicTrends?.yearly.revenueGrowth || buildRevenueGrowthYearlyFromFilings(annualReportedFinancials),
     profitMargin: () => fdicTrends?.yearly.profitMargin || buildProfitMarginYearlyFromFilings(annualReportedFinancials),

@@ -131,7 +131,6 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           FINNHUB_API_KEY_2: ${{ secrets.FINNHUB_API_KEY_2 }}
           TARGET_SYMBOL: ${{ inputs.symbol }}
-          DEBUG_YEAR_FIX: ${{ inputs.symbol }}
         run: node scripts/generateSectorMetrics.js
 
       # DCF cap + fallback (real analyst price targets via yfinance,
