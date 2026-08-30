@@ -655,6 +655,29 @@ function fixMislabeledAnnualYears(reports) {
   });
 }
 
+// The same mislabeling shows up in quarterly (10-Q) reports too, but there's
+// no single date-arithmetic rule to re-derive the right fiscal year from a
+// quarter's own endDate alone -- that depends on where THIS company's fiscal
+// year boundary falls, which varies per ticker (CRWD's own quarterly data
+// shows the mislabeling drifting across several different multi-year windows,
+// not one clean off-by-one). Instead, key off `startDate`: every quarterly
+// report in a given fiscal year shares the exact same startDate as that
+// year's annual report (both start the day the fiscal year begins), so the
+// now-corrected annualReports (see fixMislabeledAnnualYears) already carry
+// the right answer for every startDate this ticker uses. Only touch a
+// ticker's quarters when a genuine (year, quarter) collision is already
+// observed -- proven per-ticker that Finnhub's own field is unreliable here.
+function fixMislabeledQuarterlyYears(quarterlyReports, annualReports) {
+  const keys = (quarterlyReports || []).map((r) => `${r.year}-${r.quarter}`);
+  const hasDuplicateKey = new Set(keys).size !== keys.length;
+  if (!hasDuplicateKey) return quarterlyReports;
+  const yearByStartDate = new Map((annualReports || []).filter((a) => a.startDate && a.year != null).map((a) => [a.startDate, a.year]));
+  return (quarterlyReports || []).map((r) => {
+    const correctYear = r.startDate ? yearByStartDate.get(r.startDate) : null;
+    return correctYear != null ? { ...r, year: correctYear } : r;
+  });
+}
+
 async function fetchReportedFinancialsFor(symbol, apiKey) {
   const requestSymbol = resolveFinancialsReportedSymbol(symbol);
   const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${requestSymbol}&freq=annual&token=${apiKey}`);
@@ -3100,6 +3123,7 @@ async function processSymbol(symbol, apiKey, ctx) {
   await sleep(REQUEST_SPACING_MS);
   try {
     quarterlyFinancials = await fetchReportedFinancialsQuarterlyFor(symbol, apiKey);
+    quarterlyFinancials = fixMislabeledQuarterlyYears(quarterlyFinancials, annualReportedFinancials);
   } catch {
     // Leave quarterlyFinancials empty — every builder below degrades
     // gracefully to "nothing new," and pickTrendToPublish falls back to
