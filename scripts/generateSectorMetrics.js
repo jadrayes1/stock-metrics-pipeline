@@ -3512,7 +3512,24 @@ async function runWorker(workerId, symbolSubset, apiKey, ctx) {
 
 async function main() {
   const apiKeys = readFinnhubApiKeys();
-  const symbols = await fetchUniverse(apiKeys[0]);
+  let symbols = await fetchUniverse(apiKeys[0]);
+  // Single-symbol debug/backfill mode (mirrors the same TARGET_SYMBOL
+  // pattern already used in generatePfcfTrendCache.js and
+  // fetchDcfCapTargets.py) -- lets one ticker's fix get verified or
+  // manually backfilled in seconds instead of waiting out the ~5hr
+  // full-universe run. NOTE: only `metrics`/the 4 trend caches have a
+  // fallback-restore path below for tickers this run doesn't touch --
+  // `profiles` (and therefore `industryLeaders`, which is computed from
+  // it) and `dcfCapCandidates` do NOT, so a TARGET_SYMBOL run's own local
+  // marketMetrics.json/dcfCapCandidates.json are NOT safe to publish
+  // wholesale -- see generate-sector-metrics.yml's publish step, which
+  // merges just the target symbol's fresh entry into the currently-
+  // published gist files instead of copying these local files verbatim.
+  if (process.env.TARGET_SYMBOL) {
+    const target = process.env.TARGET_SYMBOL.toUpperCase();
+    symbols = symbols.filter((s) => s.toUpperCase() === target);
+    console.log(`TARGET_SYMBOL=${target} set — restricting this run to: ${symbols.join(', ') || '(not found in universe)'}`);
+  }
   console.log(
     `Fetching industry + fundamentals + DCF inputs for ${symbols.length} tickers across ${apiKeys.length} API key(s) ` +
       `(four Finnhub calls each — the fourth is quarterly financials-reported, now fetched for every ticker — rate-limited to stay under Finnhub's free-tier cap per key)...`

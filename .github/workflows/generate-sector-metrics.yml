@@ -104,7 +104,12 @@ on:
     # workflows, are the next levers if the 6-hour ceiling keeps getting hit
     # after REQUEST_SPACING_MS's 2026-08-25 widening).
     - cron: '0 0 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: 'Optional: restrict this run to one ticker (debug/backfill only -- see TARGET_SYMBOL in generateSectorMetrics.js). Leave blank for a normal full-universe run.'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -125,6 +130,7 @@ jobs:
         env:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           FINNHUB_API_KEY_2: ${{ secrets.FINNHUB_API_KEY_2 }}
+          TARGET_SYMBOL: ${{ inputs.symbol }}
         run: node scripts/generateSectorMetrics.js
 
       # DCF cap + fallback (real analyst price targets via yfinance,
@@ -167,9 +173,29 @@ jobs:
         env:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
+          TARGET_SYMBOL: ${{ inputs.symbol }}
         run: |
           git clone --depth 1 "https://${GIST_TOKEN}@gist.github.com/${GIST_ID}.git" gist-clone
-          if diff -q src/data/marketMetrics.json gist-clone/marketMetrics.json >/dev/null 2>&1 && \
+          # A TARGET_SYMBOL run's local files are only safe to MERGE one
+          # ticker out of, never copy wholesale — see
+          # mergeSingleSymbolIntoGist.js's own header for why (industryLeaders/
+          # dcfCapCandidates have no fallback-restore path for untouched
+          # tickers the way metrics/trends do).
+          if [ -n "$TARGET_SYMBOL" ]; then
+            node scripts/mergeSingleSymbolIntoGist.js
+            cd gist-clone
+            git config user.email "actions@github.com"
+            git config user.name "stock-metrics-pipeline"
+            # Orphan commit here too, same reason as the full-run branch
+            # below — accumulating history on top of these multi-ten-MB
+            # files, even for a small single-symbol patch, adds a full
+            # snapshot of all of them to history each time.
+            git checkout --orphan latest-snapshot
+            git add -A
+            git commit -m "Backfill ${TARGET_SYMBOL} $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git branch -M main
+            git push --force origin main
+          elif diff -q src/data/marketMetrics.json gist-clone/marketMetrics.json >/dev/null 2>&1 && \
              diff -q src/data/trendsNative.json gist-clone/trendsNative.json >/dev/null 2>&1 && \
              diff -q src/data/trendsQuarterly.json gist-clone/trendsQuarterly.json >/dev/null 2>&1 && \
              diff -q src/data/trendsYearly.json gist-clone/trendsYearly.json >/dev/null 2>&1 && \
