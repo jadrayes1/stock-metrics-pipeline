@@ -599,12 +599,68 @@ function impliedPriceFromProfile(profile) {
   return profile.marketCapitalization != null && profile.shareOutstanding > 0 ? profile.marketCapitalization / profile.shareOutstanding : null;
 }
 
+// Finnhub's financials-reported concept field is supposed to always carry a
+// namespace prefix (us-gaap_ConceptName, ifrs-full_ConceptName, a filer's
+// own extension like crwd_SomeLine, etc.) — every concept-matching function
+// in this file checks for that exact prefixed form. Verified live: CRWD's
+// real 2021 10-K entry has EVERY concept in its ic/cf/bs sections
+// completely unprefixed (bare "StockholdersEquity" instead of
+// "us-gaap_StockholdersEquity") — a genuine Finnhub crawl inconsistency for
+// this specific (older) filing, not a bug in any one concept-matcher.
+// Silently made every concept-based lookup against this one report fail
+// (equity, EBIT, revenue, all of it) — CRWD's yearly ROIC was stuck at
+// FY'20 specifically because this exact report's StockholdersEquity
+// concept never matched anything, and the label fallback (matching "total
+// stockholders' equity") also missed since CRWD's real label embeds its own
+// company name in the middle ("Total CrowdStrike Holdings, Inc.
+// stockholders' equity"). Normalized once, right where reports are
+// fetched, rather than patching every individual concept check — a bare
+// concept name (no namespace prefix already present) is assumed us-gaap,
+// the overwhelmingly common case for every concept this file ever looks for.
+function hasNamespacePrefix(concept) {
+  return /^[a-z0-9-]+_/i.test(concept || '');
+}
+function normalizeReportedFinancials(reports) {
+  const normalizeItems = (items) =>
+    (items || []).map((item) => (item?.concept && !hasNamespacePrefix(item.concept) ? { ...item, concept: `us-gaap_${item.concept}` } : item));
+  return (reports || []).map((r) => ({
+    ...r,
+    report: { ...r.report, ic: normalizeItems(r.report?.ic), cf: normalizeItems(r.report?.cf), bs: normalizeItems(r.report?.bs) },
+  }));
+}
+
+// Finnhub's own `year` field for annual (10-K) reports is occasionally
+// wrong for a run of consecutive fiscal years, not just a single one -- CRWD
+// tags 3 straight 10-Ks (FY'23/'24/'25, each ending Jan 31) with the
+// *start*-date's calendar year instead of the *end*-date's (its own real
+// fiscal-year convention, confirmed by CRWD's own correctly-labeled
+// FY'20/'21/'22/'26 filings all using end-year). That collides two real
+// filings onto "year: 2022" and leaves no filing ever tagged "year: 2025" --
+// every year-keyed consumer downstream (buildAnnualFlowPoints' plain
+// .map()/.sort(), the yearly ROIC builder's `.find(a => a.year === r.year)`
+// balance-sheet lookup, revenueGrowth's year===year-1+1 adjacency guard)
+// assumes `.year` uniquely identifies one fiscal year, so a collision either
+// renders two chart points under one identical label or silently drops a
+// real year's growth calc. Only recompute `.year` from `endDate` when a
+// duplicate is already observed for this ticker -- proven per-ticker that
+// Finnhub's own field is unreliable here -- never touch tickers where every
+// annual `.year` is already unique (the overwhelming majority).
+function fixMislabeledAnnualYears(reports) {
+  const years = (reports || []).map((r) => r.year).filter((y) => y != null);
+  const hasDuplicateYear = new Set(years).size !== years.length;
+  if (!hasDuplicateYear) return reports;
+  return reports.map((r) => {
+    const endYear = r.endDate ? new Date(r.endDate).getUTCFullYear() : NaN;
+    return Number.isFinite(endYear) ? { ...r, year: endYear } : r;
+  });
+}
+
 async function fetchReportedFinancialsFor(symbol, apiKey) {
   const requestSymbol = resolveFinancialsReportedSymbol(symbol);
   const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${requestSymbol}&freq=annual&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
-  return Array.isArray(data?.data) ? data.data : [];
+  return fixMislabeledAnnualYears(normalizeReportedFinancials(Array.isArray(data?.data) ? data.data : []));
 }
 
 // ---------------------------------------------------------------------------
@@ -1728,7 +1784,7 @@ async function fetchReportedFinancialsQuarterlyFor(symbol, apiKey) {
   const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${requestSymbol}&freq=quarterly&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
-  return Array.isArray(data?.data) ? data.data : [];
+  return normalizeReportedFinancials(Array.isArray(data?.data) ? data.data : []);
 }
 
 // ---------------------------------------------------------------------------
