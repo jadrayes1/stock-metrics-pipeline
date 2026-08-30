@@ -107,9 +107,27 @@ async function fetchEtfProfile(symbol, apiKey) {
   }
   const expenseRatio = data.net_expense_ratio != null ? parseFloat(data.net_expense_ratio) : null;
   const netAssets = data.net_assets != null ? parseFloat(data.net_assets) : null;
+  // Verified live: Alpha Vantage's own `holdings` array is already sorted
+  // descending by weight (SPY's #1 is NVDA at ~7.68%) -- .slice(0, 10) is
+  // sufficient, no re-sort needed. Renamed from Alpha Vantage's own
+  // `description` key to `name` here, at the single point this payload is
+  // first consumed, so every downstream consumer matches the rest of the
+  // app's own vocabulary (POPULAR_MARKET_ETFS, IndustryLeaders' leaders,
+  // etc. all use `name`, never `description`). A non-equity ETF (e.g. a
+  // futures-based commodity fund) genuinely has no constituent holdings to
+  // disclose -- verified live for UCO: `holdings: []`, not a bug. Stored
+  // as [] uniformly (never omitted) so every consumer only needs to check
+  // .length, not existence.
+  const holdings = Array.isArray(data.holdings)
+    ? data.holdings
+        .slice(0, 10)
+        .map((h) => ({ symbol: h.symbol ?? null, name: h.description ?? null, weight: h.weight != null ? parseFloat(h.weight) : null }))
+        .filter((h) => h.symbol)
+    : [];
   return {
     expenseRatio: Number.isNaN(expenseRatio) ? null : expenseRatio,
     netAssets: Number.isNaN(netAssets) ? null : netAssets,
+    holdings,
   };
 }
 
@@ -149,7 +167,7 @@ async function main() {
     try {
       const profile = await fetchEtfProfile(symbol, apiKey);
       cache[symbol] = { fetchedAt: new Date().toISOString(), ...profile };
-      console.log(`  ${symbol}: expenseRatio=${profile.expenseRatio}, netAssets=${profile.netAssets}`);
+      console.log(`  ${symbol}: expenseRatio=${profile.expenseRatio}, netAssets=${profile.netAssets}, holdings=${profile.holdings.length}`);
     } catch (err) {
       console.log(`  skip ${symbol}: ${err.message}`);
       // Leave any existing cache entry for this symbol untouched on failure
