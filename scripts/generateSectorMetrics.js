@@ -2381,6 +2381,27 @@ function buildProfitMarginTTMFromFilings(quarterlyReports, annualReports) {
 
 // --- ROIC: Quarterly, Yearly, TTM (none of these existed in this pipeline before) ---
 
+// Cash-netting (debt + equity - cash) can flip invested capital negative for
+// a growth-stage company holding a strategic cash reserve larger than its
+// combined debt + equity — verified live for CRWD: real, SEC-confirmed
+// equity/debt/cash (not a data bug), driven by a large convertible-notes
+// raise plus book equity held down by cumulative losses from non-cash
+// stock-based comp. That's a real, if unusual, capital structure, not a
+// "no real capital" situation — CRWD's own debt+equity has grown steadily
+// to $5B+. Only fall back to the un-netted figure when netting cash would
+// otherwise EXCLUDE the period; every ticker whose netted figure is already
+// positive is completely unaffected (this is a no-op for the vast majority
+// of tickers, which never hit the primary calculation going negative).
+// Genuinely exclude only when even debt+equity alone is non-positive (e.g.
+// negative book equity exceeding debt) — the ISPR/AGEN case, where there's
+// truly no real capital base to measure a return against.
+function computeInvestedCapital(debt, equity, cash) {
+  const netOfCash = debt + equity - cash;
+  if (netOfCash > 0) return netOfCash;
+  const withoutCash = debt + equity;
+  return withoutCash > 0 ? withoutCash : null;
+}
+
 function buildRoicQuarterlyFromFilings(quarterlyReports, annualReports, isBank) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
   const ebitRecords = buildStandaloneFlowQuarters(quarterlyReports, annualReports, { ebit: { fn: findReportedEBIT, section: 'ic' } });
@@ -2400,7 +2421,7 @@ function buildRoicQuarterlyFromFilings(quarterlyReports, annualReports, isBank) 
     // to 34-57% instead of its real ~3%). Debt is untouched (already ~0 for
     // most banks — see sumDebt's own deliberate exclusion of deposits).
     const cash = isBank ? 0 : findReportedCashBalance(q.report?.bs || []) || 0;
-    investedCapitalByQuarter[`${q.year}-${q.quarter}`] = debt + equity - cash;
+    investedCapitalByQuarter[`${q.year}-${q.quarter}`] = computeInvestedCapital(debt, equity, cash);
   }
   // A fiscal year-end balance sheet is only ever tagged as part of the
   // annual (10-K) report, never as a standalone Q4 entry in
@@ -2419,7 +2440,7 @@ function buildRoicQuarterlyFromFilings(quarterlyReports, annualReports, isBank) 
     if (equity == null) continue;
     const debt = sumDebt(a.report?.bs || []);
     const cash = isBank ? 0 : findReportedCashBalance(a.report?.bs || []) || 0;
-    investedCapitalByQuarter[key] = debt + equity - cash;
+    investedCapitalByQuarter[key] = computeInvestedCapital(debt, equity, cash);
   }
 
   return ebitRecords
@@ -2454,7 +2475,7 @@ function buildRoicYearlyFromFilings(annualReports, isBank) {
       // See buildRoicQuarterlyFromFilings above for why cash isn't netted
       // out for bank filers.
       const cash = isBank ? 0 : findReportedCashBalance(annualReport?.report?.bs || []) || 0;
-      const investedCapital = debt + equity - cash;
+      const investedCapital = computeInvestedCapital(debt, equity, cash);
       if (!(investedCapital > 0)) return null;
       const nopat = r.ebit * (1 - ROIC_ASSUMED_TAX_RATE);
       const value = clampImplausible(nopat / investedCapital);
@@ -2477,7 +2498,7 @@ function buildRoicTTMFromFilings(quarterlyReports, annualReports, isBank) {
     // See buildRoicQuarterlyFromFilings above for why cash isn't netted
     // out for bank filers.
     const cash = isBank ? 0 : findReportedCashBalance(q.report?.bs || []) || 0;
-    investedCapitalByQuarter[`${q.year}-${q.quarter}`] = debt + equity - cash;
+    investedCapitalByQuarter[`${q.year}-${q.quarter}`] = computeInvestedCapital(debt, equity, cash);
   }
   // See the identical backfill in buildRoicQuarterlyFromFilings above --
   // without it, any TTM window anchored on Q4 was silently dropped too.
@@ -2488,7 +2509,7 @@ function buildRoicTTMFromFilings(quarterlyReports, annualReports, isBank) {
     if (equity == null) continue;
     const debt = sumDebt(a.report?.bs || []);
     const cash = isBank ? 0 : findReportedCashBalance(a.report?.bs || []) || 0;
-    investedCapitalByQuarter[key] = debt + equity - cash;
+    investedCapitalByQuarter[key] = computeInvestedCapital(debt, equity, cash);
   }
 
   const standaloneQuarters = Object.keys(ebit)
