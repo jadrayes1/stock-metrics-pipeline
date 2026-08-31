@@ -117,6 +117,7 @@ const OUTPUT_TRENDS_NATIVE_FILE = path.join(__dirname, '../src/data/trendsNative
 const OUTPUT_TRENDS_QUARTERLY_FILE = path.join(__dirname, '../src/data/trendsQuarterly.json');
 const OUTPUT_TRENDS_YEARLY_FILE = path.join(__dirname, '../src/data/trendsYearly.json');
 const OUTPUT_TRENDS_TTM_FILE = path.join(__dirname, '../src/data/trendsTtm.json');
+const OUTPUT_TICKER_SEARCH_INDEX_FILE = path.join(__dirname, '../src/data/tickerSearchIndex.json');
 // Intermediate, unpublished artifact — tickers needing a real analyst price
 // target lookup, either to cap an outlier DCF estimate (see
 // DCF_CAP_CANDIDATE_MULTIPLE) or to fill in a mid-range estimate where DCF
@@ -165,14 +166,34 @@ function readFinnhubApiKeys() {
   return keys;
 }
 
+// Returns the full filtered entry ({symbol, name, type}), not just the bare
+// symbol string — name/type used to also be discarded here, but they're
+// needed to publish tickerSearchIndex.json (see buildTickerSearchIndex)
+// from this SAME call rather than paying a second Finnhub request for data
+// already in hand.
 async function fetchUniverse(apiKey) {
   const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/symbol?exchange=US&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status} fetching symbol universe`);
   const all = await res.json();
   return all
     .filter((s) => ALLOWED_MICS.has(s.mic) && ALLOWED_TYPES.has(s.type))
-    .map((s) => s.symbol)
-    .sort();
+    .map((s) => ({ symbol: s.symbol, name: s.description || null, type: s.type || null }))
+    .sort((a, b) => a.symbol.localeCompare(b.symbol));
+}
+
+// Small, static, client-searchable index — symbol/name/type for every
+// ticker in the pipeline's own covered universe, published once per run
+// alongside marketMetrics.json. Lets the app search entirely client-side
+// (see src/api/stockData.js's searchTickers) instead of calling Finnhub's
+// live /search endpoint on every keystroke, which doesn't scale past a
+// handful of concurrent users on a single shared free-tier key (60 req/min,
+// shared across every user through the proxy). Built from the SAME
+// universe fetch main() already makes -- costs nothing extra, and is
+// deliberately built from the FULL, unfiltered universeEntries (before any
+// TARGET_SYMBOL debug filtering is applied to `symbols` below), so a
+// single-symbol debug run never publishes a truncated index.
+function buildTickerSearchIndex(universeEntries) {
+  return universeEntries.map((e) => ({ symbol: e.symbol, name: e.name, type: e.type }));
 }
 
 function sleep(ms) {
@@ -3533,7 +3554,15 @@ async function runWorker(workerId, symbolSubset, apiKey, ctx) {
 
 async function main() {
   const apiKeys = readFinnhubApiKeys();
-  let symbols = await fetchUniverse(apiKeys[0]);
+  const universeEntries = await fetchUniverse(apiKeys[0]);
+  // Built from the full, unfiltered universe fetch above, before any
+  // TARGET_SYMBOL debug filtering below -- always complete regardless of
+  // debug mode (see generate-sector-metrics.yml's publish step, which only
+  // copies this file during a normal full run anyway, same as
+  // coverageAudit.json).
+  const tickerSearchIndex = buildTickerSearchIndex(universeEntries);
+
+  let symbols = universeEntries.map((e) => e.symbol);
   // Single-symbol debug/backfill mode (mirrors the same TARGET_SYMBOL
   // pattern already used in generatePfcfTrendCache.js and
   // fetchDcfCapTargets.py) -- lets one ticker's fix get verified or
@@ -3704,6 +3733,7 @@ async function main() {
   fs.writeFileSync(OUTPUT_TRENDS_QUARTERLY_FILE, JSON.stringify({ generatedAt, trends: quarterlyTrends }));
   fs.writeFileSync(OUTPUT_TRENDS_YEARLY_FILE, JSON.stringify({ generatedAt, trends: yearlyTrends }));
   fs.writeFileSync(OUTPUT_TRENDS_TTM_FILE, JSON.stringify({ generatedAt, trends: ttmTrends }));
+  fs.writeFileSync(OUTPUT_TICKER_SEARCH_INDEX_FILE, JSON.stringify({ generatedAt, tickers: tickerSearchIndex }));
   fs.writeFileSync(OUTPUT_DCF_CAP_CANDIDATES_FILE, JSON.stringify({ generatedAt, candidates: dcfCapCandidates }));
   const capCandidateCount = Object.values(dcfCapCandidates).filter((c) => c.reason === 'cap').length;
   const fallbackCandidateCount = Object.values(dcfCapCandidates).filter((c) => c.reason === 'fallback').length;

@@ -200,6 +200,7 @@ jobs:
              diff -q src/data/trendsQuarterly.json gist-clone/trendsQuarterly.json >/dev/null 2>&1 && \
              diff -q src/data/trendsYearly.json gist-clone/trendsYearly.json >/dev/null 2>&1 && \
              diff -q src/data/trendsTtm.json gist-clone/trendsTtm.json >/dev/null 2>&1 && \
+             diff -q src/data/tickerSearchIndex.json gist-clone/tickerSearchIndex.json >/dev/null 2>&1 && \
              diff -q coverageAudit.json gist-clone/coverageAudit.json >/dev/null 2>&1 && \
              diff -q dcfCapCandidates.json gist-clone/dcfCapCandidates.json >/dev/null 2>&1; then
             echo "No changes to publish."
@@ -209,6 +210,7 @@ jobs:
             cp src/data/trendsQuarterly.json gist-clone/trendsQuarterly.json
             cp src/data/trendsYearly.json gist-clone/trendsYearly.json
             cp src/data/trendsTtm.json gist-clone/trendsTtm.json
+            cp src/data/tickerSearchIndex.json gist-clone/tickerSearchIndex.json
             cp coverageAudit.json gist-clone/coverageAudit.json
             # dcfCapCandidates.json is small (well under the Gist API's 1MB
             # cap) but published via this same git-clone step, not a
