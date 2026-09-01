@@ -105,6 +105,9 @@ const MID_SEQUENCE_GAP_RECENT_YEARS = 2;
 const SEC_OCF_CONCEPTS = ['NetCashProvidedByUsedInOperatingActivities', 'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'];
 const SEC_CAPEX_CONCEPTS = ['PaymentsToAcquirePropertyPlantAndEquipment', 'PaymentsToAcquireProductiveAssets', 'PaymentsForCapitalImprovements', 'PaymentsToAcquireOtherPropertyPlantAndEquipment'];
 const SEC_INVESTING_SUBTOTAL_CONCEPTS = ['NetCashProvidedByUsedInInvestingActivities', 'NetCashProvidedByUsedInInvestingActivitiesContinuingOperations'];
+// P/E's numerator -- same SEC-XBRL enrichment benefit P/FCF's OCF/capex/
+// shares already get for sparse/stale Finnhub coverage.
+const SEC_NET_INCOME_CONCEPTS = ['NetIncomeLoss', 'ProfitLoss'];
 // Diluted checked first, same preference order as findReportedDilutedShares
 // below (basic is only a fallback there too).
 const SEC_SHARES_CONCEPTS = ['WeightedAverageNumberOfDilutedSharesOutstanding', 'WeightedAverageNumberOfSharesOutstandingBasic'];
@@ -228,7 +231,7 @@ function buildSecSyntheticPfcfReports(gaapFacts, cik) {
   const quarterNumber = { Q1: 1, Q2: 2, Q3: 3, Q4: 4 };
 
   const fyFpKeys = new Map();
-  for (const concept of [...SEC_OCF_CONCEPTS, ...SEC_CAPEX_CONCEPTS]) {
+  for (const concept of [...SEC_OCF_CONCEPTS, ...SEC_CAPEX_CONCEPTS, ...SEC_NET_INCOME_CONCEPTS]) {
     for (const fact of gaapFacts[concept]?.units?.USD || []) {
       if (fact.fy == null || !fact.fp || fact.val == null) continue;
       fyFpKeys.set(`${fact.fy}-${fact.fp}`, { fy: fact.fy, fp: fact.fp });
@@ -253,7 +256,10 @@ function buildSecSyntheticPfcfReports(gaapFacts, cik) {
 
     let sharesFact = findSecValueForFyFp(gaapFacts, SEC_SHARES_CONCEPTS, fy, fp, 'shares');
     if (sharesFact && sharesFact.value < MIN_PLAUSIBLE_SHARES) sharesFact = null; // see MIN_PLAUSIBLE_SHARES above
-    const icItems = sharesFact ? [{ concept: sharesFact.concept, label: `${sharesFact.concept} (SEC XBRL enrichment)`, value: sharesFact.value }] : [];
+    const netIncomeFact = findSecValueForFyFp(gaapFacts, SEC_NET_INCOME_CONCEPTS, fy, fp, 'USD');
+    const icItems = [sharesFact, netIncomeFact]
+      .filter(Boolean)
+      .map((r) => ({ concept: r.concept, label: `${r.concept} (SEC XBRL enrichment)`, value: r.value }));
 
     if (!cfItems.length && !icItems.length) continue;
 
@@ -436,6 +442,19 @@ function findReportedCapexQ(cfItems) {
   // line in.
   const hasInvestingSection = cfItems.some((item) => /investing activities/i.test(item.label || ''));
   return hasInvestingSection ? null : 0;
+}
+
+// Mirrors NET_INCOME_CONCEPT_CANDIDATES/findReportedNetIncome in
+// generateSectorMetrics.js (line ~1999) and src/utils/metrics.js — the
+// numerator for P/E reconstruction, same role OCF plays for P/FCF above.
+const NET_INCOME_CONCEPT_CANDIDATES = ['us-gaap_NetIncomeLoss', 'us-gaap_ProfitLoss'];
+function findReportedNetIncome(icItems) {
+  for (const concept of NET_INCOME_CONCEPT_CANDIDATES) {
+    const match = icItems.find((item) => item.concept === concept);
+    if (match) return match.value;
+  }
+  const labelMatch = icItems.find((item) => /^net income/i.test(item.label || ''));
+  return labelMatch ? labelMatch.value : null;
 }
 
 // Mirrors findReportedDilutedShares in src/utils/metrics.js — see that file
@@ -726,6 +745,120 @@ function buildPfcfYearlyFromFilingsAndPrices(annualReports, monthlyPrices, isBan
     .slice(-QUARTERS_OF_HISTORY);
 }
 
+// --- P/E reconstruction ---
+//
+// Unlike the other 5 comparable metrics, peRatio has no SEC-filings
+// reconstruction fallback anywhere in this pipeline -- it's 100% dependent
+// on Finnhub's own native peTTM quarterly series. Verified live across
+// CRWD/ASST/RBLX/PL: that series is frequently missing or sparse
+// specifically for companies with negative trailing EPS -- Finnhub appears
+// to omit "N/M" (not meaningful) negative-P/E periods from its own series
+// entirely. This closes that gap the same way P/FCF's own gap is closed:
+// real net income (already extracted for profitMargin/roic elsewhere in
+// this pipeline) divided by real diluted shares gives EPS, and EPS priced
+// against the SAME already-fetched Twelve Data monthly prices gives P/E --
+// zero additional Twelve Data calls, since this reuses the identical
+// quarterlyReports/annualReports/monthlyPrices already in scope per ticker
+// in main()'s loop. Deliberately NO clamp against a negative value here --
+// a negative P/E is the entire point of this fix (the exact case Finnhub's
+// own series omits), so the reconstructed series must surface it, not hide
+// it the way a "plausibility" clamp would.
+function buildPeTrendFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices) {
+  const currentCik = quarterlyReports?.[0]?.cik ?? annualReports?.[0]?.cik;
+  const sameCik = (r) => currentCik == null || r.cik === currentCik;
+  quarterlyReports = (quarterlyReports || []).filter(sameCik);
+  annualReports = (annualReports || []).filter(sameCik);
+
+  const netIncome = decumulateYtdByYear(quarterlyReports, annualReports, findReportedNetIncome, 'ic');
+
+  const sharesByQuarter = {};
+  for (const q of quarterlyReports || []) {
+    if (!q?.quarter) continue;
+    const shares = findReportedDilutedShares(q.report?.ic || []);
+    if (shares != null) sharesByQuarter[`${q.year}-${q.quarter}`] = shares;
+  }
+  for (const a of annualReports || []) {
+    const shares = findReportedDilutedShares(a?.report?.ic || []);
+    if (shares != null) sharesByQuarter[`${a.year}-4`] = sharesByQuarter[`${a.year}-4`] ?? shares;
+  }
+
+  const standaloneQuarters = Object.keys(netIncome)
+    .filter((key) => sharesByQuarter[key] > 0)
+    .map((key) => {
+      const [year, quarter] = key.split('-').map(Number);
+      return { year, quarter, netIncome: netIncome[key], shares: sharesByQuarter[key] };
+    })
+    .sort((a, b) => a.year - b.year || a.quarter - b.quarter);
+
+  const points = buildTrailingWindows(standaloneQuarters, 4).map(({ quarters, anchor, partial }) => {
+    const ttmNetIncome = quarters.reduce((sum, q) => sum + q.netIncome, 0);
+    const { year, quarter, shares } = anchor;
+    const ttmEps = ttmNetIncome / shares;
+    const price = findClosestMonthlyPrice(monthlyPrices, quarterEndDate(year, quarter));
+    const value = price != null && ttmEps !== 0 ? price / ttmEps : null;
+    return { label: `Q${quarter} '${String(year).slice(-2)}`, value, partial, quartersUsed: quarters.length };
+  });
+
+  return points.slice(-QUARTERS_OF_HISTORY);
+}
+
+// Standalone (non-TTM) quarterly P/E -- annualized (x4) EPS, same convention
+// as buildPfcfQuarterlyFromFilingsAndPrices above (a raw single-quarter EPS
+// would inflate/deflate the multiple ~4x for no real reason and make it
+// incomparable to the Yearly/TTM views).
+function buildPeQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices) {
+  const currentCik = quarterlyReports?.[0]?.cik ?? annualReports?.[0]?.cik;
+  const sameCik = (r) => currentCik == null || r.cik === currentCik;
+  quarterlyReports = (quarterlyReports || []).filter(sameCik);
+  annualReports = (annualReports || []).filter(sameCik);
+
+  const netIncome = decumulateYtdByYear(quarterlyReports, annualReports, findReportedNetIncome, 'ic');
+
+  const sharesByQuarter = {};
+  for (const q of quarterlyReports || []) {
+    if (!q?.quarter) continue;
+    const shares = findReportedDilutedShares(q.report?.ic || []);
+    if (shares != null) sharesByQuarter[`${q.year}-${q.quarter}`] = shares;
+  }
+
+  const points = [];
+  for (const key of Object.keys(netIncome)) {
+    if (!(sharesByQuarter[key] > 0)) continue;
+    const [year, quarter] = key.split('-').map(Number);
+    const annualizedEps = (netIncome[key] / sharesByQuarter[key]) * 4;
+    const price = findClosestMonthlyPrice(monthlyPrices, quarterEndDate(year, quarter));
+    const value = price != null && annualizedEps !== 0 ? price / annualizedEps : null;
+    if (value != null) points.push({ year, quarter, label: `Q${quarter} '${String(year).slice(-2)}`, value });
+  }
+  return points
+    .sort((a, b) => a.year - b.year || a.quarter - b.quarter)
+    .map(({ label, value }) => ({ label, value }))
+    .slice(-QUARTERS_OF_HISTORY);
+}
+
+// One P/E point per fiscal year, priced at that year's Dec-31-equivalent
+// close -- mirrors buildPfcfYearlyFromFilingsAndPrices above.
+function buildPeYearlyFromFilingsAndPrices(annualReports, monthlyPrices) {
+  const currentCik = annualReports?.[0]?.cik;
+  const sameCik = (r) => currentCik == null || r.cik === currentCik;
+  const filtered = (annualReports || []).filter(sameCik);
+
+  const points = [];
+  for (const a of filtered) {
+    const netIncome = findReportedNetIncome(a.report?.ic || []);
+    const shares = findReportedDilutedShares(a.report?.ic || []);
+    if (netIncome == null || !(shares > 0)) continue;
+    const eps = netIncome / shares;
+    const price = findClosestMonthlyPrice(monthlyPrices, quarterEndDate(a.year, 4));
+    const value = price != null && eps !== 0 ? price / eps : null;
+    if (value != null) points.push({ year: a.year, label: yearlyLabel(a.year), value });
+  }
+  return points
+    .sort((a, b) => a.year - b.year)
+    .map(({ label, value }) => ({ label, value }))
+    .slice(-QUARTERS_OF_HISTORY);
+}
+
 // A fresh attempt can come back empty or narrower on a day where Finnhub or
 // Twelve Data has a transient hiccup for this specific ticker — that's not
 // the same fact as "this ticker's trend no longer exists." Only replaces a
@@ -782,8 +915,19 @@ async function main() {
   // repo's processTicker (see its own comment re: STNG), independently
   // rediscovered here. A ticker now qualifies as a gap if EITHER the
   // scalar ratio is missing OR no TTM trend has been cached yet for it.
+  // A ticker qualifies as a gap if it needs EITHER P/FCF or P/E work (or
+  // both) -- these are NOT the same population (a cash-burning-but-cash-
+  // generative SaaS company commonly has a gappy P/E but a healthy P/FCF,
+  // and vice versa for a profitable-but-Finnhub-data-gapped ticker), but
+  // both need the exact same fetched inputs (financials-reported + Twelve
+  // Data monthly prices), so selecting a ticker for either reason still
+  // costs exactly 1 Twelve Data call -- both cadence sets are computed
+  // from the same fetch inside the loop below.
   const gapSymbols = Object.entries(metricsDataset.metrics || {})
-    .filter(([symbol, data]) => data.pfcfRatio == null || !cache[symbol]?.ttm?.length)
+    .filter(
+      ([symbol, data]) =>
+        data.pfcfRatio == null || !cache[symbol]?.ttm?.length || data.peRatio == null || !cache[symbol]?.pe?.ttm?.length
+    )
     .map(([symbol]) => symbol);
 
   // Least-recently-attempted first (never-attempted sorts first, via epoch
@@ -827,6 +971,7 @@ async function main() {
     }
 
     let fresh = { ttm: [], quarterly: [], yearly: [] };
+    let freshPe = { ttm: [], quarterly: [], yearly: [] };
     try {
       // Fully sequential, each call followed by its own spacing — NOT
       // Promise.all. A concurrent version of this exact pattern (verified
@@ -878,6 +1023,15 @@ async function main() {
         quarterly: buildPfcfQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices, isBank),
         yearly: buildPfcfYearlyFromFilingsAndPrices(annualReports, monthlyPrices, isBank),
       };
+      // Computed from the exact same fetched data, regardless of whether
+      // THIS symbol was selected for its P/FCF gap, its P/E gap, or both --
+      // free (CPU only, no extra API calls), and keeps both caches maximally
+      // current without ever needing two separate sweeps.
+      freshPe = {
+        ttm: buildPeTrendFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices),
+        quarterly: buildPeQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices),
+        yearly: buildPeYearlyFromFilingsAndPrices(annualReports, monthlyPrices),
+      };
     } catch (err) {
       console.log(`  skip ${symbol}: ${err.message}`);
       // pickCadenceTrendsToPublish below falls back to whatever was already
@@ -885,7 +1039,8 @@ async function main() {
     }
 
     const cadences = pickCadenceTrendsToPublish(cache[symbol], fresh);
-    cache[symbol] = { fetchedAt: new Date().toISOString(), ...cadences };
+    const peCadences = pickCadenceTrendsToPublish(cache[symbol]?.pe, freshPe);
+    cache[symbol] = { fetchedAt: new Date().toISOString(), ...cadences, pe: peCadences };
     if (cadences.ttm.length) resolved++;
 
     processed++;
@@ -906,12 +1061,16 @@ module.exports = {
   buildPfcfTrendFromFilingsAndPrices,
   buildPfcfQuarterlyFromFilingsAndPrices,
   buildPfcfYearlyFromFilingsAndPrices,
+  buildPeTrendFromFilingsAndPrices,
+  buildPeQuarterlyFromFilingsAndPrices,
+  buildPeYearlyFromFilingsAndPrices,
   fetchReportedFinancials,
   fetchMonthlyPrices,
   isFinancialIndustry,
   findReportedOperatingCashFlowQ,
   findReportedCapexQ,
   findReportedDilutedShares,
+  findReportedNetIncome,
   fetchSecTickerToCikMap,
   fetchSecUsGaapFacts,
   buildSecSyntheticPfcfReports,
