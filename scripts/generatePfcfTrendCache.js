@@ -341,11 +341,21 @@ function readFinnhubApiKey() {
   throw new Error('FINNHUB_API_KEY env var is not set.');
 }
 
-function readTwelveDataApiKey() {
-  // Deliberately a DIFFERENT env var from the app proxy's TWELVEDATA_API_KEY
-  // — see the file header for why this needs its own key/account.
-  if (process.env.TWELVEDATA_PIPELINE_API_KEY) return process.env.TWELVEDATA_PIPELINE_API_KEY;
-  throw new Error('TWELVEDATA_PIPELINE_API_KEY env var is not set.');
+// Deliberately a DIFFERENT env var from the app proxy's TWELVEDATA_API_KEY
+// — see the file header for why this needs its own key/account. An
+// optional second key (TWELVEDATA_PIPELINE_API_KEY_2, another free Twelve
+// Data account -- the free tier allows creating more than one at no cost)
+// roughly doubles the effective daily call budget by running one worker
+// per key in parallel (see main()) -- each account has its own independent
+// 800/day cap, so two workers each safely pacing at MAX_TWELVEDATA_CALLS_PER_RUN
+// don't compete with each other for the same quota the way splitting one
+// key's budget across two workers would.
+function readTwelveDataApiKeys() {
+  const keys = [];
+  if (process.env.TWELVEDATA_PIPELINE_API_KEY) keys.push(process.env.TWELVEDATA_PIPELINE_API_KEY);
+  if (process.env.TWELVEDATA_PIPELINE_API_KEY_2) keys.push(process.env.TWELVEDATA_PIPELINE_API_KEY_2);
+  if (!keys.length) throw new Error('TWELVEDATA_PIPELINE_API_KEY env var is not set.');
+  return keys;
 }
 
 function sleep(ms) {
@@ -929,9 +939,132 @@ async function fetchMonthlyPrices(symbol, apiKey) {
   return data.values.map((v) => ({ date: v.datetime, close: parseFloat(v.close) })).filter((v) => !Number.isNaN(v.close));
 }
 
+// One ticker's full fetch-and-reconstruct pass — factored out of main()'s
+// old single loop so it can be called from multiple parallel workers (one
+// per Twelve Data key, see runWorker/main() below) without duplicating
+// this logic. Returns the cache entry to write for this symbol, plus
+// whether a Twelve Data call was actually spent (so the caller can track
+// its own budget accurately — a Finnhub-side failure before reaching the
+// Twelve Data fetch shouldn't count against it).
+async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, secTickerToCikMap, existingCacheEntry) {
+  let fresh = { ttm: [], quarterly: [], yearly: [] };
+  let freshPe = { ttm: [], quarterly: [], yearly: [] };
+  let usedTwelveDataCall = false;
+  try {
+    // Fully sequential, each call followed by its own spacing — NOT
+    // Promise.all. A concurrent version of this exact pattern (verified
+    // live earlier in this project) silently doubled the effective
+    // request rate and caused widespread false-negative 429s that looked
+    // like missing data. Two Finnhub calls spaced FINNHUB_REQUEST_SPACING_MS
+    // apart, then one Twelve Data call spaced TWELVEDATA_REQUEST_SPACING_MS
+    // after the last Finnhub call (comfortably more than either provider's
+    // minimum spacing, so it doubles as this ticker's Finnhub cooldown too).
+    let quarterlyReports = await fetchReportedFinancials(symbol, 'quarterly', finnhubKey);
+    await sleep(FINNHUB_REQUEST_SPACING_MS);
+    let annualReports = await fetchReportedFinancials(symbol, 'annual', finnhubKey);
+    annualReports = fixMislabeledAnnualYears(annualReports);
+    quarterlyReports = fixMislabeledQuarterlyYears(quarterlyReports, annualReports);
+
+    // SEC-XBRL enrichment for sparse/stale Finnhub coverage — see this
+    // file's own comment block above buildSecSyntheticPfcfReports for the
+    // full rationale (SENEA verified live: Finnhub's own quarterly/annual
+    // financials-reported stall at 2022/2020 respectively, while SEC's
+    // filings are current). Free to check (array/date inspection); only
+    // spends a real network call when a gap is actually found, so the
+    // vast majority of already-healthy gap tickers pay nothing extra.
+    if (
+      quarterlyReports.length < SEC_ENRICHMENT_SPARSE_QUARTERLY_THRESHOLD ||
+      annualReports.length < SEC_ENRICHMENT_SPARSE_ANNUAL_THRESHOLD ||
+      hasRecentQuarterlyGap(quarterlyReports) ||
+      hasMidSequenceQuarterGap(quarterlyReports)
+    ) {
+      const cik = secTickerToCikMap.get((RENAMED_TICKER_FINANCIALS_ALIASES[symbol] || symbol).toUpperCase()) || secTickerToCikMap.get(symbol.toUpperCase());
+      if (cik) {
+        const gaapFacts = await fetchSecUsGaapFacts(cik);
+        const synthesized = buildSecSyntheticPfcfReports(gaapFacts, quarterlyReports[0]?.cik ?? annualReports[0]?.cik ?? cik);
+        const merged = mergeSyntheticPfcfReports(quarterlyReports, annualReports, synthesized);
+        quarterlyReports = merged.quarterlyReports;
+        annualReports = merged.annualReports;
+      }
+    }
+
+    await sleep(TWELVEDATA_REQUEST_SPACING_MS);
+    const monthlyPrices = await fetchMonthlyPrices(symbol, twelveDataKey);
+    usedTwelveDataCall = true;
+
+    // All three cadences reuse this SAME fetched data — no extra API
+    // calls beyond the ones already budgeted above. industry is already
+    // available from the metricsDataset fetched at the top of main() (the
+    // main pipeline publishes it alongside pfcfRatio) — no extra fetch
+    // needed to know whether this ticker is bank-like.
+    const isBank = isFinancialIndustry(metricsDataset.metrics?.[symbol]?.industry);
+    fresh = {
+      ttm: buildPfcfTrendFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices, isBank),
+      quarterly: buildPfcfQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices, isBank),
+      yearly: buildPfcfYearlyFromFilingsAndPrices(annualReports, monthlyPrices, isBank),
+    };
+    // Computed from the exact same fetched data, regardless of whether
+    // THIS symbol was selected for its P/FCF gap, its P/E gap, or both --
+    // free (CPU only, no extra API calls), and keeps both caches maximally
+    // current without ever needing two separate sweeps.
+    freshPe = {
+      ttm: buildPeTrendFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices),
+      quarterly: buildPeQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices),
+      yearly: buildPeYearlyFromFilingsAndPrices(annualReports, monthlyPrices),
+    };
+  } catch (err) {
+    console.log(`  skip ${symbol}: ${err.message}`);
+    // pickCadenceTrendsToPublish below falls back to whatever was already
+    // cached for this symbol rather than losing it over one failed request.
+  }
+
+  const cadences = pickCadenceTrendsToPublish(existingCacheEntry, fresh);
+  const peCadences = pickCadenceTrendsToPublish(existingCacheEntry?.pe, freshPe);
+  return { entry: { fetchedAt: new Date().toISOString(), ...cadences, pe: peCadences }, usedTwelveDataCall };
+}
+
+// Runs one Twelve Data key's share of the priority list — mirrors
+// generateSectorMetrics.js's own runWorker-per-key pattern. Each worker
+// tracks its OWN Twelve Data call budget (every key has its own
+// independent daily cap, so two workers each spending up to
+// MAX_TWELVEDATA_CALLS_PER_RUN don't compete for the same quota) and its
+// own local cache patch, merged into the shared cache by main() only after
+// every worker has finished — avoids any concurrent-mutation ambiguity
+// during the parallel phase, same reasoning as the main pipeline's own
+// worker-then-merge shape.
+async function runWorker(symbols, finnhubKey, twelveDataKey, metricsDataset, secTickerToCikMap, cache, startTime) {
+  const localCache = {};
+  let processed = 0;
+  let resolved = 0;
+  let twelveDataCalls = 0;
+
+  for (const symbol of symbols) {
+    if (twelveDataCalls >= MAX_TWELVEDATA_CALLS_PER_RUN) {
+      console.log(`  Twelve Data call budget (${MAX_TWELVEDATA_CALLS_PER_RUN}) reached after ${processed} tickers for this worker — stopping.`);
+      break;
+    }
+    if (Date.now() - startTime > TIME_BUDGET_MS) {
+      console.log(`  Time budget reached after ${processed} tickers for this worker — stopping.`);
+      break;
+    }
+
+    const { entry, usedTwelveDataCall } = await processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, secTickerToCikMap, cache[symbol]);
+    localCache[symbol] = entry;
+    if (usedTwelveDataCall) twelveDataCalls++;
+    if (entry.ttm.length) resolved++;
+
+    processed++;
+    if (processed % 50 === 0) {
+      console.log(`  ${processed}/${symbols.length} processed by this worker (${resolved} with a TTM trend), ${twelveDataCalls} Twelve Data calls used`);
+    }
+  }
+
+  return { localCache, processed, resolved, twelveDataCalls };
+}
+
 async function main() {
   const finnhubKey = readFinnhubApiKey();
-  const twelveDataKey = readTwelveDataApiKey();
+  const twelveDataKeys = readTwelveDataApiKeys();
 
   console.log('Fetching current ticker universe + P/FCF gap list from the published sector-metrics feed...');
   const [metricsDataset, existingTrendCache, secTickerToCikMap] = await Promise.all([
@@ -987,111 +1120,43 @@ async function main() {
 
   const alreadyCovered = priority.filter((s) => cache[s]?.ttm?.length).length;
   console.log(
-    `${gapSymbols.length} tickers currently have a P/FCF gap; ${alreadyCovered} already have a cached TTM trend. ` +
-      `Processing up to ${MAX_TWELVEDATA_CALLS_PER_RUN} this run (oldest/never-attempted first) — computing Quarterly/Yearly/TTM together from the same fetched data.`
+    `${gapSymbols.length} tickers currently have a P/FCF or P/E gap; ${alreadyCovered} already have a cached TTM trend. ` +
+      `Processing up to ${MAX_TWELVEDATA_CALLS_PER_RUN} per Twelve Data key this run (${twelveDataKeys.length} key(s), oldest/never-attempted first) — computing Quarterly/Yearly/TTM together from the same fetched data.`
   );
 
+  // Split the priority list across one worker per Twelve Data key,
+  // interleaved (round-robin) — same reasoning as generateSectorMetrics.js's
+  // own worker split: cheap insurance against systematic clustering in the
+  // sorted-by-staleness list skewing one worker's workload heavier than the
+  // other's. A single shared Finnhub key is safe across all workers even
+  // when running in parallel — each worker's own Twelve Data pacing
+  // (TWELVEDATA_REQUEST_SPACING_MS, ~7.5/min) is the dominant bottleneck
+  // per worker, so even two workers' combined Finnhub call rate stays
+  // comfortably under Finnhub's 60/min single-key cap without needing a
+  // second Finnhub key too.
+  const workerSymbolSubsets = twelveDataKeys.map(() => []);
+  priority.forEach((symbol, i) => workerSymbolSubsets[i % twelveDataKeys.length].push(symbol));
+
   const startTime = Date.now();
+  const workerResults = await Promise.all(
+    twelveDataKeys.map((tdKey, idx) => runWorker(workerSymbolSubsets[idx], finnhubKey, tdKey, metricsDataset, secTickerToCikMap, cache, startTime))
+  );
+
   let processed = 0;
   let resolved = 0;
   let twelveDataCalls = 0;
-
-  for (const symbol of priority) {
-    if (twelveDataCalls >= MAX_TWELVEDATA_CALLS_PER_RUN) {
-      console.log(`Twelve Data call budget (${MAX_TWELVEDATA_CALLS_PER_RUN}) reached after ${processed} tickers — stopping for this run.`);
-      break;
-    }
-    if (Date.now() - startTime > TIME_BUDGET_MS) {
-      console.log(`Time budget reached after ${processed} tickers — stopping for this run.`);
-      break;
-    }
-
-    let fresh = { ttm: [], quarterly: [], yearly: [] };
-    let freshPe = { ttm: [], quarterly: [], yearly: [] };
-    try {
-      // Fully sequential, each call followed by its own spacing — NOT
-      // Promise.all. A concurrent version of this exact pattern (verified
-      // live earlier in this project) silently doubled the effective
-      // request rate and caused widespread false-negative 429s that looked
-      // like missing data. Two Finnhub calls spaced FINNHUB_REQUEST_SPACING_MS
-      // apart, then one Twelve Data call spaced TWELVEDATA_REQUEST_SPACING_MS
-      // after the last Finnhub call (comfortably more than either provider's
-      // minimum spacing, so it doubles as this ticker's Finnhub cooldown too).
-      let quarterlyReports = await fetchReportedFinancials(symbol, 'quarterly', finnhubKey);
-      await sleep(FINNHUB_REQUEST_SPACING_MS);
-      let annualReports = await fetchReportedFinancials(symbol, 'annual', finnhubKey);
-      annualReports = fixMislabeledAnnualYears(annualReports);
-      quarterlyReports = fixMislabeledQuarterlyYears(quarterlyReports, annualReports);
-
-      // SEC-XBRL enrichment for sparse/stale Finnhub coverage — see this
-      // file's own comment block above buildSecSyntheticPfcfReports for the
-      // full rationale (SENEA verified live: Finnhub's own quarterly/annual
-      // financials-reported stall at 2022/2020 respectively, while SEC's
-      // filings are current). Free to check (array/date inspection); only
-      // spends a real network call when a gap is actually found, so the
-      // vast majority of already-healthy gap tickers pay nothing extra.
-      if (
-        quarterlyReports.length < SEC_ENRICHMENT_SPARSE_QUARTERLY_THRESHOLD ||
-        annualReports.length < SEC_ENRICHMENT_SPARSE_ANNUAL_THRESHOLD ||
-        hasRecentQuarterlyGap(quarterlyReports) ||
-        hasMidSequenceQuarterGap(quarterlyReports)
-      ) {
-        const cik = secTickerToCikMap.get((RENAMED_TICKER_FINANCIALS_ALIASES[symbol] || symbol).toUpperCase()) || secTickerToCikMap.get(symbol.toUpperCase());
-        if (cik) {
-          const gaapFacts = await fetchSecUsGaapFacts(cik);
-          const synthesized = buildSecSyntheticPfcfReports(gaapFacts, quarterlyReports[0]?.cik ?? annualReports[0]?.cik ?? cik);
-          const merged = mergeSyntheticPfcfReports(quarterlyReports, annualReports, synthesized);
-          quarterlyReports = merged.quarterlyReports;
-          annualReports = merged.annualReports;
-        }
-      }
-
-      await sleep(TWELVEDATA_REQUEST_SPACING_MS);
-      const monthlyPrices = await fetchMonthlyPrices(symbol, twelveDataKey);
-      twelveDataCalls++;
-
-      // All three cadences reuse this SAME fetched data — no extra API
-      // calls beyond the ones already budgeted above. industry is already
-      // available from the metricsDataset fetched at the top of main() (the
-      // main pipeline publishes it alongside pfcfRatio) — no extra fetch
-      // needed to know whether this ticker is bank-like.
-      const isBank = isFinancialIndustry(metricsDataset.metrics?.[symbol]?.industry);
-      fresh = {
-        ttm: buildPfcfTrendFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices, isBank),
-        quarterly: buildPfcfQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices, isBank),
-        yearly: buildPfcfYearlyFromFilingsAndPrices(annualReports, monthlyPrices, isBank),
-      };
-      // Computed from the exact same fetched data, regardless of whether
-      // THIS symbol was selected for its P/FCF gap, its P/E gap, or both --
-      // free (CPU only, no extra API calls), and keeps both caches maximally
-      // current without ever needing two separate sweeps.
-      freshPe = {
-        ttm: buildPeTrendFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices),
-        quarterly: buildPeQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices),
-        yearly: buildPeYearlyFromFilingsAndPrices(annualReports, monthlyPrices),
-      };
-    } catch (err) {
-      console.log(`  skip ${symbol}: ${err.message}`);
-      // pickCadenceTrendsToPublish below falls back to whatever was already
-      // cached for this symbol rather than losing it over one failed request.
-    }
-
-    const cadences = pickCadenceTrendsToPublish(cache[symbol], fresh);
-    const peCadences = pickCadenceTrendsToPublish(cache[symbol]?.pe, freshPe);
-    cache[symbol] = { fetchedAt: new Date().toISOString(), ...cadences, pe: peCadences };
-    if (cadences.ttm.length) resolved++;
-
-    processed++;
-    if (processed % 50 === 0) {
-      console.log(`  ${processed}/${priority.length} processed (${resolved} with a TTM trend), ${((Date.now() - startTime) / 60000).toFixed(0)}min elapsed, ${twelveDataCalls} Twelve Data calls used`);
-    }
+  for (const r of workerResults) {
+    Object.assign(cache, r.localCache);
+    processed += r.processed;
+    resolved += r.resolved;
+    twelveDataCalls += r.twelveDataCalls;
   }
 
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify({ generatedAt: new Date().toISOString(), trends: cache }));
   const totalCovered = Object.values(cache).filter((entry) => entry.ttm?.length).length;
   console.log(
-    `Done. Processed ${processed} tickers this run (${resolved} resolved to a TTM trend, ${twelveDataCalls} Twelve Data calls used). ` +
-      `Cache now covers ${totalCovered}/${gapSymbols.length} gap tickers total (TTM basis).`
+    `Done. Processed ${processed} tickers this run across ${twelveDataKeys.length} worker(s) (${resolved} resolved to a TTM trend, ${twelveDataCalls} total Twelve Data calls used), ` +
+      `${((Date.now() - startTime) / 60000).toFixed(0)}min elapsed. Cache now covers ${totalCovered}/${gapSymbols.length} gap tickers total (TTM basis).`
   );
 }
 

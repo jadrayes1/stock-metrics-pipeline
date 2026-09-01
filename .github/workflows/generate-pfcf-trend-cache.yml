@@ -25,6 +25,12 @@
 #      traffic for the same 800-calls/day free-tier budget.
 #   2. Add a repository secret named TWELVEDATA_PIPELINE_API_KEY with that
 #      second account's API key.
+#   3. Optional: add a repository secret named TWELVEDATA_PIPELINE_API_KEY_2
+#      with a THIRD, independent Twelve Data account's key — runs one
+#      worker per key in parallel (see runWorker/main() in
+#      scripts/generatePfcfTrendCache.js), roughly doubling the effective
+#      daily rotation throughput since each account has its own separate
+#      800/day cap. Leave unset to run on one key, same as before.
 
 name: Generate P/FCF trend cache
 
@@ -57,6 +63,7 @@ jobs:
         env:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           TWELVEDATA_PIPELINE_API_KEY: ${{ secrets.TWELVEDATA_PIPELINE_API_KEY }}
+          TWELVEDATA_PIPELINE_API_KEY_2: ${{ secrets.TWELVEDATA_PIPELINE_API_KEY_2 }}
           TARGET_SYMBOL: ${{ inputs.symbol }}
         run: node scripts/generatePfcfTrendCache.js
 
