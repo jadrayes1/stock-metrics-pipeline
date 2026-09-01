@@ -2204,7 +2204,19 @@ function deriveCrossCadenceReports(quarterlyReports, annualReports) {
 
 const ROIC_ASSUMED_TAX_RATE = 0.21; // matches the DCF estimate's own default simplification above
 
-const MAX_ABS_RATIO = 10; // 1000% — see clampImplausible in src/utils/metrics.js for the full rationale
+// Raised from 10 (1000%) to 1000 (100,000%) after a real, verified case
+// (ASST/Strive's 2025 Bitcoin-treasury restructuring): net income losses
+// jumped ~100x in magnitude to ~$265M/quarter while revenue stayed at a
+// tiny pre-merger scale (~$1-5M/quarter), producing a genuine, real
+// profitMargin/fcfMargin around -13,250% -- verified independently against
+// SEC's own primary XBRL data, not a data-quality issue. The clamp's
+// PURPOSE (catching a genuine extraction bug, e.g. a filer-side scale
+// error like SENEA's shares once being tagged "in thousands") is preserved
+// at this new, much wider bound -- a real 1000x scale/decimal bug would
+// still land in the millions of percent, still caught; a real company
+// with an unusually extreme but genuine ratio like ASST's is no longer
+// silently hidden as a "gap."
+const MAX_ABS_RATIO = 1000; // 100,000% — see clampImplausible in src/utils/metrics.js for the full rationale
 function clampImplausible(value) {
   return value != null && Math.abs(value) <= MAX_ABS_RATIO ? value : null;
 }
