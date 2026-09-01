@@ -3333,15 +3333,6 @@ async function processSymbol(symbol, apiKey, ctx) {
     }
   }
 
-  if (process.env.DEBUG_ASST_YEARLY && symbol === process.env.DEBUG_ASST_YEARLY) {
-    console.error('DEBUG_ASST_YEARLY annualReportedFinancials count:', (annualReportedFinancials || []).length);
-    for (const r of annualReportedFinancials || []) {
-      const rev = findReportedRevenue(r.report?.ic || []);
-      const ni = findReportedNetIncome(r.report?.ic || []);
-      console.error('DEBUG_ASST_YEARLY', 'year=', r.year, 'cik=', r.cik, 'form=', r.form, 'startDate=', r.startDate, 'endDate=', r.endDate, 'revenue=', rev, 'netIncome=', ni);
-    }
-  }
-
   const yearlyBuilders = {
     revenueGrowth: () => fdicTrends?.yearly.revenueGrowth || buildRevenueGrowthYearlyFromFilings(annualReportedFinancials),
     profitMargin: () => fdicTrends?.yearly.profitMargin || buildProfitMarginYearlyFromFilings(annualReportedFinancials),
