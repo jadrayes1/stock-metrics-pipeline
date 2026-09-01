@@ -2966,14 +2966,33 @@ function decodeTrendQualifiedMask(mask) {
 // delisted one) -- checking revenueGrowth alone would have wrongly
 // excluded it. A ticker with NO recent activity in ANY of the 6
 // comparable metrics, across both cadences, is excluded.
-function hasRecentTrendActivity(symbol, quarterlyTrends, ttmTrends) {
+//
+// UPDATE: also checks nativeTrends now -- verified live this same bug
+// shape hits a much larger population than the quarterly/ttm-only version
+// above ever accounted for: AGNC, AMH, AG, ACB, and roughly 87% of the
+// current staleSymbols list all have a FULL, current 12-point nativeTrends
+// series (Finnhub's own quarterly data, unrelated to this pipeline's own
+// SEC-filings reconstruction) despite being flagged stale, because their
+// quarterly/ttm reconstruction specifically is old or empty (e.g. REIT
+// accounting not decumulating cleanly) while the company itself is
+// obviously alive and actively reporting. Checking only 2 of the 3
+// cadences wrongly excluded these from search suggestions and (now) the
+// closing-price cache. Only ~10% of the list is genuinely empty
+// everywhere once nativeTrends is included too.
+function hasRecentTrendActivity(symbol, quarterlyTrends, ttmTrends, nativeTrends) {
   for (const key of COMPARABLE_KEYS) {
-    if (isRecentEnough(quarterlyTrends?.[symbol]?.[key]) || isRecentEnough(ttmTrends?.[symbol]?.[key])) return true;
+    if (
+      isRecentEnough(quarterlyTrends?.[symbol]?.[key]) ||
+      isRecentEnough(ttmTrends?.[symbol]?.[key]) ||
+      isRecentEnough(nativeTrends?.[symbol]?.[key])
+    ) {
+      return true;
+    }
   }
   return false;
 }
 
-function computeIndustryLeaders(metrics, profiles, quarterlyTrends, ttmTrends) {
+function computeIndustryLeaders(metrics, profiles, quarterlyTrends, ttmTrends, nativeTrends) {
   const byIndustry = {};
   for (const [symbol, data] of Object.entries(metrics)) {
     if (!data.industry) continue;
@@ -3004,7 +3023,7 @@ function computeIndustryLeaders(metrics, profiles, quarterlyTrends, ttmTrends) {
     // entire industry from ever having a real leader.
     const requiredKeys = isFinancialIndustry(industry) ? COMPARABLE_KEYS.filter((k) => k !== 'fcfMargin') : COMPARABLE_KEYS;
     const eligible = symbols.filter(
-      (s) => requiredKeys.every((k) => metrics[s][k] !== null && metrics[s][k] !== undefined) && hasRecentTrendActivity(s, quarterlyTrends, ttmTrends)
+      (s) => requiredKeys.every((k) => metrics[s][k] !== null && metrics[s][k] !== undefined) && hasRecentTrendActivity(s, quarterlyTrends, ttmTrends, nativeTrends)
     );
     if (!eligible.length) continue;
 
@@ -3700,7 +3719,7 @@ async function main() {
     console.log(`Recovered ${recoveredFromFailure} hard-failed tickers' previously-published data (never regress a ticker to nothing).`);
   }
 
-  const industryLeaders = computeIndustryLeaders(metrics, profiles, quarterlyTrends, ttmTrends);
+  const industryLeaders = computeIndustryLeaders(metrics, profiles, quarterlyTrends, ttmTrends, nativeTrends);
   const totalLeaderTickers = industryLeaders.reduce((sum, entry) => sum + entry.leaders.length, 0);
   const shortLeaderIndustries = industryLeaders.filter((entry) => entry.leaders.length < MIN_LEADERS_PER_INDUSTRY).length;
   console.log(
@@ -3717,7 +3736,7 @@ async function main() {
   // normally; this list exists specifically for the app's search-input
   // coverage filter (fetchCoveredSymbols in src/api/sectorComparison.js)
   // to subtract, so a stale ticker no longer surfaces as a suggestion.
-  const staleSymbols = Object.keys(metrics).filter((s) => !hasRecentTrendActivity(s, quarterlyTrends, ttmTrends));
+  const staleSymbols = Object.keys(metrics).filter((s) => !hasRecentTrendActivity(s, quarterlyTrends, ttmTrends, nativeTrends));
 
   const generatedAt = new Date().toISOString();
   // marketMetrics.json stays small — no trends embedded (see
