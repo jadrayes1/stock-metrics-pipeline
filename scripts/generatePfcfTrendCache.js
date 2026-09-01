@@ -887,6 +887,42 @@ async function fetchReportedFinancials(symbol, freq, apiKey) {
   return Array.isArray(data?.data) ? data.data : [];
 }
 
+// Mirrors fixMislabeledAnnualYears/fixMislabeledQuarterlyYears in
+// generateSectorMetrics.js verbatim (kept as a separate copy, same
+// duplication reasoning as every other shared helper in this file) --
+// Finnhub's own `year` field for annual (10-K) reports is occasionally
+// wrong for a run of consecutive fiscal years (verified live for CRWD:
+// three straight 10-Ks tagged with the start-date's calendar year instead
+// of the end-date's, colliding two real filings onto one year and leaving
+// another year with nothing tagged at all). This script fetches the exact
+// same raw financials-reported data as generateSectorMetrics.js via the
+// same endpoint, so it's exposed to the identical bug -- confirmed live:
+// CRWD's own P/E and P/FCF trends here had a multi-quarter gap plus
+// trailing null/future-dated points, the same symptom shape this fix
+// resolved in the main pipeline. Only recomputes `year` when a genuine
+// collision is already observed for that ticker -- a no-op for every
+// other ticker.
+function fixMislabeledAnnualYears(reports) {
+  const years = (reports || []).map((r) => r.year).filter((y) => y != null);
+  const hasDuplicateYear = new Set(years).size !== years.length;
+  if (!hasDuplicateYear) return reports;
+  return reports.map((r) => {
+    const endYear = r.endDate ? new Date(r.endDate).getUTCFullYear() : NaN;
+    return Number.isFinite(endYear) ? { ...r, year: endYear } : r;
+  });
+}
+
+function fixMislabeledQuarterlyYears(quarterlyReports, annualReports) {
+  const keys = (quarterlyReports || []).map((r) => `${r.year}-${r.quarter}`);
+  const hasDuplicateKey = new Set(keys).size !== keys.length;
+  if (!hasDuplicateKey) return quarterlyReports;
+  const yearByStartDate = new Map((annualReports || []).filter((a) => a.startDate && a.year != null).map((a) => [a.startDate, a.year]));
+  return (quarterlyReports || []).map((r) => {
+    const correctYear = r.startDate ? yearByStartDate.get(r.startDate) : null;
+    return correctYear != null ? { ...r, year: correctYear } : r;
+  });
+}
+
 async function fetchMonthlyPrices(symbol, apiKey) {
   const data = await fetchJson(`https://api.twelvedata.com/time_series?symbol=${symbol}&interval=1month&outputsize=48&apikey=${apiKey}`);
   if (data?.status !== 'ok' || !Array.isArray(data.values)) return [];
@@ -984,6 +1020,8 @@ async function main() {
       let quarterlyReports = await fetchReportedFinancials(symbol, 'quarterly', finnhubKey);
       await sleep(FINNHUB_REQUEST_SPACING_MS);
       let annualReports = await fetchReportedFinancials(symbol, 'annual', finnhubKey);
+      annualReports = fixMislabeledAnnualYears(annualReports);
+      quarterlyReports = fixMislabeledQuarterlyYears(quarterlyReports, annualReports);
 
       // SEC-XBRL enrichment for sparse/stale Finnhub coverage — see this
       // file's own comment block above buildSecSyntheticPfcfReports for the
