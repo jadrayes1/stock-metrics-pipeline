@@ -1122,10 +1122,33 @@ async function main() {
   // Data monthly prices), so selecting a ticker for either reason still
   // costs exactly 1 Twelve Data call -- both cadence sets are computed
   // from the same fetch inside the loop below.
+  // Presence alone isn't enough either -- verified live: MYE's cached TTM
+  // trend sat frozen at fetchedAt=2026-08-17 for over two weeks (real gap:
+  // Q3 '22 through Q4 '22 only) because its card-level pfcfRatio was
+  // always real and it already had SOME cached points, so neither
+  // condition above ever flagged it, no matter how stale that cached data
+  // got. Without this, once a ticker gets a first successful pass it can
+  // never be reselected for a routine refresh again -- only re-entering
+  // rotation if the SEPARATE P/E condition happens to catch it (as
+  // happened here, coincidentally, when P/E reconstruction shipped and
+  // flagged the entire universe at once). 90 days (~1 fiscal quarter) is
+  // long enough that an already-healthy ticker isn't repeatedly competing
+  // with genuine gaps for the daily budget, short enough that nothing can
+  // silently go stale indefinitely the way MYE did.
+  const STALE_CACHE_DAYS = 90;
+  function isCacheStale(fetchedAt) {
+    if (!fetchedAt) return true;
+    const ageDays = (Date.now() - new Date(fetchedAt).getTime()) / (1000 * 60 * 60 * 24);
+    return ageDays > STALE_CACHE_DAYS;
+  }
   const gapSymbols = Object.entries(metricsDataset.metrics || {})
     .filter(
       ([symbol, data]) =>
-        data.pfcfRatio == null || !cache[symbol]?.ttm?.length || data.peRatio == null || !cache[symbol]?.pe?.ttm?.length
+        data.pfcfRatio == null ||
+        !cache[symbol]?.ttm?.length ||
+        data.peRatio == null ||
+        !cache[symbol]?.pe?.ttm?.length ||
+        isCacheStale(cache[symbol]?.fetchedAt)
     )
     .map(([symbol]) => symbol);
 
