@@ -988,6 +988,25 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
       }
     }
 
+    if (process.env.DEBUG_PFCF_SYMBOLS?.split(',').map((s) => s.trim().toUpperCase()).includes(symbol)) {
+      console.error(`DEBUG_PFCF ${symbol} quarterlyReports count:`, quarterlyReports.length);
+      for (const r of quarterlyReports) {
+        console.error(`DEBUG_PFCF ${symbol} Q`, 'year=', r.year, 'quarter=', r.quarter, 'cik=', r.cik, 'form=', r.form,
+          'ocf=', findReportedOperatingCashFlowQ(r.report?.cf || []),
+          'capex=', findReportedCapexQ(r.report?.cf || []),
+          'shares=', findReportedDilutedShares(r.report?.ic || []),
+          'netIncome=', findReportedNetIncome(r.report?.ic || []));
+      }
+      console.error(`DEBUG_PFCF ${symbol} annualReports count:`, annualReports.length);
+      for (const r of annualReports) {
+        console.error(`DEBUG_PFCF ${symbol} FY`, 'year=', r.year, 'cik=', r.cik, 'form=', r.form,
+          'ocf=', findReportedOperatingCashFlowQ(r.report?.cf || []),
+          'capex=', findReportedCapexQ(r.report?.cf || []),
+          'shares=', findReportedDilutedShares(r.report?.ic || []),
+          'netIncome=', findReportedNetIncome(r.report?.ic || []));
+      }
+    }
+
     await sleep(TWELVEDATA_REQUEST_SPACING_MS);
     const monthlyPrices = await fetchMonthlyPrices(symbol, twelveDataKey);
     usedTwelveDataCall = true;
@@ -1114,8 +1133,8 @@ async function main() {
   // has a real pfcfRatio/cached TTM point), since the whole point is to
   // isolate exactly what happens for THIS symbol.
   if (process.env.TARGET_SYMBOL) {
-    priority = [process.env.TARGET_SYMBOL.toUpperCase()];
-    console.log(`TARGET_SYMBOL set — processing only ${priority[0]}, ignoring the normal gap list/rotation.`);
+    priority = process.env.TARGET_SYMBOL.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
+    console.log(`TARGET_SYMBOL set — processing only ${priority.join(', ')}, ignoring the normal gap list/rotation.`);
   }
 
   const alreadyCovered = priority.filter((s) => cache[s]?.ttm?.length).length;
