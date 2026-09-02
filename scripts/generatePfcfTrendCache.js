@@ -252,14 +252,21 @@ function buildSecSyntheticPfcfReports(gaapFacts, cik) {
     if (!capexFact && findSecValueForFyFp(gaapFacts, SEC_INVESTING_SUBTOTAL_CONCEPTS, fy, fp, 'USD')) {
       capexFact = { concept: 'ImpliedZeroCapex', value: 0 };
     }
-    const cfItems = [ocfFact, capexFact].filter(Boolean).map((r) => ({ concept: r.concept, label: `${r.concept} (SEC XBRL enrichment)`, value: r.value }));
+    // Real concept names get the same `us-gaap_` prefix every
+    // findReported*Q finder's exact-match list uses (SEC's own companyfacts
+    // API returns them bare) -- ImpliedZeroCapex is a sentinel this script
+    // invented, not a real XBRL concept, so it stays unprefixed and is
+    // recognized by its literal name in findReportedCapexQ instead.
+    const cfItems = [ocfFact, capexFact]
+      .filter(Boolean)
+      .map((r) => ({ concept: r.concept === 'ImpliedZeroCapex' ? r.concept : `us-gaap_${r.concept}`, label: `${r.concept} (SEC XBRL enrichment)`, value: r.value }));
 
     let sharesFact = findSecValueForFyFp(gaapFacts, SEC_SHARES_CONCEPTS, fy, fp, 'shares');
     if (sharesFact && sharesFact.value < MIN_PLAUSIBLE_SHARES) sharesFact = null; // see MIN_PLAUSIBLE_SHARES above
     const netIncomeFact = findSecValueForFyFp(gaapFacts, SEC_NET_INCOME_CONCEPTS, fy, fp, 'USD');
     const icItems = [sharesFact, netIncomeFact]
       .filter(Boolean)
-      .map((r) => ({ concept: r.concept, label: `${r.concept} (SEC XBRL enrichment)`, value: r.value }));
+      .map((r) => ({ concept: `us-gaap_${r.concept}`, label: `${r.concept} (SEC XBRL enrichment)`, value: r.value }));
 
     if (!cfItems.length && !icItems.length) continue;
 
@@ -286,12 +293,28 @@ function buildSecSyntheticPfcfReports(gaapFacts, cik) {
 // ever fills a section that's COMPLETELY empty -- a real entry with SOME
 // content in a section (even partial) still wins outright for that
 // section, same "real wins" philosophy as before.
+// Per-concept, not per-section -- verified live: VKTX (a clinical biotech
+// with no PP&E capex) has real, current Finnhub OCF data for nearly every
+// quarter, so existing.report.cf is essentially never completely empty,
+// meaning the section-level rule above ALWAYS kept Finnhub's real-but-
+// capex-less cf array wholesale and silently discarded synthesized SEC
+// data (including the ImpliedZeroCapex signal that would have correctly
+// resolved capex to 0) for every quarter except the rare ones where
+// Finnhub had nothing at all. A real Finnhub concept still always wins for
+// that SAME concept (never overwritten) -- this only ADDS a synthesized
+// concept Finnhub's own report doesn't have any value for at all.
 function fillEmptySections(existing, synthesized) {
-  if (!(existing.report.ic || []).length && (synthesized.report.ic || []).length) {
-    existing.report.ic = synthesized.report.ic;
-  }
-  if (!(existing.report.cf || []).length && (synthesized.report.cf || []).length) {
-    existing.report.cf = synthesized.report.cf;
+  for (const section of ['ic', 'cf']) {
+    const existingItems = existing.report[section] || [];
+    const synthesizedItems = synthesized.report[section] || [];
+    if (!synthesizedItems.length) continue;
+    if (!existingItems.length) {
+      existing.report[section] = synthesizedItems;
+      continue;
+    }
+    const existingConcepts = new Set(existingItems.map((item) => item.concept));
+    const additions = synthesizedItems.filter((item) => !existingConcepts.has(item.concept));
+    if (additions.length) existing.report[section] = [...existingItems, ...additions];
   }
 }
 
@@ -450,6 +473,13 @@ function findReportedCapexQ(cfItems) {
   // recognized by the patterns above still correctly returns null here --
   // this only fires when there's no investing section to have missed a
   // line in.
+  // A confirmed real $0 from SEC's own data (buildSecSyntheticPfcfReports
+  // sets this when the filer's real NetCashProvidedByUsedInInvestingActivities
+  // subtotal exists for this period with no matching capex concept under
+  // it) -- takes priority over the ambiguous hasInvestingSection guess
+  // below, since it's independently corroborated rather than inferred.
+  const impliedZero = cfItems.find((item) => item.concept === 'ImpliedZeroCapex');
+  if (impliedZero) return 0;
   const hasInvestingSection = cfItems.some((item) => /investing activities/i.test(item.label || ''));
   return hasInvestingSection ? null : 0;
 }
