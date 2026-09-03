@@ -913,11 +913,34 @@ function pickTrendToPublish(existingPoints, freshPoints) {
   return hasNewQuarter ? freshPoints : existingPoints;
 }
 
+// Strips a point whose period hasn't ended yet from an EXISTING published
+// series -- needed because pickTrendToPublish's own "same labels, keep
+// existing" rule means a shorter, corrected fresh computation (see the
+// future-report filter in processTicker above) can never overwrite an
+// already-published bad point on its own: none of its labels are "new"
+// relative to what's already published, so hasNewQuarter stays false and
+// the stale (still-bad) existing series survives forever. Verified live:
+// this is exactly what happened to BNC's already-published Q3 '26/Q4 '26
+// null points even after the generating bug was fixed. Mirrors this
+// codebase's established "sanitize existing before comparing" pattern for
+// this exact class of merge-protection trap.
+function stripFuturePoints(points) {
+  if (!points?.length) return points || [];
+  const now = new Date();
+  return points.filter((p) => {
+    const q = /^Q(\d) '(\d\d)$/.exec(p.label || '');
+    if (q) return quarterEndDate(2000 + Number(q[2]), Number(q[1])) <= now;
+    const fy = /^FY '(\d\d)$/.exec(p.label || '');
+    if (fy) return quarterEndDate(2000 + Number(fy[1]), 4) <= now;
+    return true;
+  });
+}
+
 function pickCadenceTrendsToPublish(existingEntry, fresh) {
   return {
-    ttm: pickTrendToPublish(existingEntry?.ttm, fresh.ttm),
-    quarterly: pickTrendToPublish(existingEntry?.quarterly, fresh.quarterly),
-    yearly: pickTrendToPublish(existingEntry?.yearly, fresh.yearly),
+    ttm: pickTrendToPublish(stripFuturePoints(existingEntry?.ttm), fresh.ttm),
+    quarterly: pickTrendToPublish(stripFuturePoints(existingEntry?.quarterly), fresh.quarterly),
+    yearly: pickTrendToPublish(stripFuturePoints(existingEntry?.yearly), fresh.yearly),
   };
 }
 

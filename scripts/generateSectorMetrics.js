@@ -2716,6 +2716,22 @@ function isRecentEnough(points, cutoffMonths = RECENCY_CUTOFF_MONTHS) {
   return Math.max(...dates.map((d) => d.getTime())) >= cutoff.getTime();
 }
 
+// Strips a point whose period hasn't ended yet -- a future date always
+// passes isRecentEnough's cutoff check (it's a STALENESS floor, not a
+// future-date guard), so a future-dated point that made it into an
+// already-published series (e.g. from a future-report bug already fixed
+// at the source above) would otherwise survive pickCadenceMetric forever,
+// same trap isRecentEnough's own comment already documents for stale
+// labels. Mirrors the identical fix in generatePfcfTrendCache.js.
+function stripFuturePoints(points) {
+  if (!points?.length) return points || [];
+  const now = new Date();
+  return points.filter((p) => {
+    const d = parseLabelToApproxDate(p.label);
+    return !d || d <= now;
+  });
+}
+
 // Wraps pickTrendToPublish with the recency floor on BOTH sides of the
 // comparison. Gating `existingPoints` too (not just the final result) is
 // required, not optional — mirrors the FY-label migration lesson from the
@@ -2724,7 +2740,7 @@ function isRecentEnough(points, cutoffMonths = RECENCY_CUTOFF_MONTHS) {
 // so a stale already-published series would survive forever if only the
 // fresh/final side were ever checked.
 function pickCadenceMetric(existingPoints, freshPoints) {
-  const recentExisting = isRecentEnough(existingPoints) ? existingPoints : [];
+  const recentExisting = isRecentEnough(stripFuturePoints(existingPoints)) ? stripFuturePoints(existingPoints) : [];
   const picked = pickTrendToPublish(recentExisting, freshPoints);
   return isRecentEnough(picked) ? picked : [];
 }
@@ -3314,6 +3330,23 @@ async function processSymbol(symbol, apiKey, ctx) {
     if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG cross-cadence derivation threw', e.message, e.stack);
     // Non-fatal — same graceful-degradation philosophy as the fetches above.
   }
+
+  // Defensive filter against a genuinely future-dated report -- mirrors the
+  // identical fix in generatePfcfTrendCache.js (verified live there for
+  // BNC, a known fiscal-year-transition filer whose SEC-XBRL enrichment
+  // synthesized a report for a quarter that hadn't ended yet). A period
+  // that hasn't ended yet can never be real, regardless of which upstream
+  // source (Finnhub mislabeling, SEC fy/fp drift, any of the merges above)
+  // produced it -- applied here, after every merge/derivation above has
+  // run, as a final safety net before the builders consume this data.
+  const nowForFutureCheck = new Date();
+  const quarterEndsAfterNow = (year, quarter) => {
+    const month = quarter * 3;
+    const lastDay = new Date(year, month, 0).getDate();
+    return new Date(year, month - 1, lastDay) > nowForFutureCheck;
+  };
+  quarterlyFinancials = quarterlyFinancials.filter((r) => !r?.quarter || !quarterEndsAfterNow(r.year, r.quarter));
+  annualReportedFinancials = annualReportedFinancials.filter((r) => !quarterEndsAfterNow(r.year, 4));
 
   const isBankLike = isFinancialIndustry(profile.industry);
 
