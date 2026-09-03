@@ -270,7 +270,16 @@ function buildSecSyntheticPfcfReports(gaapFacts, cik) {
 
     if (!cfItems.length && !icItems.length) continue;
 
-    const entry = { cik: normalizedCik, form: 'SEC-XBRL', report: { ic: icItems, cf: cfItems } };
+    // Real disclosed period-end date, straight from whichever SEC fact
+    // was actually found -- NOT derived from fy/fp (a company's fiscal
+    // quarter numbering doesn't necessarily line up with calendar
+    // quarters, so guessing a date from the quarter number alone would be
+    // wrong for a non-calendar-fiscal-year filer). Needed downstream to
+    // reliably detect a genuinely impossible (not-yet-ended) period --
+    // see the future-report filter in processTicker.
+    const endDate = ocfFact?.end || capexFact?.end || sharesFact?.end || netIncomeFact?.end || null;
+
+    const entry = { cik: normalizedCik, form: 'SEC-XBRL', endDate, report: { ic: icItems, cf: cfItems } };
     if (fp === 'FY') annualReports.push({ ...entry, year: fy });
     else if (quarterNumber[fp]) quarterlyReports.push({ ...entry, year: fy, quarter: quarterNumber[fp] });
   }
@@ -924,23 +933,29 @@ function pickTrendToPublish(existingPoints, freshPoints) {
 // null points even after the generating bug was fixed. Mirrors this
 // codebase's established "sanitize existing before comparing" pattern for
 // this exact class of merge-protection trap.
-function stripFuturePoints(points) {
+// Trims a TRAILING run of null-valued points, not a calendar-based date
+// guess -- deliberately avoids parsing a label like "Q3 '26" into a
+// calendar-quarter date (wrong for any filer whose fiscal quarters don't
+// align with calendar quarters). A null value here is a reliable,
+// entity-agnostic signal specifically for P/FCF and P/E, since a null can
+// only happen when findClosestMonthlyPrice found no real price within 45
+// days -- a period that hasn't actually happened yet can never have real
+// price data, so it will always show up as null. Trailing-only (not any
+// null anywhere) so a genuine mid-history gap (a real, past quarter that
+// just has no matching price) is left untouched -- only the phantom
+// extension at the very end gets removed.
+function stripTrailingNulls(points) {
   if (!points?.length) return points || [];
-  const now = new Date();
-  return points.filter((p) => {
-    const q = /^Q(\d) '(\d\d)$/.exec(p.label || '');
-    if (q) return quarterEndDate(2000 + Number(q[2]), Number(q[1])) <= now;
-    const fy = /^FY '(\d\d)$/.exec(p.label || '');
-    if (fy) return quarterEndDate(2000 + Number(fy[1]), 4) <= now;
-    return true;
-  });
+  let end = points.length;
+  while (end > 0 && points[end - 1].value == null) end--;
+  return points.slice(0, end);
 }
 
 function pickCadenceTrendsToPublish(existingEntry, fresh) {
   return {
-    ttm: pickTrendToPublish(stripFuturePoints(existingEntry?.ttm), fresh.ttm),
-    quarterly: pickTrendToPublish(stripFuturePoints(existingEntry?.quarterly), fresh.quarterly),
-    yearly: pickTrendToPublish(stripFuturePoints(existingEntry?.yearly), fresh.yearly),
+    ttm: pickTrendToPublish(stripTrailingNulls(existingEntry?.ttm), fresh.ttm),
+    quarterly: pickTrendToPublish(stripTrailingNulls(existingEntry?.quarterly), fresh.quarterly),
+    yearly: pickTrendToPublish(stripTrailingNulls(existingEntry?.yearly), fresh.yearly),
   };
 }
 
@@ -1048,13 +1063,19 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
     // quarters not having ended yet as of this run, producing null-valued
     // TTM points on the chart (no real price exists for a not-yet-real
     // date) instead of just not publishing a point for a period that can't
-    // possibly have been filed. A period that hasn't ended yet can never
-    // be real, regardless of which upstream source (Finnhub mislabeling,
-    // SEC fy/fp drift during a transition) produced it -- this is a general
-    // safety net, not specific to the SEC-enrichment path above.
+    // possibly have been filed. Uses each report's own REAL disclosed
+    // endDate (both real Finnhub reports and now buildSecSyntheticPfcfReports'
+    // entries carry one) -- deliberately NOT a date derived from the
+    // (year, quarter) pair via calendar-quarter arithmetic, which would be
+    // wrong for any filer whose fiscal quarters don't line up with
+    // calendar quarters (verified this would have been a real regression
+    // risk for e.g. C3.ai/AI, CRWD). A report with no endDate at all fails
+    // open (kept) rather than guessed at -- never silently drop real data
+    // over a missing field.
     const now = new Date();
-    quarterlyReports = (quarterlyReports || []).filter((r) => !r?.quarter || quarterEndDate(r.year, r.quarter) <= now);
-    annualReports = (annualReports || []).filter((r) => quarterEndDate(r.year, 4) <= now);
+    const isFutureReport = (r) => r?.endDate && new Date(r.endDate) > now;
+    quarterlyReports = (quarterlyReports || []).filter((r) => !isFutureReport(r));
+    annualReports = (annualReports || []).filter((r) => !isFutureReport(r));
 
     await sleep(TWELVEDATA_REQUEST_SPACING_MS);
     const monthlyPrices = await fetchMonthlyPrices(symbol, twelveDataKey);

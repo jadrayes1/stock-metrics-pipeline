@@ -2723,15 +2723,6 @@ function isRecentEnough(points, cutoffMonths = RECENCY_CUTOFF_MONTHS) {
 // at the source above) would otherwise survive pickCadenceMetric forever,
 // same trap isRecentEnough's own comment already documents for stale
 // labels. Mirrors the identical fix in generatePfcfTrendCache.js.
-function stripFuturePoints(points) {
-  if (!points?.length) return points || [];
-  const now = new Date();
-  return points.filter((p) => {
-    const d = parseLabelToApproxDate(p.label);
-    return !d || d <= now;
-  });
-}
-
 // Wraps pickTrendToPublish with the recency floor on BOTH sides of the
 // comparison. Gating `existingPoints` too (not just the final result) is
 // required, not optional — mirrors the FY-label migration lesson from the
@@ -2739,8 +2730,19 @@ function stripFuturePoints(points) {
 // same stale labels never trips pickTrendToPublish's hasNewQuarter check,
 // so a stale already-published series would survive forever if only the
 // fresh/final side were ever checked.
+//
+// Deliberately does NOT also strip already-published future-dated points
+// the way generatePfcfTrendCache.js's sibling merge does -- this file's
+// metrics (revenueGrowth/profitMargin/fcfMargin/roic) don't depend on
+// price data, so a mislabeled future period wouldn't reliably show up as
+// a null value the way it does for price-dependent P/FCF/P/E, and a
+// label-based date guess risks wrongly stripping a real point for any
+// filer whose fiscal quarters don't align with calendar quarters. The
+// future-report filter above now prevents this at the source going
+// forward; revisit an "existing" sanitizer here only with concrete
+// evidence of already-published bad data, not preemptively.
 function pickCadenceMetric(existingPoints, freshPoints) {
-  const recentExisting = isRecentEnough(stripFuturePoints(existingPoints)) ? stripFuturePoints(existingPoints) : [];
+  const recentExisting = isRecentEnough(existingPoints) ? existingPoints : [];
   const picked = pickTrendToPublish(recentExisting, freshPoints);
   return isRecentEnough(picked) ? picked : [];
 }
@@ -3334,19 +3336,19 @@ async function processSymbol(symbol, apiKey, ctx) {
   // Defensive filter against a genuinely future-dated report -- mirrors the
   // identical fix in generatePfcfTrendCache.js (verified live there for
   // BNC, a known fiscal-year-transition filer whose SEC-XBRL enrichment
-  // synthesized a report for a quarter that hadn't ended yet). A period
-  // that hasn't ended yet can never be real, regardless of which upstream
-  // source (Finnhub mislabeling, SEC fy/fp drift, any of the merges above)
-  // produced it -- applied here, after every merge/derivation above has
-  // run, as a final safety net before the builders consume this data.
+  // synthesized a report for a quarter that hadn't ended yet). Uses each
+  // report's own real disclosed endDate (both real Finnhub reports and
+  // buildSecSyntheticReports' own entries already carry one -- see that
+  // function's comment) -- deliberately NOT a date derived from the
+  // (year, quarter) pair via calendar-quarter arithmetic, which would be
+  // wrong for any filer whose fiscal quarters don't align with calendar
+  // quarters. A report with no endDate at all fails open (kept), same
+  // "never silently drop real data over a missing field" principle as
+  // isRecentEnough's own label-parsing fallback above.
   const nowForFutureCheck = new Date();
-  const quarterEndsAfterNow = (year, quarter) => {
-    const month = quarter * 3;
-    const lastDay = new Date(year, month, 0).getDate();
-    return new Date(year, month - 1, lastDay) > nowForFutureCheck;
-  };
-  quarterlyFinancials = quarterlyFinancials.filter((r) => !r?.quarter || !quarterEndsAfterNow(r.year, r.quarter));
-  annualReportedFinancials = annualReportedFinancials.filter((r) => !quarterEndsAfterNow(r.year, 4));
+  const isFutureReport = (r) => r?.endDate && new Date(r.endDate) > nowForFutureCheck;
+  quarterlyFinancials = quarterlyFinancials.filter((r) => !isFutureReport(r));
+  annualReportedFinancials = annualReportedFinancials.filter((r) => !isFutureReport(r));
 
   const isBankLike = isFinancialIndustry(profile.industry);
 
