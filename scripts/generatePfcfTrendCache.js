@@ -1018,6 +1018,21 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
       }
     }
 
+    // Defensive filter against a genuinely future-dated report -- verified
+    // live: BNC (a known fiscal-year-transition filer -- see
+    // buildSecSyntheticPfcfReports' own comment) had real, non-null OCF/
+    // capex/shares synthesized for "2026 Q3"/"2026 Q4" despite those
+    // quarters not having ended yet as of this run, producing null-valued
+    // TTM points on the chart (no real price exists for a not-yet-real
+    // date) instead of just not publishing a point for a period that can't
+    // possibly have been filed. A period that hasn't ended yet can never
+    // be real, regardless of which upstream source (Finnhub mislabeling,
+    // SEC fy/fp drift during a transition) produced it -- this is a general
+    // safety net, not specific to the SEC-enrichment path above.
+    const now = new Date();
+    quarterlyReports = (quarterlyReports || []).filter((r) => !r?.quarter || quarterEndDate(r.year, r.quarter) <= now);
+    annualReports = (annualReports || []).filter((r) => quarterEndDate(r.year, 4) <= now);
+
     await sleep(TWELVEDATA_REQUEST_SPACING_MS);
     const monthlyPrices = await fetchMonthlyPrices(symbol, twelveDataKey);
     usedTwelveDataCall = true;
