@@ -3371,19 +3371,32 @@ async function processSymbol(symbol, apiKey, ctx) {
   const yearlyBuilders = {
     revenueGrowth: () => fdicTrends?.yearly.revenueGrowth || buildRevenueGrowthYearlyFromFilings(annualReportedFinancials),
     profitMargin: () => fdicTrends?.yearly.profitMargin || buildProfitMarginYearlyFromFilings(annualReportedFinancials),
-    fcfMargin: () => (isBankLike ? [] : buildFcfMarginYearlyFromFilings(annualReportedFinancials)),
+    // Deliberately NOT gated on isBankLike the way revenueGrowth/profitMargin/
+    // roic's bank-specific fallbacks are -- verified live: HOOD (Robinhood,
+    // industry "Financial Services", which isBankLike also treats as
+    // bank-like) has real, current capex data in its SEC filings despite
+    // not being a depository bank, so the blanket exclusion was hiding a
+    // computable trend. buildFcfMarginYearlyFromFilings already relies on
+    // findReportedCapexQ's own per-period null-vs-zero disambiguation (real
+    // banks like BAC, with zero capex concepts anywhere, still correctly
+    // produce no records) -- a blanket industry-based gate on top of that
+    // was redundant for a true bank and wrong for a non-depository
+    // "Financial Services" filer like HOOD.
+    fcfMargin: () => buildFcfMarginYearlyFromFilings(annualReportedFinancials),
     roic: () => fdicTrends?.yearly.roic || buildRoicYearlyFromFilings(annualReportedFinancials, isBankLike),
   };
   const quarterlyBuilders = {
     revenueGrowth: () => fdicTrends?.quarterly.revenueGrowth || buildRevenueGrowthQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials),
     profitMargin: () => fdicTrends?.quarterly.profitMargin || buildProfitMarginQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials),
-    fcfMargin: () => (isBankLike ? [] : buildFcfMarginQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials)),
+    // See yearlyBuilders.fcfMargin above for why this isn't gated on isBankLike.
+    fcfMargin: () => buildFcfMarginQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials),
     roic: () => fdicTrends?.quarterly.roic || buildRoicQuarterlyFromFilings(quarterlyFinancials, annualReportedFinancials, isBankLike),
   };
   const ttmBuilders = {
     revenueGrowth: () => fdicTrends?.ttm.revenueGrowth || buildRevenueGrowthTTMFromFilings(quarterlyFinancials, annualReportedFinancials),
     profitMargin: () => fdicTrends?.ttm.profitMargin || buildProfitMarginTTMFromFilings(quarterlyFinancials, annualReportedFinancials),
-    fcfMargin: () => (isBankLike ? [] : buildFcfMarginTrendFromFilings(quarterlyFinancials, annualReportedFinancials)),
+    // See yearlyBuilders.fcfMargin above for why this isn't gated on isBankLike.
+    fcfMargin: () => buildFcfMarginTrendFromFilings(quarterlyFinancials, annualReportedFinancials),
     roic: () => fdicTrends?.ttm.roic || buildRoicTTMFromFilings(quarterlyFinancials, annualReportedFinancials, isBankLike),
   };
 
