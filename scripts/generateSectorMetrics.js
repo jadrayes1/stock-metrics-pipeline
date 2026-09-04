@@ -1530,11 +1530,30 @@ function buildSecSyntheticReports(gaapFacts, cik, isFinancial = false) {
 // entry with SOME content in a section (even partial) still wins outright
 // for that section, same "real wins" philosophy as everywhere else in
 // this merge.
+// Per-concept, not per-section -- mirrors the identical fix in
+// generatePfcfTrendCache.js (verified live there for VKTX, a clinical
+// biotech with real OCF but no PP&E capex: the section-level rule kept
+// Finnhub's real-but-capex-less cf array wholesale and silently discarded
+// synthesized SEC data for every quarter, since the section was never
+// COMPLETELY empty). Same shape verified live here for HOOD (Robinhood):
+// real Finnhub OCF exists, but capex was missing and never got backfilled
+// by SEC enrichment, leaving fcfMargin's trend empty despite real, current
+// capex data being available. A real Finnhub concept still always wins
+// for that SAME concept (never overwritten) -- this only ADDS a
+// synthesized concept Finnhub's own report doesn't have any value for at
+// all.
 function fillEmptySections(existing, synthesized) {
   for (const section of ['ic', 'cf', 'bs']) {
-    if (!(existing.report[section] || []).length && (synthesized.report[section] || []).length) {
-      existing.report[section] = synthesized.report[section];
+    const existingItems = existing.report[section] || [];
+    const synthesizedItems = synthesized.report[section] || [];
+    if (!synthesizedItems.length) continue;
+    if (!existingItems.length) {
+      existing.report[section] = synthesizedItems;
+      continue;
     }
+    const existingConcepts = new Set(existingItems.map((item) => item.concept));
+    const additions = synthesizedItems.filter((item) => !existingConcepts.has(item.concept));
+    if (additions.length) existing.report[section] = [...existingItems, ...additions];
   }
 }
 
