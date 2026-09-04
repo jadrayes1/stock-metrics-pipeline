@@ -65,6 +65,7 @@ jobs:
           TWELVEDATA_PIPELINE_API_KEY: ${{ secrets.TWELVEDATA_PIPELINE_API_KEY }}
           TWELVEDATA_PIPELINE_API_KEY_2: ${{ secrets.TWELVEDATA_PIPELINE_API_KEY_2 }}
           TARGET_SYMBOL: ${{ inputs.symbol }}
+          DEBUG_PFCF_SYMBOLS: ${{ inputs.symbol }}
         run: node scripts/generatePfcfTrendCache.js
 
       - name: Publish to gist
