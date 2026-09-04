@@ -1077,6 +1077,16 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
     quarterlyReports = (quarterlyReports || []).filter((r) => !isFutureReport(r));
     annualReports = (annualReports || []).filter((r) => !isFutureReport(r));
 
+    if (process.env.DEBUG_PFCF_SYMBOLS?.split(',').map((s) => s.trim().toUpperCase()).includes(symbol)) {
+      console.error(`DEBUG_PFCF ${symbol} quarterlyReports count:`, quarterlyReports.length, 'annualReports count:', annualReports.length);
+      for (const r of quarterlyReports.slice(-6)) {
+        console.error(`DEBUG_PFCF ${symbol} Q`, 'year=', r.year, 'quarter=', r.quarter, 'form=', r.form,
+          'ocf=', findReportedOperatingCashFlowQ(r.report?.cf || []),
+          'capex=', findReportedCapexQ(r.report?.cf || []),
+          'shares=', findReportedDilutedShares(r.report?.ic || []));
+      }
+    }
+
     await sleep(TWELVEDATA_REQUEST_SPACING_MS);
     const monthlyPrices = await fetchMonthlyPrices(symbol, twelveDataKey);
     usedTwelveDataCall = true;
