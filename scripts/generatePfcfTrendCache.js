@@ -1079,11 +1079,21 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
 
     if (process.env.DEBUG_PFCF_SYMBOLS?.split(',').map((s) => s.trim().toUpperCase()).includes(symbol)) {
       console.error(`DEBUG_PFCF ${symbol} quarterlyReports count:`, quarterlyReports.length, 'annualReports count:', annualReports.length);
-      for (const r of quarterlyReports.slice(-6)) {
-        console.error(`DEBUG_PFCF ${symbol} Q`, 'year=', r.year, 'quarter=', r.quarter, 'form=', r.form,
+      const sortedQ = [...quarterlyReports].sort((a, b) => a.year - b.year || a.quarter - b.quarter);
+      for (const r of sortedQ.slice(-6)) {
+        console.error(`DEBUG_PFCF ${symbol} Q`, 'year=', r.year, 'quarter=', r.quarter, 'form=', r.form, 'endDate=', r.endDate,
           'ocf=', findReportedOperatingCashFlowQ(r.report?.cf || []),
           'capex=', findReportedCapexQ(r.report?.cf || []),
-          'shares=', findReportedDilutedShares(r.report?.ic || []));
+          'shares=', findReportedDilutedShares(r.report?.ic || []),
+          'netIncome=', findReportedNetIncome(r.report?.ic || []));
+      }
+      const sortedA = [...annualReports].sort((a, b) => a.year - b.year);
+      for (const r of sortedA.slice(-6)) {
+        console.error(`DEBUG_PFCF ${symbol} FY`, 'year=', r.year, 'form=', r.form, 'endDate=', r.endDate,
+          'ocf=', findReportedOperatingCashFlowQ(r.report?.cf || []),
+          'capex=', findReportedCapexQ(r.report?.cf || []),
+          'shares=', findReportedDilutedShares(r.report?.ic || []),
+          'netIncome=', findReportedNetIncome(r.report?.ic || []));
       }
     }
 
