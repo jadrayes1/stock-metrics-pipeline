@@ -772,16 +772,41 @@ function buildPfcfQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports,
 
 // One P/FCF point per fiscal year, priced at that year's Dec-31-equivalent
 // close — mirrors buildPfcfYearlyFromFilingsAndPrices in src/utils/metrics.js.
-function buildPfcfYearlyFromFilingsAndPrices(annualReports, monthlyPrices, isBank = false) {
+// sharesFallbackByYear: built by the caller from quarterlyReports (see
+// buildSharesFallbackByYear below) -- used only when the annual report
+// itself has no diluted-shares concept Finnhub extracted. Verified live:
+// WEYS's 10-Ks have real OCF/capex but no shares Finnhub crawls, across
+// EVERY fiscal year, despite its own 10-Qs having real shares every
+// quarter -- yearly P/FCF/P/E were permanently empty with no fallback,
+// unlike the quarterly/TTM builders which already borrow in the opposite
+// direction (annual used as a Q4 fallback when a quarter lacks shares).
+function buildSharesFallbackByYear(quarterlyReports) {
+  const byYear = {};
+  for (const q of quarterlyReports || []) {
+    if (!q?.quarter) continue;
+    const shares = findReportedDilutedShares(q.report?.ic || []);
+    // Prefer the LATEST quarter of the year (closest to fiscal year-end,
+    // most representative of that year's actual share count) -- quarters
+    // aren't guaranteed to arrive in order, so always take a later one
+    // over an earlier one already recorded for the same year.
+    if (shares > 0 && (byYear[q.year] == null || q.quarter > byYear[q.year].quarter)) {
+      byYear[q.year] = { shares, quarter: q.quarter };
+    }
+  }
+  return Object.fromEntries(Object.entries(byYear).map(([year, v]) => [year, v.shares]));
+}
+
+function buildPfcfYearlyFromFilingsAndPrices(annualReports, monthlyPrices, isBank = false, quarterlyReports = []) {
   const currentCik = annualReports?.[0]?.cik;
   const sameCik = (r) => currentCik == null || r.cik === currentCik;
   const filtered = (annualReports || []).filter(sameCik);
+  const sharesFallbackByYear = buildSharesFallbackByYear(quarterlyReports);
 
   const points = [];
   for (const a of filtered) {
     const ocf = findReportedOperatingCashFlowQ(a.report?.cf || []);
     const capex = findReportedCapexQ(a.report?.cf || []);
-    const shares = findReportedDilutedShares(a.report?.ic || []);
+    const shares = findReportedDilutedShares(a.report?.ic || []) || sharesFallbackByYear[a.year];
     if (ocf == null || (capex == null && !isBank) || !(shares > 0)) continue;
     const fcfPerShare = (ocf - (capex ?? 0)) / shares;
     const price = findClosestMonthlyPrice(monthlyPrices, quarterEndDate(a.year, 4));
@@ -887,15 +912,16 @@ function buildPeQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, m
 
 // One P/E point per fiscal year, priced at that year's Dec-31-equivalent
 // close -- mirrors buildPfcfYearlyFromFilingsAndPrices above.
-function buildPeYearlyFromFilingsAndPrices(annualReports, monthlyPrices) {
+function buildPeYearlyFromFilingsAndPrices(annualReports, monthlyPrices, quarterlyReports = []) {
   const currentCik = annualReports?.[0]?.cik;
   const sameCik = (r) => currentCik == null || r.cik === currentCik;
   const filtered = (annualReports || []).filter(sameCik);
+  const sharesFallbackByYear = buildSharesFallbackByYear(quarterlyReports);
 
   const points = [];
   for (const a of filtered) {
     const netIncome = findReportedNetIncome(a.report?.ic || []);
-    const shares = findReportedDilutedShares(a.report?.ic || []);
+    const shares = findReportedDilutedShares(a.report?.ic || []) || sharesFallbackByYear[a.year];
     if (netIncome == null || !(shares > 0)) continue;
     const eps = netIncome / shares;
     const price = findClosestMonthlyPrice(monthlyPrices, quarterEndDate(a.year, 4));
@@ -1110,7 +1136,7 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
     fresh = {
       ttm: buildPfcfTrendFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices, isBank),
       quarterly: buildPfcfQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices, isBank),
-      yearly: buildPfcfYearlyFromFilingsAndPrices(annualReports, monthlyPrices, isBank),
+      yearly: buildPfcfYearlyFromFilingsAndPrices(annualReports, monthlyPrices, isBank, quarterlyReports),
     };
     // Computed from the exact same fetched data, regardless of whether
     // THIS symbol was selected for its P/FCF gap, its P/E gap, or both --
@@ -1119,7 +1145,7 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
     freshPe = {
       ttm: buildPeTrendFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices),
       quarterly: buildPeQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices),
-      yearly: buildPeYearlyFromFilingsAndPrices(annualReports, monthlyPrices),
+      yearly: buildPeYearlyFromFilingsAndPrices(annualReports, monthlyPrices, quarterlyReports),
     };
   } catch (err) {
     console.log(`  skip ${symbol}: ${err.message}`);
