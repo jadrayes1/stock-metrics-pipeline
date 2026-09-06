@@ -382,6 +382,25 @@ const CIK_CONTINUITY_ALIASES = {
   DMRC: ['1438231', '2119322'],
 };
 
+// Tickers Finnhub's own /stock/symbol universe endpoint still lists even
+// though they're stale duplicates of a company already covered under its
+// real, currently-traded symbol. This is different from a normal rename
+// (RENAMED_TICKER_FINANCIALS_ALIASES above) -- Finnhub correctly DROPPED
+// the old symbol from its universe list for that map's own BNY/AD examples
+// (verified live: neither "BK" nor "USM" appear in the universe at all
+// today, only their current "BNY"/"AD" symbols do). "ISSC" is an anomaly:
+// Innovative Solutions & Support Inc (CIK 836690) renamed its ticker to
+// "IA" in 2021, but Finnhub's universe endpoint still lists "ISSC" too,
+// and /stock/profile2, /stock/metric, and financials-reported all still
+// return real (if slightly stale) data for the string "ISSC" -- so left
+// unhandled, this publishes a fully-populated ghost duplicate of "IA"
+// alongside the real one. Its /quote endpoint does not return live data
+// for a symbol that hasn't actually traded under that name in years,
+// which is what surfaces as "cannot be loaded" in the app. Narrow,
+// explicit, hand-verified exclusion list -- same philosophy as
+// CIK_CONTINUITY_ALIASES above, not an automatic heuristic.
+const EXCLUDED_STALE_UNIVERSE_SYMBOLS = new Set(['ISSC']);
+
 // CIKs show up in two different string formats across this file's own data
 // sources -- Finnhub's financials-reported returns them unpadded ("1438231"),
 // while SEC's own company_tickers.json-derived secTickerToCikMap zero-pads
@@ -3652,7 +3671,7 @@ async function runWorker(workerId, symbolSubset, apiKey, ctx) {
 
 async function main() {
   const apiKeys = readFinnhubApiKeys();
-  const universeEntries = await fetchUniverse(apiKeys[0]);
+  const universeEntries = (await fetchUniverse(apiKeys[0])).filter((e) => !EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(e.symbol));
   // Built from the full, unfiltered universe fetch above, before any
   // TARGET_SYMBOL debug filtering below -- always complete regardless of
   // debug mode (see generate-sector-metrics.yml's publish step, which only
@@ -3774,24 +3793,24 @@ async function main() {
   // resurrecting stale data for a delisted/invalid ticker forever).
   let recoveredFromFailure = 0;
   for (const [symbol, prevMetrics] of Object.entries(previouslyPublishedMetrics)) {
-    if (metrics[symbol] || deadSymbols.has(symbol)) continue;
+    if (metrics[symbol] || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
     metrics[symbol] = prevMetrics;
     recoveredFromFailure++;
   }
   for (const [symbol, prevTrends] of Object.entries(previouslyPublished.nativeTrends)) {
-    if (nativeTrends[symbol] || deadSymbols.has(symbol)) continue;
+    if (nativeTrends[symbol] || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
     nativeTrends[symbol] = prevTrends;
   }
   for (const [symbol, prevTrends] of Object.entries(previouslyPublished.yearlyTrends)) {
-    if (yearlyTrends[symbol] || deadSymbols.has(symbol)) continue;
+    if (yearlyTrends[symbol] || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
     yearlyTrends[symbol] = prevTrends;
   }
   for (const [symbol, prevTrends] of Object.entries(previouslyPublished.quarterlyTrends)) {
-    if (quarterlyTrends[symbol] || deadSymbols.has(symbol)) continue;
+    if (quarterlyTrends[symbol] || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
     quarterlyTrends[symbol] = prevTrends;
   }
   for (const [symbol, prevTrends] of Object.entries(previouslyPublished.ttmTrends)) {
-    if (ttmTrends[symbol] || deadSymbols.has(symbol)) continue;
+    if (ttmTrends[symbol] || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
     ttmTrends[symbol] = prevTrends;
   }
   if (recoveredFromFailure) {
