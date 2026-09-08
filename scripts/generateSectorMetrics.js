@@ -3414,8 +3414,23 @@ async function processSymbol(symbol, apiKey, ctx) {
   // isRecentEnough's own label-parsing fallback above.
   const nowForFutureCheck = new Date();
   const isFutureReport = (r) => r?.endDate && new Date(r.endDate) > nowForFutureCheck;
+  if (process.env.DEBUG_SEC_ENRICHMENT) {
+    console.error(
+      'DEBUG pre-future-filter',
+      symbol,
+      'q=',
+      quarterlyFinancials.length,
+      'a=',
+      annualReportedFinancials.length,
+      'sample endDates=',
+      JSON.stringify(quarterlyFinancials.slice(0, 3).map((r) => r?.endDate))
+    );
+  }
   quarterlyFinancials = quarterlyFinancials.filter((r) => !isFutureReport(r));
   annualReportedFinancials = annualReportedFinancials.filter((r) => !isFutureReport(r));
+  if (process.env.DEBUG_SEC_ENRICHMENT) {
+    console.error('DEBUG post-future-filter', symbol, 'q=', quarterlyFinancials.length, 'a=', annualReportedFinancials.length);
+  }
 
   const isBankLike = isFinancialIndustry(profile.industry);
 
