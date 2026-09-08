@@ -68,7 +68,7 @@ const ETF_UNIVERSE = [
   // Growth / active thematic
   'ARKK', 'ARKG', 'ARKW', 'ARKQ', 'ARKF',
   // Leveraged / inverse (high volume, frequently searched)
-  'TQQQ', 'SQQQ', 'SPXL', 'SPXS', 'SOXL', 'SOXS', 'UVXY', 'SDS', 'SSO',
+  'TQQQ', 'SQQQ', 'SPXL', 'SPXS', 'SOXL', 'SOXS', 'UVXY', 'SDS', 'SSO', 'SCO', 'RAM',
   // Crypto-adjacent
   'BITO', 'IBIT', 'FBTC', 'GBTC',
   // ESG
