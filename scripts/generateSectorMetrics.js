@@ -2287,15 +2287,34 @@ function buildAnnualFlowPoints(annualReports, fieldSpecs) {
   const currentCik = annualReports?.[0]?.cik;
   const sameCik = (r) => currentCik == null || r.cik === currentCik;
   const filtered = (annualReports || []).filter(sameCik);
+  if (process.env.DEBUG_SEC_ENRICHMENT) {
+    console.error(
+      'DEBUG buildAnnualFlowPoints',
+      'fields=',
+      Object.keys(fieldSpecs).join(','),
+      'currentCik=',
+      currentCik,
+      'ciks=',
+      JSON.stringify([...new Set((annualReports || []).map((r) => r.cik))]),
+      'in=',
+      (annualReports || []).length,
+      'afterCikFilter=',
+      filtered.length
+    );
+  }
 
-  return filtered
-    .map((a) => {
-      const record = { year: a.year };
-      for (const [name, { fn, section }] of Object.entries(fieldSpecs)) {
-        record[name] = fn(a.report?.[section] || []);
-      }
-      return record;
-    })
+  const mapped = filtered.map((a) => {
+    const record = { year: a.year };
+    for (const [name, { fn, section }] of Object.entries(fieldSpecs)) {
+      record[name] = fn(a.report?.[section] || []);
+    }
+    return record;
+  });
+  if (process.env.DEBUG_SEC_ENRICHMENT) {
+    console.error('DEBUG buildAnnualFlowPoints mapped', JSON.stringify(mapped));
+  }
+  return mapped
+    .slice()
     .filter((record) => Object.keys(fieldSpecs).every((name) => record[name] != null))
     .sort((a, b) => a.year - b.year);
 }
