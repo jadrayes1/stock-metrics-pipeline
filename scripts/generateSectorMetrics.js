@@ -3480,10 +3480,12 @@ async function processSymbol(symbol, apiKey, ctx) {
     let fresh = [];
     try {
       fresh = yearlyBuilders[key]();
-    } catch {
+    } catch (e) {
+      if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG yearly builder threw', symbol, key, e.message, e.stack);
       // A single metric's oddly-shaped filing shouldn't take down the
       // others — pickTrendToPublish falls back to the previous run.
     }
+    if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG yearly builder', symbol, key, 'fresh.length=', fresh.length);
     const published = pickTrendToPublish(previousYearlyForSymbol[key], fresh);
     if (published.length) mergedYearlyForSymbol[key] = published;
   }
@@ -3491,9 +3493,11 @@ async function processSymbol(symbol, apiKey, ctx) {
     let fresh = [];
     try {
       fresh = quarterlyBuilders[key]();
-    } catch {
+    } catch (e) {
+      if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG quarterly builder threw', symbol, key, e.message, e.stack);
       // Same graceful-degradation philosophy as above.
     }
+    if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG quarterly builder', symbol, key, 'fresh.length=', fresh.length);
     const published = pickTrendToPublish(previousQuarterlyForSymbol[key], fresh);
     if (published.length) mergedQuarterlyForSymbol[key] = published;
   }
@@ -3501,9 +3505,11 @@ async function processSymbol(symbol, apiKey, ctx) {
     let fresh = [];
     try {
       fresh = ttmBuilders[key]();
-    } catch {
+    } catch (e) {
+      if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG ttm builder threw', symbol, key, e.message, e.stack);
       // Same graceful-degradation philosophy as above.
     }
+    if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG ttm builder', symbol, key, 'fresh.length=', fresh.length);
     const published = pickTrendToPublish(previousTtmForSymbol[key], fresh);
     if (published.length) {
       mergedTtmForSymbol[key] = published;
