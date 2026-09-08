@@ -1625,6 +1625,9 @@ const REVENUE_CONTRACT_CONCEPT_EXCLUDE = /RemainingPerformanceObligation|Disaggr
 const REVENUE_LABEL_PATTERN = /^(total\s+)?(net\s+)?revenues?(,?\s*net)?$|^(total\s+)?net\s+sales$/i;
 
 function findReportedRevenue(icItems) {
+  if (process.env.DEBUG_SEC_ENRICHMENT && process.env.DEBUG_REVENUE_ITEMS) {
+    console.error('DEBUG findReportedRevenue icItems', JSON.stringify((icItems || []).map((i) => ({ concept: i.concept, label: i.label, value: i.value }))));
+  }
   for (const concept of REVENUE_CONCEPT_CANDIDATES) {
     const match = icItems.find((item) => item.concept === concept);
     if (match) return match.value;
