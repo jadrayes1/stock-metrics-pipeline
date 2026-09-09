@@ -429,6 +429,43 @@ function normalizeCikContinuity(symbol, reports) {
   return reports.map((r) => (r?.cik != null && aliasSet.has(canonicalCikDigits(r.cik)) ? { ...r, cik: canonicalCik } : r));
 }
 
+// Finnhub's `financials-reported` occasionally resolves a ticker to a
+// completely UNRELATED company's CIK -- a ticker-symbol collision (the
+// ticker was previously used by a different, often long-defunct filer, and
+// Finnhub's own internal symbol->CIK resolution hasn't caught up to the
+// current listing). Verified live: CAAP (Corporación América Airports, a
+// confirmed foreign filer, real CIK 0001717393 per SEC's own
+// company_tickers.json) resolves through Finnhub's financials-reported to
+// CIK 925535 -- a tiny, unrelated company whose last-ever report is a 10-Q
+// covering a bizarre 1991-2012 period with ~$180K quarterly "SALES." Not a
+// rare/theoretical case -- CAAP's live-published domestic metrics were
+// visibly garbage as a direct result (an 83% profit margin, a 20,277%
+// revenue growth) and Finnhub's own native /stock/metric ratio engine was
+// equally corrupted for it (netProfitMarginAnnual: 18899.97,
+// revenueGrowthQuarterlyYoy: 79040.04), even though that endpoint exposes
+// no CIK of its own to check directly -- financials-reported's mismatch is
+// used here as a proxy signal for "Finnhub is confused about this ticker's
+// identity," broad enough to also gate the native ratio values, not just
+// the reconstructed trends.
+//
+// Unlike normalizeCikContinuity above (a hand-curated alias list for KNOWN
+// continuity cases -- the same real company changing CIK), this has no
+// alias to apply; the data is for a genuinely different company and must
+// be discarded, not remapped. SEC's own company_tickers.json
+// (secTickerToCikMap, already fetched for the SEC-XBRL enrichment
+// fallback) is the independent ground truth here -- when it disagrees with
+// what Finnhub itself reported, Finnhub is wrong, not SEC. Fails OPEN
+// (returns false, i.e. "trust Finnhub") when SEC's map has no entry for
+// this ticker or Finnhub's reports don't carry a cik at all -- absence of
+// evidence isn't evidence of a mismatch, and a false positive here would
+// wrongly blank out a real ticker's real data.
+function isFinnhubCikMismatched(symbol, reports, secTickerToCikMap) {
+  const finnhubCik = reports?.[0]?.cik;
+  const secCik = secTickerToCikMap?.get(symbol.toUpperCase());
+  if (finnhubCik == null || secCik == null) return false;
+  return canonicalCikDigits(finnhubCik) !== canonicalCikDigits(secCik);
+}
+
 // FDIC BankFind integration for Section 12(i)-exempt banks -- these report
 // periodic financials to the FDIC instead of registering with the SEC, so
 // they have zero XBRL/financials-reported data of any kind, ever (verified
@@ -3279,13 +3316,24 @@ async function processSymbol(symbol, apiKey, ctx) {
   let estimatedFairValue = null;
   let annualReportedFinancials = [];
   let dcfComputed = false;
+  let finnhubDataUntrusted = false;
   await sleep(REQUEST_SPACING_MS);
   try {
     annualReportedFinancials = await fetchReportedFinancialsFor(symbol, apiKey);
-    const dcfInputs = extractDcfInputs(annualReportedFinancials, profile.industry);
-    if (dcfInputs) {
-      estimatedFairValue = computeEstimatedFairValue(dcfInputs, current, profile.marketCapitalization, profile.industry);
-      if (estimatedFairValue != null) dcfComputed = true;
+    if (isFinnhubCikMismatched(symbol, annualReportedFinancials, ctx.secTickerToCikMap)) {
+      // See isFinnhubCikMismatched's own comment — Finnhub has the wrong
+      // company for this ticker. Discard its reported financials entirely
+      // (never remap/estimate) and flag every other Finnhub-fundamentals-
+      // derived value below as untrusted too, rather than only this one
+      // fetch.
+      finnhubDataUntrusted = true;
+      annualReportedFinancials = [];
+    } else {
+      const dcfInputs = extractDcfInputs(annualReportedFinancials, profile.industry);
+      if (dcfInputs) {
+        estimatedFairValue = computeEstimatedFairValue(dcfInputs, current, profile.marketCapitalization, profile.industry);
+        if (estimatedFairValue != null) dcfComputed = true;
+      }
     }
   } catch {
     // A single ticker's oddly-shaped filing (or a failed request) shouldn't
@@ -3295,7 +3343,9 @@ async function processSymbol(symbol, apiKey, ctx) {
   }
 
   const impliedPrice = impliedPriceFromProfile(profile);
-  const values = extractMetricValues(current, quarterly, impliedPrice);
+  const values = finnhubDataUntrusted
+    ? { roic: null, revenueGrowth: null, profitMargin: null, fcfMargin: null, peRatio: null, pfcfRatio: null }
+    : extractMetricValues(current, quarterly, impliedPrice);
 
   // Tier 1 — native quarterly series (all 6 metrics), straight from the
   // stock/metric response already fetched above for the current values.
@@ -3303,7 +3353,7 @@ async function processSymbol(symbol, apiKey, ctx) {
   // previously published. See buildNativeTrendsForTicker's own comments
   // for why this matters (it's the whole fix for P/E's trend chart, which
   // has no reconstruction fallback of its own).
-  const freshNativeTrends = buildNativeTrendsForTicker(quarterly);
+  const freshNativeTrends = finnhubDataUntrusted ? {} : buildNativeTrendsForTicker(quarterly);
   const previousNativeForSymbol = previouslyPublishedNativeTrends[symbol] || {};
   const mergedNativeForSymbol = {};
   for (const key of ['roic', 'revenueGrowth', 'profitMargin', 'fcfMargin', 'peRatio', 'pfcfRatio']) {
@@ -3320,14 +3370,21 @@ async function processSymbol(symbol, apiKey, ctx) {
   // live-reconstructing on first tap. annualReportedFinancials is already
   // fetched above for the DCF estimate, at no extra cost either way.
   let quarterlyFinancials = [];
-  await sleep(REQUEST_SPACING_MS);
-  try {
-    quarterlyFinancials = await fetchReportedFinancialsQuarterlyFor(symbol, apiKey);
-    quarterlyFinancials = fixMislabeledQuarterlyYears(quarterlyFinancials, annualReportedFinancials);
-  } catch {
-    // Leave quarterlyFinancials empty — every builder below degrades
-    // gracefully to "nothing new," and pickTrendToPublish falls back to
-    // whatever was already published rather than losing it.
+  if (!finnhubDataUntrusted) {
+    await sleep(REQUEST_SPACING_MS);
+    try {
+      quarterlyFinancials = await fetchReportedFinancialsQuarterlyFor(symbol, apiKey);
+      // Same ticker/symbol resolution as the annual fetch above -- if that
+      // one hit a different company's CIK, this one almost certainly would
+      // too (not re-checked separately; skipping the fetch also saves the
+      // call, same "known untrustworthy, don't bother" reasoning as the
+      // annual branch above).
+      quarterlyFinancials = fixMislabeledQuarterlyYears(quarterlyFinancials, annualReportedFinancials);
+    } catch {
+      // Leave quarterlyFinancials empty — every builder below degrades
+      // gracefully to "nothing new," and pickTrendToPublish falls back to
+      // whatever was already published rather than losing it.
+    }
   }
 
   // SEC XBRL fallback for a Finnhub crawl gap that would otherwise block
