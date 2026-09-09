@@ -2701,6 +2701,13 @@ const GIST_TRENDS_NATIVE_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd
 const GIST_TRENDS_QUARTERLY_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/trendsQuarterly.json';
 const GIST_TRENDS_YEARLY_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/trendsYearly.json';
 const GIST_TRENDS_TTM_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/trendsTtm.json';
+// Published by the SEPARATE generatePfcfTrendCache.js pipeline (P/FCF needs
+// Twelve Data price history, this file's own main() doesn't fetch prices at
+// all -- see the file header). Read-only here, purely to backfill the
+// pfcfRatio CARD value when this script's own native/no-price-needed
+// sources have nothing -- see the fetch site's own comment for why that
+// backfill was missing.
+const GIST_PFCF_TREND_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/pfcfTrendCache.json';
 
 async function fetchJsonSafe(url) {
   try {
@@ -3751,6 +3758,26 @@ async function processSymbol(symbol, apiKey, ctx) {
     estimatedFairValueSource = previous.estimatedFairValueSource;
   }
 
+  // Backfill the pfcfRatio CARD value from the separate pfcfTrendCache
+  // pipeline's own real, already-published TTM trend when this script's
+  // own sources (Finnhub's native ratio, the only source extractMetricValues
+  // has for pfcfRatio) have nothing -- mirrors the EXACT "backfill the card
+  // from whichever trend survives" pattern the ttmBuilders loop above
+  // already applies to revenueGrowth/profitMargin/fcfMargin/roic, just
+  // reaching across to the other pipeline's own output instead of a
+  // locally-computed trend. Verified live: MLTX (a real, pre-revenue
+  // biotech with genuine OCF/capex data) has a complete, real 12-point P/FCF
+  // TTM trend in pfcfTrendCache.json, yet its marketMetrics.json pfcfRatio
+  // card sat at null forever -- nothing in this script had ever read that
+  // other file to notice the trend existed. Only ever fills a null with a
+  // REAL, already-computed-and-verified point (never estimates/derives a
+  // new one here) -- same "verify or leave empty" principle as everywhere
+  // else in this pipeline.
+  if (values.pfcfRatio == null) {
+    const pfcfTtm = ctx.pfcfTrendCache[symbol]?.ttm;
+    if (pfcfTtm?.length) values.pfcfRatio = pfcfTtm[pfcfTtm.length - 1].value;
+  }
+
   return {
     status: 'ok',
     profile: profileEntry,
@@ -3890,6 +3917,11 @@ async function main() {
   const secTickerToCikMap = await fetchSecTickerToCikMap();
   console.log(`Loaded ${secTickerToCikMap.size} ticker->CIK mappings from SEC for the revenue-gap fallback.`);
 
+  // Read-only, for the pfcfRatio card-value backfill (see its own call site
+  // comment) -- never written back here, generatePfcfTrendCache.js owns
+  // this file's actual publishing.
+  const pfcfTrendCache = (await fetchJsonSafe(GIST_PFCF_TREND_URL))?.trends || {};
+
   const ctx = {
     previouslyPublishedMetrics,
     previouslyPublishedNativeTrends: previouslyPublished.nativeTrends,
@@ -3897,6 +3929,7 @@ async function main() {
     previouslyPublishedQuarterlyTrends: previouslyPublished.quarterlyTrends,
     previouslyPublishedTtmTrends: previouslyPublished.ttmTrends,
     secTickerToCikMap,
+    pfcfTrendCache,
   };
 
   // Split the universe across one worker per key, interleaved (round-robin
