@@ -3316,17 +3316,31 @@ async function processSymbol(symbol, apiKey, ctx) {
   let estimatedFairValue = null;
   let annualReportedFinancials = [];
   let dcfComputed = false;
-  let finnhubDataUntrusted = false;
+  // Gates Tier 2/3 (financials-reported-derived reconstruction) ONLY --
+  // NOT Tier 1 (native /stock/metric ratios). Verified live this
+  // distinction matters: NU (Nu Holdings) has the exact same
+  // financials-reported CIK mismatch as CAAP (resolves to CIK 315256,
+  // "PUBLIC SERVICE CO OF NEW HAMPSHIRE" -- confirmed via SEC's own
+  // submissions API, not the real Nu Holdings CIK 1691493) but its native
+  // /stock/metric ratios are genuinely plausible (50% revenue growth is
+  // real for Nu's actual growth story) -- Finnhub's financials-reported
+  // and /stock/metric endpoints evidently don't always share the same
+  // internal company resolution, so a mismatch confirmed in ONE doesn't
+  // reliably predict corruption in the OTHER. An earlier version of this
+  // fix blanked Tier 1 too on the same signal and briefly wiped ARIS's and
+  // FMFC's genuinely-good native data live before this was caught and
+  // corrected -- see TIER1_ALSO_CORRUPTED_SYMBOLS below for the narrower,
+  // hand-verified-only way to additionally suppress Tier 1 for a specific
+  // ticker.
+  let finnhubReportedFinancialsUntrusted = false;
   await sleep(REQUEST_SPACING_MS);
   try {
     annualReportedFinancials = await fetchReportedFinancialsFor(symbol, apiKey);
     if (isFinnhubCikMismatched(symbol, annualReportedFinancials, ctx.secTickerToCikMap)) {
       // See isFinnhubCikMismatched's own comment — Finnhub has the wrong
-      // company for this ticker. Discard its reported financials entirely
-      // (never remap/estimate) and flag every other Finnhub-fundamentals-
-      // derived value below as untrusted too, rather than only this one
-      // fetch.
-      finnhubDataUntrusted = true;
+      // company for this ticker's reported financials. Discard them
+      // entirely (never remap/estimate).
+      finnhubReportedFinancialsUntrusted = true;
       annualReportedFinancials = [];
     } else {
       const dcfInputs = extractDcfInputs(annualReportedFinancials, profile.industry);
@@ -3341,6 +3355,18 @@ async function processSymbol(symbol, apiKey, ctx) {
     // degradation philosophy as the rest of this pipeline. Its sector-
     // percentile metrics are unaffected.
   }
+
+  // Narrow, hand-verified exclusion for a ticker where Finnhub's native
+  // /stock/metric ratio engine was ITSELF independently confirmed corrupted
+  // (not just inferred from a financials-reported CIK mismatch, which
+  // NU/ARIS/FMFC prove doesn't reliably transfer -- see the comment above).
+  // Verified live for CAAP: netProfitMarginAnnual 18899.97,
+  // revenueGrowthQuarterlyYoy 79040.04 -- both from /stock/metric directly,
+  // impossible values regardless of company. Add a ticker here ONLY after
+  // fetching its own /stock/metric response directly and confirming
+  // implausible values, same bar as CAAP.
+  const TIER1_ALSO_CORRUPTED_SYMBOLS = new Set(['CAAP']);
+  const finnhubDataUntrusted = finnhubReportedFinancialsUntrusted && TIER1_ALSO_CORRUPTED_SYMBOLS.has(symbol);
 
   const impliedPrice = impliedPriceFromProfile(profile);
   const values = finnhubDataUntrusted
@@ -3370,7 +3396,7 @@ async function processSymbol(symbol, apiKey, ctx) {
   // live-reconstructing on first tap. annualReportedFinancials is already
   // fetched above for the DCF estimate, at no extra cost either way.
   let quarterlyFinancials = [];
-  if (!finnhubDataUntrusted) {
+  if (!finnhubReportedFinancialsUntrusted) {
     await sleep(REQUEST_SPACING_MS);
     try {
       quarterlyFinancials = await fetchReportedFinancialsQuarterlyFor(symbol, apiKey);
