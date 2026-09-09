@@ -1180,6 +1180,48 @@ async function backfillRevenueGapsFromSec(symbol, cik, quarterlyReports, annualR
   };
 }
 
+// Finds reports that EXIST (real Finnhub coverage, not a missing-report
+// gap -- see findRevenueGapsNeedingBackfill above for that case) but whose
+// own `ic` section has no usable revenue line for findReportedRevenue to
+// find. Verified live: NFG's Finnhub financials-reported feed tags its
+// "Statement of Comprehensive Income" (net income plus OCI reconciling
+// items like unrealized derivative gains/losses) as `ic` instead of its
+// real income statement -- every single one of its 48 quarterly + 16
+// annual reports has real netIncome (a different concept, still present)
+// but zero revenue-shaped concept or label anywhere, since the real
+// income statement (with Revenue/Operating Expenses/Operating Income)
+// was never the section Finnhub extracted. findRevenueGapsNeedingBackfill
+// can't catch this -- every (year, quarter) IS present in the reports
+// array, just with unusable content, not literally missing.
+function findReportsMissingRevenue(reports) {
+  return (reports || []).filter((r) => r?.startDate && r?.endDate && r.report?.ic?.length && findReportedRevenue(r.report.ic) == null);
+}
+
+// Injects a recovered SEC revenue fact directly into an EXISTING report's
+// own `ic` array (mutating it in place) -- deliberately NOT appending a
+// new synthetic report the way backfillRevenueGapsFromSec does for a
+// missing quarter, since NFG's report for that period already exists and
+// already has real netIncome; adding a SEPARATE stub report for the same
+// period would leave TWO incomplete records (one with netIncome but no
+// revenue, one with revenue but no netIncome) instead of one complete
+// one, and buildAnnualFlowPoints/buildStandaloneFlowQuarters require
+// every needed field to come from the SAME report. Matched by the
+// report's own real startDate/endDate against SEC's real disclosed
+// period (stripping the incidental " 00:00:00" time suffix Finnhub's own
+// dates carry) -- an exact-date match only, never a guess.
+function fillMissingRevenueInExistingReports(reports, byPeriod) {
+  let filled = 0;
+  for (const r of findReportsMissingRevenue(reports)) {
+    const start = r.startDate.slice(0, 10);
+    const end = r.endDate.slice(0, 10);
+    const value = byPeriod.get(`${start}|${end}`);
+    if (value == null) continue;
+    r.report.ic.push({ concept: 'us-gaap_Revenues', label: 'Revenues (SEC XBRL fallback)', value });
+    filled++;
+  }
+  return filled;
+}
+
 // ---------------------------------------------------------------------------
 // Broad SEC XBRL enrichment — for tickers whose Finnhub financials-reported
 // coverage is severely sparse (verified live: Berkshire Hathaway/BRK.A has
@@ -1625,9 +1667,6 @@ const REVENUE_CONTRACT_CONCEPT_EXCLUDE = /RemainingPerformanceObligation|Disaggr
 const REVENUE_LABEL_PATTERN = /^(total\s+)?(net\s+)?revenues?(,?\s*net)?$|^(total\s+)?net\s+sales$/i;
 
 function findReportedRevenue(icItems) {
-  if (process.env.DEBUG_SEC_ENRICHMENT && process.env.DEBUG_REVENUE_ITEMS) {
-    console.error('DEBUG findReportedRevenue icItems', JSON.stringify((icItems || []).map((i) => ({ concept: i.concept, label: i.label, value: i.value }))));
-  }
   for (const concept of REVENUE_CONCEPT_CANDIDATES) {
     const match = icItems.find((item) => item.concept === concept);
     if (match) return match.value;
@@ -2290,34 +2329,15 @@ function buildAnnualFlowPoints(annualReports, fieldSpecs) {
   const currentCik = annualReports?.[0]?.cik;
   const sameCik = (r) => currentCik == null || r.cik === currentCik;
   const filtered = (annualReports || []).filter(sameCik);
-  if (process.env.DEBUG_SEC_ENRICHMENT) {
-    console.error(
-      'DEBUG buildAnnualFlowPoints',
-      'fields=',
-      Object.keys(fieldSpecs).join(','),
-      'currentCik=',
-      currentCik,
-      'ciks=',
-      JSON.stringify([...new Set((annualReports || []).map((r) => r.cik))]),
-      'in=',
-      (annualReports || []).length,
-      'afterCikFilter=',
-      filtered.length
-    );
-  }
 
-  const mapped = filtered.map((a) => {
-    const record = { year: a.year };
-    for (const [name, { fn, section }] of Object.entries(fieldSpecs)) {
-      record[name] = fn(a.report?.[section] || []);
-    }
-    return record;
-  });
-  if (process.env.DEBUG_SEC_ENRICHMENT) {
-    console.error('DEBUG buildAnnualFlowPoints mapped', JSON.stringify(mapped));
-  }
-  return mapped
-    .slice()
+  return filtered
+    .map((a) => {
+      const record = { year: a.year };
+      for (const [name, { fn, section }] of Object.entries(fieldSpecs)) {
+        record[name] = fn(a.report?.[section] || []);
+      }
+      return record;
+    })
     .filter((record) => Object.keys(fieldSpecs).every((name) => record[name] != null))
     .sort((a, b) => a.year - b.year);
 }
@@ -3321,6 +3341,23 @@ async function processSymbol(symbol, apiKey, ctx) {
       const backfilled = await backfillRevenueGapsFromSec(symbol, cik, quarterlyFinancials, annualReportedFinancials);
       quarterlyFinancials = backfilled.quarterlyReports;
       annualReportedFinancials = backfilled.annualReports;
+
+      // A different, narrower gap than the one above -- see
+      // findReportsMissingRevenue's own comment (verified live for NFG).
+      // Every report EXISTS here; only its own revenue line is missing.
+      // Only pays for the SEC fetch when at least one report actually
+      // needs it.
+      const reportsMissingRevenue = [...findReportsMissingRevenue(quarterlyFinancials), ...findReportsMissingRevenue(annualReportedFinancials)];
+      if (reportsMissingRevenue.length) {
+        const byPeriod = await fetchSecRevenueFactsByPeriod(cik);
+        if (byPeriod.size) {
+          const filledQ = fillMissingRevenueInExistingReports(quarterlyFinancials, byPeriod);
+          const filledA = fillMissingRevenueInExistingReports(annualReportedFinancials, byPeriod);
+          if (filledQ || filledA) {
+            console.log(`  ${symbol}: filled missing revenue into ${filledQ} quarterly + ${filledA} annual existing report(s) from SEC (Finnhub tagged the wrong statement as 'ic')`);
+          }
+        }
+      }
     }
   } catch {
     // Non-fatal — same graceful-degradation philosophy as the fetch above.
@@ -3436,23 +3473,8 @@ async function processSymbol(symbol, apiKey, ctx) {
   // isRecentEnough's own label-parsing fallback above.
   const nowForFutureCheck = new Date();
   const isFutureReport = (r) => r?.endDate && new Date(r.endDate) > nowForFutureCheck;
-  if (process.env.DEBUG_SEC_ENRICHMENT) {
-    console.error(
-      'DEBUG pre-future-filter',
-      symbol,
-      'q=',
-      quarterlyFinancials.length,
-      'a=',
-      annualReportedFinancials.length,
-      'sample endDates=',
-      JSON.stringify(quarterlyFinancials.slice(0, 3).map((r) => r?.endDate))
-    );
-  }
   quarterlyFinancials = quarterlyFinancials.filter((r) => !isFutureReport(r));
   annualReportedFinancials = annualReportedFinancials.filter((r) => !isFutureReport(r));
-  if (process.env.DEBUG_SEC_ENRICHMENT) {
-    console.error('DEBUG post-future-filter', symbol, 'q=', quarterlyFinancials.length, 'a=', annualReportedFinancials.length);
-  }
 
   const isBankLike = isFinancialIndustry(profile.industry);
 
@@ -3522,7 +3544,6 @@ async function processSymbol(symbol, apiKey, ctx) {
       // A single metric's oddly-shaped filing shouldn't take down the
       // others — pickTrendToPublish falls back to the previous run.
     }
-    if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG yearly builder', symbol, key, 'fresh.length=', fresh.length);
     const published = pickTrendToPublish(previousYearlyForSymbol[key], fresh);
     if (published.length) mergedYearlyForSymbol[key] = published;
   }
@@ -3534,7 +3555,6 @@ async function processSymbol(symbol, apiKey, ctx) {
       if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG quarterly builder threw', symbol, key, e.message, e.stack);
       // Same graceful-degradation philosophy as above.
     }
-    if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG quarterly builder', symbol, key, 'fresh.length=', fresh.length);
     const published = pickTrendToPublish(previousQuarterlyForSymbol[key], fresh);
     if (published.length) mergedQuarterlyForSymbol[key] = published;
   }
@@ -3546,7 +3566,6 @@ async function processSymbol(symbol, apiKey, ctx) {
       if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG ttm builder threw', symbol, key, e.message, e.stack);
       // Same graceful-degradation philosophy as above.
     }
-    if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG ttm builder', symbol, key, 'fresh.length=', fresh.length);
     const published = pickTrendToPublish(previousTtmForSymbol[key], fresh);
     if (published.length) {
       mergedTtmForSymbol[key] = published;
@@ -3952,6 +3971,8 @@ module.exports = {
   fetchSecRevenueFactsByPeriod,
   backfillRevenueGapsFromSec,
   findAnnualRevenueGapsNeedingBackfill,
+  findReportsMissingRevenue,
+  fillMissingRevenueInExistingReports,
   fetchSecTickerToCikMap,
   buildRevenueGrowthQuarterlyFromFilings,
   buildRevenueGrowthTTMFromFilings,
