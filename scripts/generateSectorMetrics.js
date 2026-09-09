@@ -252,10 +252,21 @@ function latestRevenueGrowthFromQuarterly(quarterly) {
 // dataset even though the app can still fill it in on-demand for that one
 // ticker when someone looks it up.
 function extractMetricValues(current, quarterly, impliedPrice) {
-  const roic = latestQuarterly(quarterly, 'roicTTM') ?? (current.roiTTM != null ? current.roiTTM / 100 : null);
-  const revenueGrowth = current.revenueGrowthTTMYoy != null ? current.revenueGrowthTTMYoy / 100 : latestRevenueGrowthFromQuarterly(quarterly);
-  const profitMargin = current.netProfitMarginTTM != null ? current.netProfitMarginTTM / 100 : null;
-  const fcfMargin = latestQuarterly(quarterly, 'fcfMargin');
+  // clampImplausible (defined below, MAX_ABS_RATIO=1000 i.e. 100,000%) is
+  // already applied extensively to every RECONSTRUCTED ratio elsewhere in
+  // this file -- verified live this native-Finnhub path was the one place
+  // still missing it: HTLM (a real company, recently listed 2024-10-01)
+  // published revenueGrowth: 48.3533 (4835%) straight from Finnhub's own
+  // `current.revenueGrowthTTMYoy`, most likely a post-listing-vs-pre-
+  // listing base-period mismatch on Finnhub's own end (its netProfitMargin
+  // for the same ticker is a normal, real 4.23% -- not a wholesale wrong-
+  // company collision, just this one ratio). Applied to the 4 percentage-
+  // style metrics only, matching the established peRatio/pfcfRatio
+  // exemption elsewhere (valuation multiples can legitimately be extreme).
+  const roic = clampImplausible(latestQuarterly(quarterly, 'roicTTM') ?? (current.roiTTM != null ? current.roiTTM / 100 : null));
+  const revenueGrowth = clampImplausible(current.revenueGrowthTTMYoy != null ? current.revenueGrowthTTMYoy / 100 : latestRevenueGrowthFromQuarterly(quarterly));
+  const profitMargin = clampImplausible(current.netProfitMarginTTM != null ? current.netProfitMarginTTM / 100 : null);
+  const fcfMargin = clampImplausible(latestQuarterly(quarterly, 'fcfMargin'));
   const peRatio = current.peTTM ?? (impliedPrice != null && current.epsTTM ? impliedPrice / current.epsTTM : null);
   const pfcfRatio = latestQuarterly(quarterly, 'pfcfTTM') ?? current.pfcfShareTTM ?? null;
   return { roic, revenueGrowth, profitMargin, fcfMargin, peRatio, pfcfRatio };
@@ -3379,6 +3390,23 @@ async function processSymbol(symbol, apiKey, ctx) {
   const values = finnhubDataUntrusted
     ? { roic: null, revenueGrowth: null, profitMargin: null, fcfMargin: null, peRatio: null, pfcfRatio: null }
     : extractMetricValues(current, quarterly, impliedPrice);
+
+  // Narrow, hand-verified per-FIELD override -- for a native Finnhub ratio
+  // independently confirmed implausible but still under clampImplausible's
+  // general MAX_ABS_RATIO bound (100,000%), so that broader clamp alone
+  // doesn't catch it. Unlike TIER1_ALSO_CORRUPTED_SYMBOLS above (a whole-
+  // ticker exclusion, for a confirmed wrong-company case), this only nulls
+  // the SPECIFIC field verified broken -- HTLM's netProfitMargin (4.23%,
+  // via /stock/metric directly) is genuinely fine, only its
+  // revenueGrowthTTMYoy (4835.33%, verified live 2026-09-09 -- most likely
+  // a post-listing-vs-pre-listing base-period mismatch on Finnhub's own
+  // end for this recently-listed, Oct 2024, company) is broken. Add an
+  // entry here only after independently fetching and confirming that
+  // specific field's own implausibility, same bar as TIER1_ALSO_CORRUPTED_SYMBOLS.
+  const KNOWN_IMPLAUSIBLE_NATIVE_FIELDS = { HTLM: ['revenueGrowth'] };
+  for (const field of KNOWN_IMPLAUSIBLE_NATIVE_FIELDS[symbol] || []) {
+    values[field] = null;
+  }
 
   // Tier 1 — native quarterly series (all 6 metrics), straight from the
   // stock/metric response already fetched above for the current values.
