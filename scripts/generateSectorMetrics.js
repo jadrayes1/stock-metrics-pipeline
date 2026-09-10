@@ -2719,6 +2719,18 @@ const GIST_TRENDS_TTM_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f4
 // sources have nothing -- see the fetch site's own comment for why that
 // backfill was missing.
 const GIST_PFCF_TREND_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/pfcfTrendCache.json';
+// Published by foreign-filings-pipeline's generateForeignPfcfCache.js —
+// same read-only backfill role as GIST_PFCF_TREND_URL above, but for
+// foreign filers specifically. Verified live (ANTA, ATGL — both real
+// 20-F/6-K filers with zero Finnhub financials-reported quarterly coverage
+// and no us-gaap OCF/net income facts for this script's own SEC-XBRL
+// enrichment to find): foreignPfcfCache.json already has real, verified
+// P/FCF data for them (a yearly point in both cases), but this script
+// never fetched that file at all — the pfcfRatio backfill below only ever
+// checked the DOMESTIC pfcfTrendCache.json, so a foreign filer whose real
+// data lives exclusively in the foreign pipeline's own cache file was
+// silently never considered.
+const GIST_FOREIGN_PFCF_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/foreignPfcfCache.json';
 
 async function fetchJsonSafe(url) {
   try {
@@ -3805,6 +3817,20 @@ async function processSymbol(symbol, apiKey, ctx) {
     const pfcfTtm = ctx.pfcfTrendCache[symbol]?.ttm;
     if (pfcfTtm?.length) values.pfcfRatio = pfcfTtm[pfcfTtm.length - 1].value;
   }
+  // Same backfill, reaching into the FOREIGN pipeline's own cache next --
+  // see GIST_FOREIGN_PFCF_URL's comment for why this is a real, separate
+  // gap from the domestic check just above (verified live for ANTA/ATGL,
+  // both real 20-F/6-K filers with zero domestic-pipeline coverage but
+  // real, verified P/FCF data in foreignPfcfCache.json). Falls through
+  // ttm -> quarterly -> yearly (most representative first) since many
+  // sparse foreign filers -- a well-documented, common shape this session
+  // -- only ever have a real YEARLY P/FCF point, never a standalone
+  // quarter to build a TTM window from at all.
+  if (values.pfcfRatio == null) {
+    const foreignEntry = ctx.foreignPfcfCache[symbol];
+    const latest = (points) => (points?.length ? points[points.length - 1].value : null);
+    values.pfcfRatio = latest(foreignEntry?.ttm) ?? latest(foreignEntry?.quarterly) ?? latest(foreignEntry?.yearly);
+  }
 
   return {
     status: 'ok',
@@ -3949,6 +3975,9 @@ async function main() {
   // comment) -- never written back here, generatePfcfTrendCache.js owns
   // this file's actual publishing.
   const pfcfTrendCache = (await fetchJsonSafe(GIST_PFCF_TREND_URL))?.trends || {};
+  // Same read-only role, for foreign filers -- see GIST_FOREIGN_PFCF_URL's
+  // own comment. Owned by foreign-filings-pipeline's generateForeignPfcfCache.js.
+  const foreignPfcfCache = (await fetchJsonSafe(GIST_FOREIGN_PFCF_URL))?.trends || {};
 
   const ctx = {
     previouslyPublishedMetrics,
@@ -3958,6 +3987,7 @@ async function main() {
     previouslyPublishedTtmTrends: previouslyPublished.ttmTrends,
     secTickerToCikMap,
     pfcfTrendCache,
+    foreignPfcfCache,
   };
 
   // Split the universe across one worker per key, interleaved (round-robin
