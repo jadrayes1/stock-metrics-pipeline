@@ -118,10 +118,31 @@ async function fetchEtfProfile(symbol, apiKey) {
   // disclose -- verified live for UCO: `holdings: []`, not a bug. Stored
   // as [] uniformly (never omitted) so every consumer only needs to check
   // .length, not existence.
+  // Alpha Vantage's own `symbol`/`description` fields are sometimes the
+  // literal string "n/a" (not null/missing) -- verified live across a
+  // 10-ETF, 15-holding sample: `name` alone for PLTR within XLK/IGV (while
+  // ARKK/ARKQ/ARKF disclose PLTR's real name fine -- a genuine per-ETF gap
+  // in Alpha Vantage's own data, not something wrong with this extraction),
+  // and BOTH `symbol` and `name` as "n/a" together for several holdings in
+  // EEM/IEMG/ACWI/EWZ (foreign/ADR-heavy funds). `?? null` only catches
+  // null/undefined, so a literal "n/a" string passed straight through --
+  // for `name` the app rendered it as the holding's name; for `symbol` the
+  // existing `.filter((h) => h.symbol)` never caught it either, since "n/a"
+  // is truthy, so a genuinely unidentifiable holding still showed up as a
+  // dead row (unusable -- nothing to tap or navigate to). Normalizing both
+  // here means a real symbol-less holding is now correctly dropped by the
+  // same filter it was always meant to pass through, and a name-less one
+  // renders with just its real symbol -- ETFHoldings.js already hides the
+  // name line entirely for a null name.
+  const isAlphaVantageNA = (v) => !v || v.trim().toLowerCase() === 'n/a';
   const holdings = Array.isArray(data.holdings)
     ? data.holdings
         .slice(0, 10)
-        .map((h) => ({ symbol: h.symbol ?? null, name: h.description ?? null, weight: h.weight != null ? parseFloat(h.weight) : null }))
+        .map((h) => ({
+          symbol: isAlphaVantageNA(h.symbol) ? null : h.symbol,
+          name: isAlphaVantageNA(h.description) ? null : h.description,
+          weight: h.weight != null ? parseFloat(h.weight) : null,
+        }))
         .filter((h) => h.symbol)
     : [];
   return {
