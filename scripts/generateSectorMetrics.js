@@ -3354,9 +3354,6 @@ async function processSymbol(symbol, apiKey, ctx) {
   await sleep(REQUEST_SPACING_MS);
   try {
     annualReportedFinancials = await fetchReportedFinancialsFor(symbol, apiKey);
-    if (process.env.DEBUG_SEC_ENRICHMENT) {
-      console.error('DEBUG_CIK_CHECK', symbol, 'finnhubCik', annualReportedFinancials?.[0]?.cik, 'secCik', ctx.secTickerToCikMap?.get(symbol.toUpperCase()), 'reportCount', annualReportedFinancials?.length);
-    }
     if (isFinnhubCikMismatched(symbol, annualReportedFinancials, ctx.secTickerToCikMap)) {
       // See isFinnhubCikMismatched's own comment — Finnhub has the wrong
       // company for this ticker's reported financials. Discard them
