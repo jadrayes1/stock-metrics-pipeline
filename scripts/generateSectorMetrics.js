@@ -2751,6 +2751,16 @@ const GIST_PFCF_TREND_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f4
 // data lives exclusively in the foreign pipeline's own cache file was
 // silently never considered.
 const GIST_FOREIGN_PFCF_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/foreignPfcfCache.json';
+// Published by foreign-filings-pipeline's generateForeignFilingsCache.js —
+// same read-only backfill role as GIST_FOREIGN_PFCF_URL above, but for the
+// 4 metrics THAT script covers (revenueGrowth/profitMargin/fcfMargin/
+// roic) instead of P/FCF. Verified live (ALVO/AZ/ACCL, all real, already-
+// correctly-classified foreign filers): real data for one or more of
+// these 4 metrics already existed in this file while the corresponding
+// marketMetrics.json scalar sat at null, for the identical reason as
+// GIST_FOREIGN_PFCF_URL's own gap -- this script never fetched this file
+// either.
+const GIST_FOREIGN_FILINGS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/foreignFilingsCache.json';
 
 async function fetchJsonSafe(url) {
   try {
@@ -3851,6 +3861,32 @@ async function processSymbol(symbol, apiKey, ctx) {
     const latest = (points) => (points?.length ? points[points.length - 1].value : null);
     values.pfcfRatio = latest(foreignEntry?.ttm) ?? latest(foreignEntry?.quarterly) ?? latest(foreignEntry?.yearly);
   }
+  // Same backfill again, for the 4 metrics foreignFilingsCache.json covers
+  // (revenueGrowth/profitMargin/fcfMargin/roic) -- this script had NEVER
+  // read that file either, the identical gap class as pfcfRatio's own fix
+  // just above, now confirmed to affect these 4 metrics too. Verified
+  // live: ALVO's real yearly roic (0.0734), AZ's real quarterly/yearly/
+  // ttm fcfMargin, and ACCL's real yearly revenueGrowth (0.1254) were all
+  // already sitting in foreignFilingsCache.json while marketMetrics.json
+  // showed null for each -- all three are already correctly listed in
+  // foreignFilerList.json and already processed by that pipeline, so the
+  // real data existed, this script just never looked. Same ttm ->
+  // quarterly -> yearly preference and "only ever fills a null" guarantee
+  // as the pfcfRatio backfill above.
+  {
+    const foreignEntry = ctx.foreignFilingsCache[symbol];
+    const latestForeignFilingsMetric = (metric) => {
+      for (const cadence of ['ttm', 'quarterly', 'yearly']) {
+        const points = foreignEntry?.[cadence]?.[metric];
+        if (points?.length) return points[points.length - 1].value;
+      }
+      return null;
+    };
+    if (values.roic == null) values.roic = latestForeignFilingsMetric('roic');
+    if (values.revenueGrowth == null) values.revenueGrowth = latestForeignFilingsMetric('revenueGrowth');
+    if (values.profitMargin == null) values.profitMargin = latestForeignFilingsMetric('profitMargin');
+    if (values.fcfMargin == null) values.fcfMargin = latestForeignFilingsMetric('fcfMargin');
+  }
 
   return {
     status: 'ok',
@@ -3998,6 +4034,9 @@ async function main() {
   // Same read-only role, for foreign filers -- see GIST_FOREIGN_PFCF_URL's
   // own comment. Owned by foreign-filings-pipeline's generateForeignPfcfCache.js.
   const foreignPfcfCache = (await fetchJsonSafe(GIST_FOREIGN_PFCF_URL))?.trends || {};
+  // Same read-only role, for the 4 core metrics -- see GIST_FOREIGN_FILINGS_URL's
+  // own comment. Owned by foreign-filings-pipeline's generateForeignFilingsCache.js.
+  const foreignFilingsCache = (await fetchJsonSafe(GIST_FOREIGN_FILINGS_URL))?.trends || {};
 
   const ctx = {
     previouslyPublishedMetrics,
@@ -4008,6 +4047,7 @@ async function main() {
     secTickerToCikMap,
     pfcfTrendCache,
     foreignPfcfCache,
+    foreignFilingsCache,
   };
 
   // Split the universe across one worker per key, interleaved (round-robin
