@@ -265,7 +265,16 @@ function extractMetricValues(current, quarterly, impliedPrice) {
   // exemption elsewhere (valuation multiples can legitimately be extreme).
   const roic = clampImplausible(latestQuarterly(quarterly, 'roicTTM') ?? (current.roiTTM != null ? current.roiTTM / 100 : null));
   const revenueGrowth = clampImplausible(current.revenueGrowthTTMYoy != null ? current.revenueGrowthTTMYoy / 100 : latestRevenueGrowthFromQuarterly(quarterly));
-  const profitMargin = clampImplausible(current.netProfitMarginTTM != null ? current.netProfitMarginTTM / 100 : null);
+  // Unlike roic/fcfMargin just above (both already fall back to Finnhub's
+  // own quarterly.{roicTTM,fcfMargin} series when the "current" snapshot
+  // field is null), profitMargin had NO fallback at all -- verified live
+  // for OKLO: current.netProfitMarginTTM is null (a very recent IPO whose
+  // TTM aggregate Finnhub hasn't computed yet, real revenue only started
+  // this past quarter) while quarterly.netMargin already has a real,
+  // recent point (confirmed via historyQuarters, which counts this exact
+  // same array) -- the scalar card showed "--" despite the data already
+  // being one property access away. Mirrors roic's exact fallback shape.
+  const profitMargin = clampImplausible(current.netProfitMarginTTM != null ? current.netProfitMarginTTM / 100 : latestQuarterly(quarterly, 'netMargin'));
   const fcfMargin = clampImplausible(latestQuarterly(quarterly, 'fcfMargin'));
   const peRatio = current.peTTM ?? (impliedPrice != null && current.epsTTM ? impliedPrice / current.epsTTM : null);
   const pfcfRatio = latestQuarterly(quarterly, 'pfcfTTM') ?? current.pfcfShareTTM ?? null;
