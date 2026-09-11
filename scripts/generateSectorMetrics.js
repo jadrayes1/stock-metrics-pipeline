@@ -499,6 +499,17 @@ function isFinnhubCikMismatched(symbol, reports, secTickerToCikMap) {
 const FDIC_BANK_CERTS = {
   PFBC: 33539, // Preferred Bank, Los Angeles CA
   OZK: 110, // Bank OZK, Little Rock AR
+  // Northeast Bank -- deregistered from SEC in 2019 (Form 15-12B, CIK
+  // 0000811831, the old "Northeast Bancorp /ME/" holding-company
+  // structure), so it has had zero SEC filings/historyQuarters ever since
+  // despite remaining an actively-traded, real ~$5B-asset bank today. Two
+  // unrelated FDIC-registered institutions share the exact name
+  // "Northeast Bank" (CERT 16659 in Minneapolis MN, CERT 19690 in
+  // Portland ME) -- verified live that 19690 is the real match (current
+  // financials through 2026-06-30 show ~$5.2B assets, consistent with
+  // NBN's real market cap/profile; Minneapolis one not checked further
+  // once Portland ME matched, since NBN's own real HQ is in Maine).
+  NBN: 19690,
 };
 
 const FDIC_FINANCIALS_URL = 'https://api.fdic.gov/banks/financials';
