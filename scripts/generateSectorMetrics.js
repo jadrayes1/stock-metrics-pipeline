@@ -3861,6 +3861,24 @@ async function processSymbol(symbol, apiKey, ctx) {
     const latest = (points) => (points?.length ? points[points.length - 1].value : null);
     values.pfcfRatio = latest(foreignEntry?.ttm) ?? latest(foreignEntry?.quarterly) ?? latest(foreignEntry?.yearly);
   }
+  // A THIRD instance of the identical gap class, this time for peRatio --
+  // extractMetricValues above only ever checks Finnhub's own current.peTTM
+  // (or a locally-implied-price/EPS fallback), never `pfcfTrendCache.json`'s
+  // own `.pe` key, even though that file already carries real P/E for BOTH
+  // domestic AND foreign tickers uniformly (unlike P/FCF, which needs two
+  // separate files/checks -- foreign P/E publishes into this SAME shared
+  // file's `.pe` key, see generateForeignPfcfCache.js). Verified live:
+  // CAAP (now correctly getting real data via the foreignFilingsCache
+  // backfill above, since item 5's CIK-mismatch fix only ever nulled the
+  // WRONG Tier-2/3 domestic reconstruction, not CAAP's own real foreign
+  // data) has real yearly P/E in pfcfTrendCache.json (FY'22-25, latest
+  // 18.67) while its peRatio scalar sat at null. Same ttm -> quarterly ->
+  // yearly preference, same "only ever fills a null" guarantee.
+  if (values.peRatio == null) {
+    const pe = ctx.pfcfTrendCache[symbol]?.pe;
+    const latest = (points) => (points?.length ? points[points.length - 1].value : null);
+    values.peRatio = latest(pe?.ttm) ?? latest(pe?.quarterly) ?? latest(pe?.yearly);
+  }
   // Same backfill again, for the 4 metrics foreignFilingsCache.json covers
   // (revenueGrowth/profitMargin/fcfMargin/roic) -- this script had NEVER
   // read that file either, the identical gap class as pfcfRatio's own fix
