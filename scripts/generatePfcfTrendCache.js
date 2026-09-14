@@ -168,6 +168,23 @@ async function fetchFdicJson(url) {
 // RI's own convention, resetting every Q1) -- same de-cumulation
 // generateSectorMetrics.js's decumulateFdicQuarters already does, narrowed
 // to just the one field P/E needs.
+//
+// FDIC_THOUSANDS_SCALE: FDIC Call Report dollar fields (NETINC included)
+// are reported in THOUSANDS of dollars, a standard regulatory convention
+// -- verified live (PFBC): raw NETINC ~30024 for a real quarter, which as
+// literal dollars ($30K) is absurd for a ~$2-3B bank but exactly right as
+// $30,024 thousand = $30.0M once scaled. generateSectorMetrics.js's own
+// decumulateFdicQuarters never applies this scale either, but it never
+// needed to -- every ratio it builds (netInc/revenue for profitMargin,
+// netInc/equity for roic) divides two FDIC-sourced dollar fields at the
+// SAME unscaled magnitude, so the missing ×1000 cancels out silently. P/E
+// is the first use of this data that divides against a NON-FDIC-sourced
+// denominator (a real share count), which is what finally exposed this --
+// confirmed live via a validation dispatch: PFBC/OZK's synthesized P/E
+// came back in the THOUSANDS (and even negative-millions for some
+// quarters) before this fix.
+const FDIC_THOUSANDS_SCALE = 1000;
+
 function decumulateFdicNetIncome(rows) {
   const sorted = [...rows].sort((a, b) => a.REPDTE.localeCompare(b.REPDTE));
   const byYear = new Map();
@@ -181,8 +198,9 @@ function decumulateFdicNetIncome(rows) {
   for (const yearRows of byYear.values()) {
     let prevCumulative = 0;
     for (const row of yearRows) {
-      quarters.push({ repdte: row.REPDTE, standalone: row.NETINC - prevCumulative, cumulativeToDate: row.NETINC });
-      prevCumulative = row.NETINC;
+      const cumulative = row.NETINC * FDIC_THOUSANDS_SCALE;
+      quarters.push({ repdte: row.REPDTE, standalone: cumulative - prevCumulative, cumulativeToDate: cumulative });
+      prevCumulative = cumulative;
     }
   }
   return quarters;
