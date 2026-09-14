@@ -3742,6 +3742,29 @@ async function processSymbol(symbol, apiKey, ctx) {
       }
     }
   }
+  // The TTM backfill above only ever checks the TTM reconstruction --
+  // verified live for FLG (Flagstar Bank): Finnhub's own financials-
+  // reported coverage is thin (5 quarterly reports, 2 annual), enough for
+  // buildRevenueGrowthYearlyFromFilings to produce a real point (FY'25:
+  // -19.2%) but NOT enough for buildRevenueGrowthTTMFromFilings to
+  // assemble a full trailing/YoY quarterly window (came back empty) --
+  // so the card stayed null even though a real, computed value already
+  // existed in mergedYearlyForSymbol. Same "backfill the card from
+  // whichever trend survives" principle as the TTM backfill just above,
+  // extended to also check quarterly then yearly when TTM itself has
+  // nothing -- likely affects the same shape for any other sparsely-
+  // covered ticker (a real cluster of small banks showed this exact
+  // "revenueGrowth only" signature in coverageAudit.json).
+  for (const key of Object.keys(yearlyBuilders)) {
+    if (values[key] != null) continue;
+    const fromQuarterly = mergedQuarterlyForSymbol[key];
+    const fromYearly = mergedYearlyForSymbol[key];
+    const fallback = fromQuarterly?.length ? fromQuarterly : fromYearly;
+    if (fallback?.length) {
+      values[key] = fallback[fallback.length - 1].value;
+      cardValuesReconstructed = true;
+    }
+  }
 
   // Regression guard: a fresh null for one of the 6 comparable metrics
   // doesn't overwrite a previously-published real value for the same field
