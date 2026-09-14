@@ -126,6 +126,119 @@ const SEC_SHARES_CONCEPTS = ['WeightedAverageNumberOfDilutedSharesOutstanding', 
 // the newer, correctly-scaled facts still get through untouched.
 const MIN_PLAUSIBLE_SHARES = 100000;
 
+// P/E enrichment for Section 12(i)-deregistered banks -- mirrors
+// generateSectorMetrics.js's own FDIC_BANK_CERTS mechanism exactly (same
+// hand-verified CERT numbers, same "multiple unrelated institutions can
+// share the same NAME" caution), but ported here separately since this
+// script never had ANY FDIC awareness. Verified live for PFBC (Preferred
+// Bank): both Finnhub's financials-reported (this script's usual source)
+// AND SEC's companyfacts API (the enrichment fallback just above) return
+// completely empty/404 -- PFBC has never filed structured financial data
+// with either, only FDIC Call Reports. P/E is the one metric this script
+// CAN still recover for these tickers despite that: it needs net income
+// (FDIC has it) and a share count (not in FDIC data at all -- Finnhub's
+// own /stock/profile2 is the fallback, see fetchFinnhubShareCount below).
+// P/FCF stays genuinely impossible (needs a cash-flow statement, which
+// Call Reports don't have) -- deliberately NOT attempted here, matching
+// the already-confirmed structural limit for every FDIC-fallback bank.
+const FDIC_BANK_CERTS = {
+  PFBC: 33539, // Preferred Bank, Los Angeles CA
+  OZK: 110, // Bank OZK, Little Rock AR
+  NBN: 19690, // Northeast Bank, Portland ME
+};
+const FDIC_FINANCIALS_URL = 'https://api.fdic.gov/banks/financials';
+const FDIC_FETCH_TIMEOUT_MS = 15000;
+const FDIC_QUARTERS_TO_FETCH = 24;
+
+async function fetchFdicJson(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FDIC_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { headers: { Accept: 'application/json' }, signal: controller.signal });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// NETINC is year-to-date cumulative within each calendar year (Schedule
+// RI's own convention, resetting every Q1) -- same de-cumulation
+// generateSectorMetrics.js's decumulateFdicQuarters already does, narrowed
+// to just the one field P/E needs.
+function decumulateFdicNetIncome(rows) {
+  const sorted = [...rows].sort((a, b) => a.REPDTE.localeCompare(b.REPDTE));
+  const byYear = new Map();
+  for (const row of sorted) {
+    if (row.NETINC == null) continue;
+    const year = row.REPDTE.slice(0, 4);
+    if (!byYear.has(year)) byYear.set(year, []);
+    byYear.get(year).push(row);
+  }
+  const quarters = [];
+  for (const yearRows of byYear.values()) {
+    let prevCumulative = 0;
+    for (const row of yearRows) {
+      quarters.push({ repdte: row.REPDTE, standalone: row.NETINC - prevCumulative, cumulativeToDate: row.NETINC });
+      prevCumulative = row.NETINC;
+    }
+  }
+  return quarters;
+}
+
+// A single, recent share count used across every synthesized period --
+// FDIC Call Reports don't carry share count at all (it's not a regulatory
+// capital/earnings figure), and there's no historical XBRL to derive one
+// from either (confirmed live: PFBC's SEC companyfacts is a 404, not just
+// sparse). Finnhub's own /stock/profile2 still has real current data for
+// these tickers even though /stock/financials-reported is empty (the
+// SAME asymmetry that already lets generateSectorMetrics.js's peRatio
+// SCALAR work for PFBC via /stock/metric while this script's own trend
+// stayed empty). Treating one real, current share count as roughly
+// constant across the reconstructed history is the same "fallbackShares"
+// approximation already established elsewhere in this app for exactly
+// this shape of gap -- a real bank's share count moves slowly quarter to
+// quarter without a split/major buyback, so this is a reasonable
+// approximation, not a fabrication of the underlying earnings data itself.
+async function fetchFinnhubShareCount(symbol, apiKey) {
+  const data = await fetchJson(`https://finnhub.io/api/v1/stock/profile2?symbol=${symbol}&token=${apiKey}`);
+  const shares = typeof data?.shareOutstanding === 'number' ? data.shareOutstanding * 1e6 : null;
+  return shares != null && shares >= MIN_PLAUSIBLE_SHARES ? shares : null;
+}
+
+function buildFdicSyntheticPeReports(netIncomeQuarters, shareCount, cert) {
+  const quarterlyReports = [];
+  const annualReports = [];
+  const byYear = new Map();
+  for (const q of netIncomeQuarters) {
+    const year = Number(q.repdte.slice(0, 4));
+    const month = Number(q.repdte.slice(4, 6));
+    const day = Number(q.repdte.slice(6, 8));
+    const endDate = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    const icItems = [
+      { concept: 'us-gaap_NetIncomeLoss', label: 'Net income (FDIC Call Report)', value: q.standalone },
+      { concept: 'us-gaap_WeightedAverageNumberOfSharesOutstandingBasic', label: 'Shares (Finnhub profile, held roughly constant)', value: shareCount },
+    ];
+    const quarter = Math.ceil(month / 3);
+    quarterlyReports.push({ cik: `FDIC-${cert}`, form: 'FDIC-CALL-REPORT', endDate, year, quarter, report: { ic: icItems, cf: [] } });
+    if (!byYear.has(year)) byYear.set(year, []);
+    byYear.get(year).push(q);
+  }
+  for (const [year, quarters] of byYear) {
+    if (quarters.length < 4) continue; // only a genuine full-year sum, never a partial-year estimate
+    const lastQuarter = quarters[quarters.length - 1];
+    const endDate = `${lastQuarter.repdte.slice(0, 4)}-${lastQuarter.repdte.slice(4, 6)}-${lastQuarter.repdte.slice(6, 8)}`;
+    const icItems = [
+      { concept: 'us-gaap_NetIncomeLoss', label: 'Net income (FDIC Call Report, FY)', value: lastQuarter.cumulativeToDate },
+      { concept: 'us-gaap_WeightedAverageNumberOfSharesOutstandingBasic', label: 'Shares (Finnhub profile, held roughly constant)', value: shareCount },
+    ];
+    annualReports.push({ cik: `FDIC-${cert}`, form: 'FDIC-CALL-REPORT', endDate, year, report: { ic: icItems, cf: [] } });
+  }
+  return { quarterlyReports, annualReports };
+}
+
 async function fetchSecJson(url) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), SEC_FETCH_TIMEOUT_MS);
@@ -1110,6 +1223,37 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
         const merged = mergeSyntheticPfcfReports(quarterlyReports, annualReports, synthesized);
         quarterlyReports = merged.quarterlyReports;
         annualReports = merged.annualReports;
+      }
+    }
+
+    // FDIC P/E enrichment -- see FDIC_BANK_CERTS' own comment for the full
+    // rationale. Unconditional for the small curated list (matching
+    // generateSectorMetrics.js's own FDIC_BANK_CERTS check) rather than
+    // gated on sparsity, since these tickers are ALREADY confirmed to have
+    // nothing from either Finnhub or SEC -- no point re-checking that
+    // every run. Additive only: real Finnhub/SEC quarters (if any exist
+    // for a given period) are never touched, this only fills in the
+    // (year, quarter)/(year) slots that are still completely empty.
+    if (FDIC_BANK_CERTS[symbol]) {
+      try {
+        const [fdicRows, shareCount] = await Promise.all([
+          fetchFdicJson(
+            `${FDIC_FINANCIALS_URL}?filters=CERT:${FDIC_BANK_CERTS[symbol]}&fields=REPDTE,NETINC&sort_by=REPDTE&sort_order=DESC&limit=${FDIC_QUARTERS_TO_FETCH}&format=json`
+          ).then((data) => (data?.data || []).map((row) => row.data).filter((r) => r?.REPDTE)),
+          fetchFinnhubShareCount(symbol, finnhubKey),
+        ]);
+        if (fdicRows.length && shareCount != null) {
+          const netIncomeQuarters = decumulateFdicNetIncome(fdicRows);
+          const synthesized = buildFdicSyntheticPeReports(netIncomeQuarters, shareCount, FDIC_BANK_CERTS[symbol]);
+          const merged = mergeSyntheticPfcfReports(quarterlyReports, annualReports, synthesized);
+          quarterlyReports = merged.quarterlyReports;
+          annualReports = merged.annualReports;
+        }
+      } catch (e) {
+        if (process.env.DEBUG_PFCF_SYMBOLS?.split(',').map((s) => s.trim().toUpperCase()).includes(symbol)) {
+          console.error(`DEBUG_PFCF ${symbol} FDIC enrichment threw:`, e.message);
+        }
+        // Non-fatal -- falls through to whatever Finnhub/SEC already found (nothing, for these tickers today).
       }
     }
 
