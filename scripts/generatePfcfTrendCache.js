@@ -226,6 +226,26 @@ async function fetchFinnhubShareCount(symbol, apiKey) {
   return shares != null && shares >= MIN_PLAUSIBLE_SHARES ? shares : null;
 }
 
+// startDate matters, not just endDate -- decumulateYtdByYear (used by the
+// quarterly P/E builder) infers whether a disclosed value is ALREADY
+// standalone vs. needs its own YTD decumulation from reportDurationDays,
+// which requires BOTH startDate and endDate (a report with no startDate
+// gets treated as "duration unknown," which this codebase's own comment
+// on decumulateYtdByYear documents as the CUMULATIVE default). My own
+// standalone net income (already decumulated from FDIC's cumulative
+// NETINC just above) was silently getting DECUMULATED A SECOND TIME as a
+// result -- verified live: PFBC/OZK's quarterly P/E swung between
+// plausible values (~2-9) and wild ones (600-2000, even negative) in
+// exactly the pattern this bug predicts (Q1/Q4 -- which decumulateYtdByYear
+// handles without needing a prior-quarter subtraction -- came out fine;
+// Q2/Q3 -- which DO get subtracted -- were corrupted). A real, correctly-
+// dated ~90-day startDate/endDate pair is enough for reportDurationDays to
+// classify these as standalone and skip re-decumulating them.
+function fdicQuarterStartDate(year, quarter) {
+  const startMonth = (quarter - 1) * 3 + 1;
+  return `${year}-${String(startMonth).padStart(2, '0')}-01`;
+}
+
 function buildFdicSyntheticPeReports(netIncomeQuarters, shareCount, cert) {
   const quarterlyReports = [];
   const annualReports = [];
@@ -235,12 +255,20 @@ function buildFdicSyntheticPeReports(netIncomeQuarters, shareCount, cert) {
     const month = Number(q.repdte.slice(4, 6));
     const day = Number(q.repdte.slice(6, 8));
     const endDate = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    const quarter = Math.ceil(month / 3);
     const icItems = [
       { concept: 'us-gaap_NetIncomeLoss', label: 'Net income (FDIC Call Report)', value: q.standalone },
       { concept: 'us-gaap_WeightedAverageNumberOfSharesOutstandingBasic', label: 'Shares (Finnhub profile, held roughly constant)', value: shareCount },
     ];
-    const quarter = Math.ceil(month / 3);
-    quarterlyReports.push({ cik: `FDIC-${cert}`, form: 'FDIC-CALL-REPORT', endDate, year, quarter, report: { ic: icItems, cf: [] } });
+    quarterlyReports.push({
+      cik: `FDIC-${cert}`,
+      form: 'FDIC-CALL-REPORT',
+      startDate: fdicQuarterStartDate(year, quarter),
+      endDate,
+      year,
+      quarter,
+      report: { ic: icItems, cf: [] },
+    });
     if (!byYear.has(year)) byYear.set(year, []);
     byYear.get(year).push(q);
   }
@@ -252,7 +280,7 @@ function buildFdicSyntheticPeReports(netIncomeQuarters, shareCount, cert) {
       { concept: 'us-gaap_NetIncomeLoss', label: 'Net income (FDIC Call Report, FY)', value: lastQuarter.cumulativeToDate },
       { concept: 'us-gaap_WeightedAverageNumberOfSharesOutstandingBasic', label: 'Shares (Finnhub profile, held roughly constant)', value: shareCount },
     ];
-    annualReports.push({ cik: `FDIC-${cert}`, form: 'FDIC-CALL-REPORT', endDate, year, report: { ic: icItems, cf: [] } });
+    annualReports.push({ cik: `FDIC-${cert}`, form: 'FDIC-CALL-REPORT', startDate: `${year}-01-01`, endDate, year, report: { ic: icItems, cf: [] } });
   }
   return { quarterlyReports, annualReports };
 }
