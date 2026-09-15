@@ -409,27 +409,35 @@ function buildSecSyntheticPfcfReports(gaapFacts, cik) {
   for (const { fy, fp } of fyFpKeys.values()) {
     const ocfFact = findSecValueForFyFp(gaapFacts, SEC_OCF_CONCEPTS, fy, fp, 'USD');
     let capexFact = findSecValueForFyFp(gaapFacts, SEC_CAPEX_CONCEPTS, fy, fp, 'USD');
-    if (process.env.DEBUG_SEC_SYNTH) {
-      console.error(`DEBUG_SEC_SYNTH fy=${fy} fp=${fp} ocfFact=${JSON.stringify(ocfFact)} capexFact=${JSON.stringify(capexFact)}`);
-    }
     if (!capexFact && findSecValueForFyFp(gaapFacts, SEC_INVESTING_SUBTOTAL_CONCEPTS, fy, fp, 'USD')) {
       capexFact = { concept: 'ImpliedZeroCapex', value: 0 };
     }
-    // Real concept names get the same `us-gaap_` prefix every
-    // findReported*Q finder's exact-match list uses (SEC's own companyfacts
-    // API returns them bare) -- ImpliedZeroCapex is a sentinel this script
-    // invented, not a real XBRL concept, so it stays unprefixed and is
-    // recognized by its literal name in findReportedCapexQ instead.
+    // findSecValueForFyFp already returns a `us-gaap_`-prefixed concept
+    // name (it builds `concept: \`us-gaap_${concept}\`` itself) -- use it
+    // as-is here, don't prefix it a second time. Verified live this was a
+    // REAL, previously-unnoticed regression: FPS's real, current FY2026
+    // ocf/capex/netIncome all resolved correctly inside findSecValueForFyFp
+    // (confirmed via debug trace) but came out double-prefixed here
+    // ("us-gaap_us-gaap_NetCashProvidedByUsedInOperatingActivities"),
+    // silently breaking every downstream exact-concept-name match in
+    // findReportedOperatingCashFlowQ/findReportedCapexQ/findReportedNetIncome
+    // -- only WeightedAverageNumberOfDilutedSharesOutstanding's own
+    // label-regex fallback (`/diluted.*shares/i`, which matches even
+    // without a space since the concept name has "Diluted" immediately
+    // followed by "Shares") accidentally survived, which is why shares
+    // alone looked fine while ocf/capex/netIncome silently came back
+    // null/0. ImpliedZeroCapex is a sentinel this script invented, not a
+    // real XBRL concept, so it's still recognized by its own literal name.
     const cfItems = [ocfFact, capexFact]
       .filter(Boolean)
-      .map((r) => ({ concept: r.concept === 'ImpliedZeroCapex' ? r.concept : `us-gaap_${r.concept}`, label: `${r.concept} (SEC XBRL enrichment)`, value: r.value }));
+      .map((r) => ({ concept: r.concept, label: `${r.concept} (SEC XBRL enrichment)`, value: r.value }));
 
     let sharesFact = findSecValueForFyFp(gaapFacts, SEC_SHARES_CONCEPTS, fy, fp, 'shares');
     if (sharesFact && sharesFact.value < MIN_PLAUSIBLE_SHARES) sharesFact = null; // see MIN_PLAUSIBLE_SHARES above
     const netIncomeFact = findSecValueForFyFp(gaapFacts, SEC_NET_INCOME_CONCEPTS, fy, fp, 'USD');
     const icItems = [sharesFact, netIncomeFact]
       .filter(Boolean)
-      .map((r) => ({ concept: `us-gaap_${r.concept}`, label: `${r.concept} (SEC XBRL enrichment)`, value: r.value }));
+      .map((r) => ({ concept: r.concept, label: `${r.concept} (SEC XBRL enrichment)`, value: r.value }));
 
     if (!cfItems.length && !icItems.length) continue;
 
@@ -1270,10 +1278,6 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
       if (cik) {
         const gaapFacts = await fetchSecUsGaapFacts(cik);
         const synthesized = buildSecSyntheticPfcfReports(gaapFacts, quarterlyReports[0]?.cik ?? annualReports[0]?.cik ?? cik);
-        if (process.env.DEBUG_SEC_SYNTH) {
-          console.error(`DEBUG_SEC_SYNTH pre-merge Finnhub annualReports:`, JSON.stringify(annualReports.map((r) => ({ year: r.year, cik: r.cik, form: r.form, cfConcepts: (r.report?.cf || []).map((i) => i.concept), icConcepts: (r.report?.ic || []).map((i) => i.concept) }))));
-          console.error(`DEBUG_SEC_SYNTH synthesized.annualReports:`, JSON.stringify(synthesized.annualReports.map((r) => ({ year: r.year, cik: r.cik }))));
-        }
         const merged = mergeSyntheticPfcfReports(quarterlyReports, annualReports, synthesized);
         quarterlyReports = merged.quarterlyReports;
         annualReports = merged.annualReports;
