@@ -836,6 +836,31 @@ function quarterEndDate(year, quarter) {
   return new Date(year, month - 1, lastDay);
 }
 
+// Real disclosed period-end date per "year-quarter" key, straight from
+// whichever real report (Finnhub or this file's own SEC-XBRL synthesis)
+// actually covers it -- both carry a real endDate. Used to price-match a
+// standalone/TTM quarter against its OWN real fiscal quarter-end instead of
+// quarterEndDate's calendar-quarter guess, which is wrong for any filer
+// whose fiscal quarters don't land on calendar quarter boundaries (verified
+// live: FPS, fiscal year ending June 30 -- its real fiscal "Q3" (Jan-Mar)
+// was being matched against a guessed calendar Q3 end, September 30,
+// silently producing wrong/missing prices for every derived point). The
+// year-end quarter (fiscal Q4) has no standalone real report of its own for
+// a filer whose annual total is the only source for that period -- the
+// annual report's own endDate IS that quarter's real end date, same
+// `${year}-4` convention buildSharesFallbackByYear/sharesByQuarter already
+// use elsewhere in this file for exactly this case.
+function buildEndDateByQuarterKey(quarterlyReports, annualReports) {
+  const map = {};
+  for (const q of quarterlyReports || []) {
+    if (q?.quarter && q?.endDate) map[`${q.year}-${q.quarter}`] = q.endDate;
+  }
+  for (const a of annualReports || []) {
+    if (a?.endDate) map[`${a.year}-4`] = map[`${a.year}-4`] ?? a.endDate;
+  }
+  return map;
+}
+
 const MAX_PRICE_MATCH_MS = 45 * 24 * 60 * 60 * 1000;
 
 function findClosestMonthlyPrice(monthlyPrices, targetDate) {
@@ -887,11 +912,13 @@ function buildPfcfTrendFromFilingsAndPrices(quarterlyReports, annualReports, mon
     })
     .sort((a, b) => a.year - b.year || a.quarter - b.quarter);
 
+  const endDateByKey = buildEndDateByQuarterKey(quarterlyReports, annualReports);
   const points = buildTrailingWindows(standaloneQuarters, 4).map(({ quarters, anchor, partial }) => {
     const ttmFcf = quarters.reduce((sum, q) => sum + q.fcf, 0);
     const { year, quarter, shares } = anchor;
     const ttmFcfPerShare = ttmFcf / shares;
-    const price = findClosestMonthlyPrice(monthlyPrices, quarterEndDate(year, quarter));
+    const endDate = endDateByKey[`${year}-${quarter}`];
+    const price = findClosestMonthlyPrice(monthlyPrices, endDate ? new Date(endDate) : quarterEndDate(year, quarter));
     const value = price != null && ttmFcfPerShare !== 0 ? price / ttmFcfPerShare : null;
     return { label: `Q${quarter} '${String(year).slice(-2)}`, value, partial, quartersUsed: quarters.length };
   });
@@ -926,12 +953,14 @@ function buildPfcfQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports,
     if (shares != null) sharesByQuarter[`${q.year}-${q.quarter}`] = shares;
   }
 
+  const endDateByKey = buildEndDateByQuarterKey(quarterlyReports, annualReports);
   const points = [];
   for (const key of Object.keys(ocf)) {
     if ((capex[key] == null && !isBank) || !(sharesByQuarter[key] > 0)) continue;
     const [year, quarter] = key.split('-').map(Number);
     const annualizedFcfPerShare = ((ocf[key] - (capex[key] ?? 0)) / sharesByQuarter[key]) * 4;
-    const price = findClosestMonthlyPrice(monthlyPrices, quarterEndDate(year, quarter));
+    const endDate = endDateByKey[key];
+    const price = findClosestMonthlyPrice(monthlyPrices, endDate ? new Date(endDate) : quarterEndDate(year, quarter));
     const value = price != null && annualizedFcfPerShare !== 0 ? price / annualizedFcfPerShare : null;
     if (value != null) points.push({ year, quarter, label: `Q${quarter} '${String(year).slice(-2)}`, value });
   }
@@ -980,7 +1009,19 @@ function buildPfcfYearlyFromFilingsAndPrices(annualReports, monthlyPrices, isBan
     const shares = findReportedDilutedShares(a.report?.ic || []) || sharesFallbackByYear[a.year];
     if (ocf == null || (capex == null && !isBank) || !(shares > 0)) continue;
     const fcfPerShare = (ocf - (capex ?? 0)) / shares;
-    const price = findClosestMonthlyPrice(monthlyPrices, quarterEndDate(a.year, 4));
+    // Prefer the report's own REAL disclosed fiscal year-end date over a
+    // guessed calendar Dec-31 -- both real Finnhub entries and this file's
+    // own SEC-XBRL synthetic ones carry endDate. Verified live: FPS (fiscal
+    // year ending June 30) had its real, current FY2026 annual data
+    // (endDate 2026-06-30) matched against a guessed Dec 31, 2026 -- a date
+    // still in the future as of this run, over 45 days outside
+    // findClosestMonthlyPrice's own match tolerance, so no price (and
+    // therefore no yearly P/FCF point) was ever produced despite real,
+    // correct OCF/capex/shares all being available. A strict superset for
+    // calendar-FYE filers, whose endDate already lands on/near Dec 31 --
+    // falls back to the old guess only when endDate is genuinely absent.
+    const periodEndDate = a.endDate ? new Date(a.endDate) : quarterEndDate(a.year, 4);
+    const price = findClosestMonthlyPrice(monthlyPrices, periodEndDate);
     const value = price != null && fcfPerShare !== 0 ? price / fcfPerShare : null;
     if (value != null) points.push({ year: a.year, label: yearlyLabel(a.year), value });
   }
@@ -1035,11 +1076,13 @@ function buildPeTrendFromFilingsAndPrices(quarterlyReports, annualReports, month
     })
     .sort((a, b) => a.year - b.year || a.quarter - b.quarter);
 
+  const endDateByKey = buildEndDateByQuarterKey(quarterlyReports, annualReports);
   const points = buildTrailingWindows(standaloneQuarters, 4).map(({ quarters, anchor, partial }) => {
     const ttmNetIncome = quarters.reduce((sum, q) => sum + q.netIncome, 0);
     const { year, quarter, shares } = anchor;
     const ttmEps = ttmNetIncome / shares;
-    const price = findClosestMonthlyPrice(monthlyPrices, quarterEndDate(year, quarter));
+    const endDate = endDateByKey[`${year}-${quarter}`];
+    const price = findClosestMonthlyPrice(monthlyPrices, endDate ? new Date(endDate) : quarterEndDate(year, quarter));
     const value = price != null && ttmEps !== 0 ? price / ttmEps : null;
     return { label: `Q${quarter} '${String(year).slice(-2)}`, value, partial, quartersUsed: quarters.length };
   });
@@ -1066,12 +1109,14 @@ function buildPeQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, m
     if (shares != null) sharesByQuarter[`${q.year}-${q.quarter}`] = shares;
   }
 
+  const endDateByKey = buildEndDateByQuarterKey(quarterlyReports, annualReports);
   const points = [];
   for (const key of Object.keys(netIncome)) {
     if (!(sharesByQuarter[key] > 0)) continue;
     const [year, quarter] = key.split('-').map(Number);
     const annualizedEps = (netIncome[key] / sharesByQuarter[key]) * 4;
-    const price = findClosestMonthlyPrice(monthlyPrices, quarterEndDate(year, quarter));
+    const endDate = endDateByKey[key];
+    const price = findClosestMonthlyPrice(monthlyPrices, endDate ? new Date(endDate) : quarterEndDate(year, quarter));
     const value = price != null && annualizedEps !== 0 ? price / annualizedEps : null;
     if (value != null) points.push({ year, quarter, label: `Q${quarter} '${String(year).slice(-2)}`, value });
   }
@@ -1095,7 +1140,10 @@ function buildPeYearlyFromFilingsAndPrices(annualReports, monthlyPrices, quarter
     const shares = findReportedDilutedShares(a.report?.ic || []) || sharesFallbackByYear[a.year];
     if (netIncome == null || !(shares > 0)) continue;
     const eps = netIncome / shares;
-    const price = findClosestMonthlyPrice(monthlyPrices, quarterEndDate(a.year, 4));
+    // See buildPfcfYearlyFromFilingsAndPrices' identical fix for the full
+    // rationale (non-calendar fiscal year-end, verified live for FPS).
+    const periodEndDate = a.endDate ? new Date(a.endDate) : quarterEndDate(a.year, 4);
+    const price = findClosestMonthlyPrice(monthlyPrices, periodEndDate);
     const value = price != null && eps !== 0 ? price / eps : null;
     if (value != null) points.push({ year: a.year, label: yearlyLabel(a.year), value });
   }
