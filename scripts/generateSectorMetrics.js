@@ -3457,6 +3457,9 @@ async function processSymbol(symbol, apiKey, ctx) {
   // mismatch inferred indirectly.
   const TIER1_ALSO_CORRUPTED_SYMBOLS = new Set(['CAAP', 'CCXI']);
   const finnhubDataUntrusted = finnhubReportedFinancialsUntrusted && TIER1_ALSO_CORRUPTED_SYMBOLS.has(symbol);
+  if (process.env.DEBUG_TIER1_SYMBOL === symbol) {
+    console.error(`DEBUG_TIER1 ${symbol} finnhubReportedFinancialsUntrusted=${finnhubReportedFinancialsUntrusted} annualReportedFinancials.length=${annualReportedFinancials?.length} finnhubDataUntrusted=${finnhubDataUntrusted}`);
+  }
 
   const impliedPrice = impliedPriceFromProfile(profile);
   const values = finnhubDataUntrusted
