@@ -246,7 +246,7 @@ function fdicQuarterStartDate(year, quarter) {
   return `${year}-${String(startMonth).padStart(2, '0')}-01`;
 }
 
-function buildFdicSyntheticPeReports(netIncomeQuarters, shareCount, cert) {
+function buildFdicSyntheticPeReports(netIncomeQuarters, shareCount, cik) {
   const quarterlyReports = [];
   const annualReports = [];
   const byYear = new Map();
@@ -261,7 +261,7 @@ function buildFdicSyntheticPeReports(netIncomeQuarters, shareCount, cert) {
       { concept: 'us-gaap_WeightedAverageNumberOfSharesOutstandingBasic', label: 'Shares (Finnhub profile, held roughly constant)', value: shareCount },
     ];
     quarterlyReports.push({
-      cik: `FDIC-${cert}`,
+      cik,
       form: 'FDIC-CALL-REPORT',
       startDate: fdicQuarterStartDate(year, quarter),
       endDate,
@@ -280,7 +280,7 @@ function buildFdicSyntheticPeReports(netIncomeQuarters, shareCount, cert) {
       { concept: 'us-gaap_NetIncomeLoss', label: 'Net income (FDIC Call Report, FY)', value: lastQuarter.cumulativeToDate },
       { concept: 'us-gaap_WeightedAverageNumberOfSharesOutstandingBasic', label: 'Shares (Finnhub profile, held roughly constant)', value: shareCount },
     ];
-    annualReports.push({ cik: `FDIC-${cert}`, form: 'FDIC-CALL-REPORT', startDate: `${year}-01-01`, endDate, year, report: { ic: icItems, cf: [] } });
+    annualReports.push({ cik, form: 'FDIC-CALL-REPORT', startDate: `${year}-01-01`, endDate, year, report: { ic: icItems, cf: [] } });
   }
   return { quarterlyReports, annualReports };
 }
@@ -1289,8 +1289,30 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
           fetchFinnhubShareCount(symbol, finnhubKey),
         ]);
         if (fdicRows.length && shareCount != null) {
+          // Every builder below filters its input reports down to a
+          // single CIK (guards against mixing a renamed ticker's old and
+          // new company identities -- see buildPeQuarterlyFromFilingsAndPrices's
+          // own sameCik check) by taking whichever CIK the FIRST report
+          // in the array happens to have. A distinct marker CIK here (the
+          // original version of this used "FDIC-<cert>") silently got
+          // filtered OUT the moment ANY other real report already existed
+          // for this ticker under a different (numeric) CIK -- verified
+          // live: NBN has one genuine old Finnhub 10-K from 2012, and
+          // that alone was enough to make every FDIC-synthesized quarter
+          // vanish from the published P/E trend even though the
+          // synthesis itself worked correctly (PFBC/OZK, with zero real
+          // reports of any kind, were unaffected by this and worked on
+          // the first attempt). Reusing whichever CIK is ALREADY in use
+          // (falling back to the real SEC CIK only when nothing exists
+          // yet) keeps these synthetic reports in the same "family" as
+          // any real ones, matching the established pattern
+          // buildSecSyntheticPfcfReports already uses for its own
+          // synthetic entries just above.
+          const existingCik = quarterlyReports?.[0]?.cik ?? annualReports?.[0]?.cik;
+          const realCik = secTickerToCikMap.get(symbol.toUpperCase());
+          const syntheticCik = existingCik ?? realCik ?? `FDIC-${FDIC_BANK_CERTS[symbol]}`;
           const netIncomeQuarters = decumulateFdicNetIncome(fdicRows);
-          const synthesized = buildFdicSyntheticPeReports(netIncomeQuarters, shareCount, FDIC_BANK_CERTS[symbol]);
+          const synthesized = buildFdicSyntheticPeReports(netIncomeQuarters, shareCount, syntheticCik);
           const merged = mergeSyntheticPfcfReports(quarterlyReports, annualReports, synthesized);
           quarterlyReports = merged.quarterlyReports;
           annualReports = merged.annualReports;
