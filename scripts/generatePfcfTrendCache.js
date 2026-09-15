@@ -409,6 +409,9 @@ function buildSecSyntheticPfcfReports(gaapFacts, cik) {
   for (const { fy, fp } of fyFpKeys.values()) {
     const ocfFact = findSecValueForFyFp(gaapFacts, SEC_OCF_CONCEPTS, fy, fp, 'USD');
     let capexFact = findSecValueForFyFp(gaapFacts, SEC_CAPEX_CONCEPTS, fy, fp, 'USD');
+    if (process.env.DEBUG_SEC_SYNTH) {
+      console.error(`DEBUG_SEC_SYNTH fy=${fy} fp=${fp} ocfFact=${JSON.stringify(ocfFact)} capexFact=${JSON.stringify(capexFact)}`);
+    }
     if (!capexFact && findSecValueForFyFp(gaapFacts, SEC_INVESTING_SUBTOTAL_CONCEPTS, fy, fp, 'USD')) {
       capexFact = { concept: 'ImpliedZeroCapex', value: 0 };
     }
