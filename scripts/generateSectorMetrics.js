@@ -142,7 +142,19 @@ const OUTPUT_DCF_CAP_CANDIDATES_FILE = path.join(__dirname, '../dcfCapCandidates
 const REQUEST_SPACING_MS = 1350;
 
 const ALLOWED_MICS = new Set(['XNAS', 'XNYS', 'XASE']); // NASDAQ, NYSE, NYSE American
-const ALLOWED_TYPES = new Set(['Common Stock', 'REIT']);
+// ADR added 2026-09-15 -- verified live via Finnhub's own /stock/symbol
+// response that BABA, JD, PDD, NIO, and IQ (some of the most heavily-
+// traded US-listed stocks) were ALL silently excluded from the entire
+// tracked universe, every one tagged `type: "ADR"` by Finnhub (not
+// "Common Stock", even though CAAS -- also a Chinese company trading on
+// the same exchanges -- happens to be tagged "Common Stock" and was
+// already tracked). An ADR is economically a common stock for every
+// metric this pipeline computes (P/E, ROIC, margins all apply the same
+// way) -- there's no reason to exclude it, this looks like an
+// unintentional omission from the original list rather than a deliberate
+// choice, not a special "ADR" concept this pipeline needs to treat
+// differently downstream.
+const ALLOWED_TYPES = new Set(['Common Stock', 'REIT', 'ADR']);
 
 // This script runs server-side (locally or in the pipeline repo's GitHub
 // Actions workflow), never bundled into the app, so it reads keys straight
@@ -175,15 +187,6 @@ async function fetchUniverse(apiKey) {
   const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/symbol?exchange=US&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status} fetching symbol universe`);
   const all = await res.json();
-  // TEMP DIAGNOSTIC (2026-09-15) -- confirming why BABA/JD/PDD/NIO/IQ are
-  // absent from the tracked universe before touching ALLOWED_TYPES, a
-  // shared filter for all ~5000+ tickers. Remove once confirmed.
-  if (process.env.DEBUG_UNIVERSE_SYMBOLS) {
-    const targets = new Set(process.env.DEBUG_UNIVERSE_SYMBOLS.split(',').map((s) => s.trim().toUpperCase()));
-    for (const s of all) {
-      if (targets.has(s.symbol)) console.log(`DEBUG universe raw entry: ${JSON.stringify(s)}`);
-    }
-  }
   return all
     .filter((s) => ALLOWED_MICS.has(s.mic) && ALLOWED_TYPES.has(s.type))
     .map((s) => ({ symbol: s.symbol, name: s.description || null, type: s.type || null }))
