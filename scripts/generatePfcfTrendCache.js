@@ -1270,6 +1270,10 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
       if (cik) {
         const gaapFacts = await fetchSecUsGaapFacts(cik);
         const synthesized = buildSecSyntheticPfcfReports(gaapFacts, quarterlyReports[0]?.cik ?? annualReports[0]?.cik ?? cik);
+        if (process.env.DEBUG_SEC_SYNTH) {
+          console.error(`DEBUG_SEC_SYNTH pre-merge Finnhub annualReports:`, JSON.stringify(annualReports.map((r) => ({ year: r.year, cik: r.cik, form: r.form, cfConcepts: (r.report?.cf || []).map((i) => i.concept), icConcepts: (r.report?.ic || []).map((i) => i.concept) }))));
+          console.error(`DEBUG_SEC_SYNTH synthesized.annualReports:`, JSON.stringify(synthesized.annualReports.map((r) => ({ year: r.year, cik: r.cik }))));
+        }
         const merged = mergeSyntheticPfcfReports(quarterlyReports, annualReports, synthesized);
         quarterlyReports = merged.quarterlyReports;
         annualReports = merged.annualReports;
