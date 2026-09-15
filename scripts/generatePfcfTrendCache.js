@@ -952,6 +952,20 @@ function buildPfcfQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports,
     const shares = findReportedDilutedShares(q.report?.ic || []);
     if (shares != null) sharesByQuarter[`${q.year}-${q.quarter}`] = shares;
   }
+  // The final fiscal quarter of a year (key "year-4") often has no
+  // standalone quarterly report of its own -- it's derived by
+  // decumulateYtdByYear from the annual total minus the known quarters, so
+  // its share count can only come from the annual report's own shares fact.
+  // Missing this (unlike buildPfcfTrendFromFilingsAndPrices/the TTM
+  // sibling, which already had it) meant a derived Q4 with real, correct
+  // ocf/capex was silently dropped here for lack of a share count --
+  // verified live: FPS's TTM tab gained a real Q4 '26 point from this same
+  // fallback, while quarterly stayed stuck on the OLD single point until
+  // this was added here too.
+  for (const a of annualReports || []) {
+    const shares = findReportedDilutedShares(a?.report?.ic || []);
+    if (shares != null) sharesByQuarter[`${a.year}-4`] = sharesByQuarter[`${a.year}-4`] ?? shares;
+  }
 
   const endDateByKey = buildEndDateByQuarterKey(quarterlyReports, annualReports);
   const points = [];
@@ -1107,6 +1121,13 @@ function buildPeQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, m
     if (!q?.quarter) continue;
     const shares = findReportedDilutedShares(q.report?.ic || []);
     if (shares != null) sharesByQuarter[`${q.year}-${q.quarter}`] = shares;
+  }
+  // See buildPfcfQuarterlyFromFilingsAndPrices' identical fix for the full
+  // rationale -- a derived Q4 (no standalone report of its own) needs its
+  // share count backfilled from the annual report.
+  for (const a of annualReports || []) {
+    const shares = findReportedDilutedShares(a?.report?.ic || []);
+    if (shares != null) sharesByQuarter[`${a.year}-4`] = sharesByQuarter[`${a.year}-4`] ?? shares;
   }
 
   const endDateByKey = buildEndDateByQuarterKey(quarterlyReports, annualReports);
