@@ -114,6 +114,10 @@ on:
         description: 'Optional: set to 1 for verbose SEC-enrichment tracing (DEBUG_SEC_ENRICHMENT)'
         required: false
         type: string
+      debugUniverseSymbols:
+        description: 'TEMP: comma-separated symbols to log the raw pre-filter Finnhub universe entry for (DEBUG_UNIVERSE_SYMBOLS)'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -137,6 +141,7 @@ jobs:
           TARGET_SYMBOL: ${{ inputs.symbol }}
           DEBUG_SEC_ENRICHMENT: ${{ inputs.debug }}
           DEBUG_REVENUE_ITEMS: ${{ inputs.debug }}
+          DEBUG_UNIVERSE_SYMBOLS: ${{ inputs.debugUniverseSymbols }}
         run: node scripts/generateSectorMetrics.js
 
       # DCF cap + fallback (real analyst price targets via yfinance,

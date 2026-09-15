@@ -175,6 +175,15 @@ async function fetchUniverse(apiKey) {
   const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/symbol?exchange=US&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status} fetching symbol universe`);
   const all = await res.json();
+  // TEMP DIAGNOSTIC (2026-09-15) -- confirming why BABA/JD/PDD/NIO/IQ are
+  // absent from the tracked universe before touching ALLOWED_TYPES, a
+  // shared filter for all ~5000+ tickers. Remove once confirmed.
+  if (process.env.DEBUG_UNIVERSE_SYMBOLS) {
+    const targets = new Set(process.env.DEBUG_UNIVERSE_SYMBOLS.split(',').map((s) => s.trim().toUpperCase()));
+    for (const s of all) {
+      if (targets.has(s.symbol)) console.log(`DEBUG universe raw entry: ${JSON.stringify(s)}`);
+    }
+  }
   return all
     .filter((s) => ALLOWED_MICS.has(s.mic) && ALLOWED_TYPES.has(s.type))
     .map((s) => ({ symbol: s.symbol, name: s.description || null, type: s.type || null }))
@@ -3431,7 +3440,19 @@ async function processSymbol(symbol, apiKey, ctx) {
   // impossible values regardless of company. Add a ticker here ONLY after
   // fetching its own /stock/metric response directly and confirming
   // implausible values, same bar as CAAP.
-  const TIER1_ALSO_CORRUPTED_SYMBOLS = new Set(['CAAP']);
+  // CCXI: same ticker-recycling shape as CAAP, just via a delisting instead
+  // of a live CIK mismatch -- CCXI belonged to ChemoCentryx, Inc. (real
+  // biotech, acquired by Amgen, delisted ~Oct 2022) before being reused by
+  // the unrelated SPAC Churchill Capital Corp XI (real current CIK
+  // 2074973, confirmed via SEC submissions). Verified live via
+  // trendsNative.json (sourced directly from Finnhub's own /stock/metric):
+  // revenueGrowth/profitMargin stop dead at Q2 '22 and fcfMargin/pfcfRatio
+  // at Q1 '22 -- exactly ChemoCentryx's last live quarter -- while roic has
+  // an anomalous, unrelated Q2 '26 point mixed into the same series,
+  // proof the native ratio engine is blending two unrelated companies'
+  // data under one recycled ticker, not just a financials-reported CIK
+  // mismatch inferred indirectly.
+  const TIER1_ALSO_CORRUPTED_SYMBOLS = new Set(['CAAP', 'CCXI']);
   const finnhubDataUntrusted = finnhubReportedFinancialsUntrusted && TIER1_ALSO_CORRUPTED_SYMBOLS.has(symbol);
 
   const impliedPrice = impliedPriceFromProfile(profile);
