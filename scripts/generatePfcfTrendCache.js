@@ -67,6 +67,7 @@ const RENAMED_TICKER_FINANCIALS_ALIASES = {
   BNY: 'BK',
   AD: 'USM',
   IA: 'ISSC',
+  DFTX: 'MNMD',
 };
 
 // ---------------------------------------------------------------------------

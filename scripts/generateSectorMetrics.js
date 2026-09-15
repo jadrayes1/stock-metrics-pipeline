@@ -350,6 +350,12 @@ const RENAMED_TICKER_FINANCIALS_ALIASES = {
   BNY: 'BK',
   AD: 'USM',
   IA: 'ISSC',
+  // Definium Therapeutics, formerly Mind Medicine (MindMed) Inc. — SEC
+  // formerNames confirms the rename (2026-01-12), same CIK 1813814
+  // throughout, real 10-Q through Q2'26 on record — same pattern as
+  // BNY/AD/IA, verified live: "DFTX" showed historyQuarters: 0 in
+  // published output despite the real, current SEC filing history.
+  DFTX: 'MNMD',
 };
 
 // financials-reported also needs the dual-class redirect (DUAL_CLASS_ALIASES
