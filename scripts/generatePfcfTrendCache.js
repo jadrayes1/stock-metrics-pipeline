@@ -1359,8 +1359,6 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
     if (process.env.DEBUG_INSPECT_ONLY === symbol) {
       console.error(`DEBUG_INSPECT CIK-filtered quarterlyReports (${quarterlyReports.length}):`, JSON.stringify(quarterlyReports.map((r) => ({ year: r.year, quarter: r.quarter, cik: r.cik, form: r.form, endDate: r.endDate }))));
       console.error(`DEBUG_INSPECT CIK-filtered annualReports (${annualReports.length}):`, JSON.stringify(annualReports.map((r) => ({ year: r.year, cik: r.cik, form: r.form, endDate: r.endDate }))));
-      console.error('DEBUG_INSPECT_ONLY set -- exiting before SEC enrichment/publish, no risk of publishing anything for this ticker.');
-      return { entry: existingCacheEntry || { fetchedAt: new Date().toISOString(), ttm: [], quarterly: [], yearly: [] }, usedTwelveDataCall: false };
     }
 
     // SEC-XBRL enrichment for sparse/stale Finnhub coverage — see this
