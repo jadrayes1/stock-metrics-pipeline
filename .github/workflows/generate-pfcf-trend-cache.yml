@@ -43,10 +43,6 @@ on:
         description: 'Optional: process only this one ticker (debugging), ignoring the normal gap list/rotation'
         required: false
         type: string
-      debugInspectOnly:
-        description: 'TEMP: exits before SEC enrichment/publish for this exact symbol, just logs raw Finnhub reports (DEBUG_INSPECT_ONLY)'
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -70,7 +66,6 @@ jobs:
           TWELVEDATA_PIPELINE_API_KEY_2: ${{ secrets.TWELVEDATA_PIPELINE_API_KEY_2 }}
           TARGET_SYMBOL: ${{ inputs.symbol }}
           DEBUG_PFCF_SYMBOLS: ${{ inputs.symbol }}
-          DEBUG_INSPECT_ONLY: ${{ inputs.debugInspectOnly }}
         run: node scripts/generatePfcfTrendCache.js
 
       - name: Publish to gist

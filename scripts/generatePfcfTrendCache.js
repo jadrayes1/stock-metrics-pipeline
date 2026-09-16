@@ -1356,11 +1356,6 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
       annualReports = annualReports.filter(sameRealCik);
     }
 
-    if (process.env.DEBUG_INSPECT_ONLY === symbol) {
-      console.error(`DEBUG_INSPECT CIK-filtered quarterlyReports (${quarterlyReports.length}):`, JSON.stringify(quarterlyReports.map((r) => ({ year: r.year, quarter: r.quarter, cik: r.cik, form: r.form, endDate: r.endDate }))));
-      console.error(`DEBUG_INSPECT CIK-filtered annualReports (${annualReports.length}):`, JSON.stringify(annualReports.map((r) => ({ year: r.year, cik: r.cik, form: r.form, endDate: r.endDate }))));
-    }
-
     // SEC-XBRL enrichment for sparse/stale Finnhub coverage — see this
     // file's own comment block above buildSecSyntheticPfcfReports for the
     // full rationale (SENEA verified live: Finnhub's own quarterly/annual
