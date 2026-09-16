@@ -1330,6 +1330,13 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
     annualReports = fixMislabeledAnnualYears(annualReports);
     quarterlyReports = fixMislabeledQuarterlyYears(quarterlyReports, annualReports);
 
+    if (process.env.DEBUG_INSPECT_ONLY === symbol) {
+      console.error(`DEBUG_INSPECT raw quarterlyReports (${quarterlyReports.length}):`, JSON.stringify(quarterlyReports.map((r) => ({ year: r.year, quarter: r.quarter, cik: r.cik, form: r.form, endDate: r.endDate }))));
+      console.error(`DEBUG_INSPECT raw annualReports (${annualReports.length}):`, JSON.stringify(annualReports.map((r) => ({ year: r.year, cik: r.cik, form: r.form, endDate: r.endDate }))));
+      console.error('DEBUG_INSPECT_ONLY set -- exiting before SEC enrichment/publish, no risk of publishing anything for this ticker.');
+      return { entry: existingCacheEntry || { fetchedAt: new Date().toISOString(), ttm: [], quarterly: [], yearly: [] }, usedTwelveDataCall: false };
+    }
+
     // SEC-XBRL enrichment for sparse/stale Finnhub coverage — see this
     // file's own comment block above buildSecSyntheticPfcfReports for the
     // full rationale (SENEA verified live: Finnhub's own quarterly/annual
