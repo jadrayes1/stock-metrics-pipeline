@@ -3557,14 +3557,9 @@ async function processSymbol(symbol, apiKey, ctx) {
     const realCik = ctx.secTickerToCikMap?.get((RENAMED_TICKER_FINANCIALS_ALIASES[symbol] || symbol).toUpperCase());
     if (realCik) {
       const realCikDigits = canonicalCikDigits(realCik);
-      const beforeQ = quarterlyFinancials.length;
-      const beforeA = annualReportedFinancials.length;
       const sameRealCik = (r) => r.cik == null || canonicalCikDigits(r.cik) === realCikDigits;
       quarterlyFinancials = quarterlyFinancials.filter(sameRealCik);
       annualReportedFinancials = annualReportedFinancials.filter(sameRealCik);
-      if (process.env.DEBUG_CIK_FILTER === symbol) {
-        console.error(`DEBUG_CIK_FILTER ${symbol} realCik=${realCikDigits} quarterly ${beforeQ}->${quarterlyFinancials.length} annual ${beforeA}->${annualReportedFinancials.length}`);
-      }
     }
   }
 
