@@ -1330,9 +1330,35 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
     annualReports = fixMislabeledAnnualYears(annualReports);
     quarterlyReports = fixMislabeledQuarterlyYears(quarterlyReports, annualReports);
 
+    // Ticker-recycling guard: Finnhub's financials-reported occasionally
+    // returns a blend of reports from a completely different, unrelated
+    // company that previously traded under this same symbol. Verified
+    // live: CCXI (Churchill Capital Corp XI, a real 2025-formed SPAC,
+    // real CIK 2074973, exactly one real 10-Q filed so far) also
+    // returned 32 quarterly + 10 annual reports tagged CIK 1340652 --
+    // ChemoCentryx's real historical CIK, spanning 2012-2022, from years
+    // before ChemoCentryx was acquired by Amgen and this ticker symbol
+    // was later reused. Filtering to the REAL, current SEC CIK
+    // (secTickerToCikMap -- the same authoritative source every other
+    // CIK check in this file already trusts) is what makes this
+    // actually matter: without it, CCXI's blended 33/11 raw counts look
+    // comfortably non-sparse below, so SEC-XBRL enrichment never even
+    // triggers, even though only 1 of those 33 quarterly reports is real
+    // for the company this ticker represents today. A no-op for the
+    // vast majority of tickers, whose Finnhub reports already carry the
+    // same CIK as secTickerToCikMap; a report with no cik field at all
+    // fails open (kept) rather than guessed at.
+    const realCik = secTickerToCikMap.get((RENAMED_TICKER_FINANCIALS_ALIASES[symbol] || symbol).toUpperCase());
+    if (realCik) {
+      const realCikDigits = String(Number(realCik));
+      const sameRealCik = (r) => r.cik == null || String(Number(r.cik)) === realCikDigits;
+      quarterlyReports = quarterlyReports.filter(sameRealCik);
+      annualReports = annualReports.filter(sameRealCik);
+    }
+
     if (process.env.DEBUG_INSPECT_ONLY === symbol) {
-      console.error(`DEBUG_INSPECT raw quarterlyReports (${quarterlyReports.length}):`, JSON.stringify(quarterlyReports.map((r) => ({ year: r.year, quarter: r.quarter, cik: r.cik, form: r.form, endDate: r.endDate }))));
-      console.error(`DEBUG_INSPECT raw annualReports (${annualReports.length}):`, JSON.stringify(annualReports.map((r) => ({ year: r.year, cik: r.cik, form: r.form, endDate: r.endDate }))));
+      console.error(`DEBUG_INSPECT CIK-filtered quarterlyReports (${quarterlyReports.length}):`, JSON.stringify(quarterlyReports.map((r) => ({ year: r.year, quarter: r.quarter, cik: r.cik, form: r.form, endDate: r.endDate }))));
+      console.error(`DEBUG_INSPECT CIK-filtered annualReports (${annualReports.length}):`, JSON.stringify(annualReports.map((r) => ({ year: r.year, cik: r.cik, form: r.form, endDate: r.endDate }))));
       console.error('DEBUG_INSPECT_ONLY set -- exiting before SEC enrichment/publish, no risk of publishing anything for this ticker.');
       return { entry: existingCacheEntry || { fetchedAt: new Date().toISOString(), ttm: [], quarterly: [], yearly: [] }, usedTwelveDataCall: false };
     }
