@@ -114,6 +114,10 @@ on:
         description: 'Optional: set to 1 for verbose SEC-enrichment tracing (DEBUG_SEC_ENRICHMENT)'
         required: false
         type: string
+      debugCikFilter:
+        description: 'TEMP: logs before/after report counts from the CIK-contamination filter for this exact symbol (DEBUG_CIK_FILTER)'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -137,6 +141,7 @@ jobs:
           TARGET_SYMBOL: ${{ inputs.symbol }}
           DEBUG_SEC_ENRICHMENT: ${{ inputs.debug }}
           DEBUG_REVENUE_ITEMS: ${{ inputs.debug }}
+          DEBUG_CIK_FILTER: ${{ inputs.debugCikFilter }}
         run: node scripts/generateSectorMetrics.js
 
       # DCF cap + fallback (real analyst price targets via yfinance,

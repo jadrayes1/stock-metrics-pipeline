@@ -3537,6 +3537,37 @@ async function processSymbol(symbol, apiKey, ctx) {
     }
   }
 
+  // Ticker-recycling guard, mirrors the identical fix in
+  // generatePfcfTrendCache.js (see that file's own comment for the full
+  // rationale, verified live for CCXI: Finnhub's financials-reported
+  // blends 32 quarterly + 10 annual reports tagged with ChemoCentryx's
+  // real historical CIK 1340652 alongside the 1 real Churchill Capital
+  // Corp XI report, CIK 2074973). isFinnhubCikMismatched/
+  // finnhubReportedFinancialsUntrusted above only gate the DCF-estimate
+  // fetch when Finnhub's FIRST report entry has a mismatched CIK --
+  // false for CCXI, since its first (most recent) entry happens to
+  // already be the real one, so this contaminated data flows straight
+  // into revenueGrowth/profitMargin/fcfMargin/roic reconstruction below
+  // ungated. Filtering to the real, current SEC CIK here -- before any
+  // builder runs, not relying on each builder's own internal
+  // first-entry-wins `sameCik` filter -- is a no-op for the vast
+  // majority of tickers, whose Finnhub reports already carry the
+  // correct CIK.
+  {
+    const realCik = ctx.secTickerToCikMap?.get((RENAMED_TICKER_FINANCIALS_ALIASES[symbol] || symbol).toUpperCase());
+    if (realCik) {
+      const realCikDigits = canonicalCikDigits(realCik);
+      const beforeQ = quarterlyFinancials.length;
+      const beforeA = annualReportedFinancials.length;
+      const sameRealCik = (r) => r.cik == null || canonicalCikDigits(r.cik) === realCikDigits;
+      quarterlyFinancials = quarterlyFinancials.filter(sameRealCik);
+      annualReportedFinancials = annualReportedFinancials.filter(sameRealCik);
+      if (process.env.DEBUG_CIK_FILTER === symbol) {
+        console.error(`DEBUG_CIK_FILTER ${symbol} realCik=${realCikDigits} quarterly ${beforeQ}->${quarterlyFinancials.length} annual ${beforeA}->${annualReportedFinancials.length}`);
+      }
+    }
+  }
+
   // SEC XBRL fallback for a Finnhub crawl gap that would otherwise block
   // revenueGrowth's YoY comparison — see backfillRevenueGapsFromSec's own
   // comment for the full rationale (verified live for Dominion Energy/D).
