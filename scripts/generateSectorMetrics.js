@@ -3445,18 +3445,35 @@ async function processSymbol(symbol, apiKey, ctx) {
   // implausible values, same bar as CAAP.
   // CCXI: same ticker-recycling shape as CAAP, just via a delisting instead
   // of a live CIK mismatch -- CCXI belonged to ChemoCentryx, Inc. (real
-  // biotech, acquired by Amgen, delisted ~Oct 2022) before being reused by
-  // the unrelated SPAC Churchill Capital Corp XI (real current CIK
-  // 2074973, confirmed via SEC submissions). Verified live via
+  // biotech, acquired by Amgen, delisted ~Oct 2022, real CIK 1340652) before
+  // being reused by the unrelated SPAC Churchill Capital Corp XI (real
+  // current CIK 2074973, confirmed via SEC submissions). Verified live via
   // trendsNative.json (sourced directly from Finnhub's own /stock/metric):
   // revenueGrowth/profitMargin stop dead at Q2 '22 and fcfMargin/pfcfRatio
   // at Q1 '22 -- exactly ChemoCentryx's last live quarter -- while roic has
-  // an anomalous, unrelated Q2 '26 point mixed into the same series,
-  // proof the native ratio engine is blending two unrelated companies'
-  // data under one recycled ticker, not just a financials-reported CIK
-  // mismatch inferred indirectly.
+  // an anomalous, unrelated Q2 '26 point mixed into the same series. Also
+  // directly confirmed via CIK 2074973's own real companyfacts: it's a
+  // textbook pre-merger blank-check shell (AssetsHeldInTrustNoncurrent,
+  // AdministrativeFeesExpense, zero Revenues concept anywhere) -- the real
+  // Churchill Capital Corp XI has NO real operating financials of any kind
+  // to be the source of these numbers.
+  //
+  // CCXI is the reason this can't stay gated behind
+  // finnhubReportedFinancialsUntrusted like the AND above originally
+  // assumed: verified live via DEBUG_TIER1_SYMBOL that
+  // isFinnhubCikMismatched returns false for CCXI even though its data is
+  // definitely wrong -- Finnhub's own financials-reported entries for
+  // "CCXI" apparently carry no usable cik field, so the mismatch check
+  // "fails open" (its own documented behavior when a cik is missing,
+  // designed to never wrongly blank a REAL ticker's real data) and never
+  // even notices anything is off. TIER1_ALSO_CORRUPTED_SYMBOLS membership
+  // is already the real safety bar here (a human independently verifying
+  // /stock/metric's own output before adding an entry) -- requiring
+  // finnhubReportedFinancialsUntrusted on top of that added no real safety,
+  // just an accidental extra condition that happened to be satisfied for
+  // CAAP and silently defeated the whole mechanism for CCXI.
   const TIER1_ALSO_CORRUPTED_SYMBOLS = new Set(['CAAP', 'CCXI']);
-  const finnhubDataUntrusted = finnhubReportedFinancialsUntrusted && TIER1_ALSO_CORRUPTED_SYMBOLS.has(symbol);
+  const finnhubDataUntrusted = TIER1_ALSO_CORRUPTED_SYMBOLS.has(symbol);
   if (process.env.DEBUG_TIER1_SYMBOL === symbol) {
     console.error(`DEBUG_TIER1 ${symbol} finnhubReportedFinancialsUntrusted=${finnhubReportedFinancialsUntrusted} annualReportedFinancials.length=${annualReportedFinancials?.length} finnhubDataUntrusted=${finnhubDataUntrusted}`);
   }
