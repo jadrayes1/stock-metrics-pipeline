@@ -4096,16 +4096,6 @@ async function runWorker(workerId, symbolSubset, apiKey, ctx) {
 
 async function main() {
   const apiKeys = readFinnhubApiKeys();
-  if (process.env.DEBUG_UNIVERSE_SYMBOLS) {
-    const targets = new Set(process.env.DEBUG_UNIVERSE_SYMBOLS.split(',').map((s) => s.trim().toUpperCase()));
-    const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/symbol?exchange=US&token=${apiKeys[0]}`);
-    const all = await res.json();
-    for (const s of all) {
-      if (targets.has(s.symbol)) console.error('DEBUG raw entry', JSON.stringify(s));
-    }
-    console.error('DEBUG done, exiting early');
-    return;
-  }
   const universeEntries = (await fetchUniverse(apiKeys[0])).filter((e) => !EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(e.symbol));
   // Built from the full, unfiltered universe fetch above, before any
   // TARGET_SYMBOL debug filtering below -- always complete regardless of
@@ -4173,18 +4163,6 @@ async function main() {
     foreignPfcfCache,
     foreignFilingsCache,
   };
-
-  if (process.env.DEBUG_TRACE_SYMBOL) {
-    const target = process.env.DEBUG_TRACE_SYMBOL.toUpperCase();
-    try {
-      const r = await processSymbol(target, apiKeys[0], ctx);
-      console.error('DEBUG trace result status=', r.status, 'metrics=', JSON.stringify(r.metrics));
-    } catch (err) {
-      console.error('DEBUG trace threw:', err && err.stack ? err.stack : err);
-    }
-    console.error('DEBUG trace done, exiting early');
-    return;
-  }
 
   // Split the universe across one worker per key, interleaved (round-robin
   // by index) rather than contiguous halves — cheap insurance against any

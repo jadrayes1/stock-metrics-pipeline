@@ -64,6 +64,21 @@ permissions:
   contents: read
   issues: write
 
+# Shares a concurrency group with generate-sector-metrics.yml (same group
+# name there) -- see that workflow's own comment for the full root-cause
+# analysis (verified live 2026-09-17: this was the actual mechanism behind
+# marketMetrics.json being frozen at a stale snapshot for about a month,
+# and behind CCXI's data reverting three times earlier this session).
+# `cancel-in-progress: false` queues rather than kills an in-progress run;
+# every run here is functionally redundant with any later one (each just
+# curls whatever's live and reapplies the same cap/fallback logic), so
+# GitHub's own concurrency behavior -- collapsing multiple queued-but-not-
+# started runs down to just the most recent -- causes no lost work here,
+# unlike a TARGET_SYMBOL dispatch of the OTHER workflow in this group.
+concurrency:
+  group: gist-publish
+  cancel-in-progress: false
+
 jobs:
   apply:
     runs-on: ubuntu-latest

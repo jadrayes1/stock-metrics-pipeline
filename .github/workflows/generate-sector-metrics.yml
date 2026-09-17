@@ -114,18 +114,33 @@ on:
         description: 'Optional: set to 1 for verbose SEC-enrichment tracing (DEBUG_SEC_ENRICHMENT)'
         required: false
         type: string
-      debugUniverseSymbols:
-        description: 'Optional: comma-separated symbols to print raw Finnhub /stock/symbol entries for, then exit early (DEBUG_UNIVERSE_SYMBOLS)'
-        required: false
-        type: string
-      debugTraceSymbol:
-        description: 'Optional: call processSymbol for exactly this one symbol and print its result/error, then exit early without publishing (DEBUG_TRACE_SYMBOL)'
-        required: false
-        type: string
 
 permissions:
   contents: read
   issues: write
+
+# Serializes every run that can publish to the shared gist — this workflow's
+# own full/TARGET_SYMBOL runs AND apply-dcf-cap.yml's runs (same group name
+# there) — against each other. Root-caused live 2026-09-17: with no
+# concurrency control, apply-dcf-cap.yml's workflow_run trigger fires on
+# EVERY completion of this workflow, including every single-symbol debug/
+# backfill dispatch; each such run independently curls whatever is live at
+# ITS OWN start, spends ~80-90 minutes on the yfinance sweep, then force-
+# overwrites the WHOLE marketMetrics.json. With dispatches firing minutes
+# apart (routine during active debugging), a later-FINISHING run whose own
+# snapshot predates an earlier-finishing sibling's fresh publish silently
+# reverts it — confirmed live: marketMetrics.json's generatedAt was frozen
+# at 2026-08-18 for about a month despite continuous "success" runs, and
+# this is also the confirmed mechanism behind CCXI's data reverting three
+# separate times earlier this session. `cancel-in-progress: false` queues
+# (never kills an in-progress run outright); GitHub's own concurrency
+# semantics keep only the MOST RECENTLY queued pending run per group,
+# cancelling any earlier-queued-but-not-yet-started one — a cancelled run
+# is visible as such in `gh run list` and just needs re-dispatching, a far
+# safer failure mode than the silent data reversion this replaces.
+concurrency:
+  group: gist-publish
+  cancel-in-progress: false
 
 jobs:
   generate:
@@ -145,8 +160,6 @@ jobs:
           TARGET_SYMBOL: ${{ inputs.symbol }}
           DEBUG_SEC_ENRICHMENT: ${{ inputs.debug }}
           DEBUG_REVENUE_ITEMS: ${{ inputs.debug }}
-          DEBUG_UNIVERSE_SYMBOLS: ${{ inputs.debugUniverseSymbols }}
-          DEBUG_TRACE_SYMBOL: ${{ inputs.debugTraceSymbol }}
         run: node scripts/generateSectorMetrics.js
 
       # DCF cap + fallback (real analyst price targets via yfinance,
