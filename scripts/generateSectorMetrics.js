@@ -1075,7 +1075,18 @@ function extractDcfInputs(reportedFinancials, industry) {
 // "operating"). A widespread utility-industry gap, not ticker-specific --
 // affects revenueGrowth directly and profitMargin/fcfMargin through their
 // shared revenue denominator.
-const REVENUE_CONCEPT_CANDIDATES = ['us-gaap_RevenuesNetOfInterestExpense', 'us-gaap_Revenues', 'us-gaap_SalesRevenueNet', 'us-gaap_RevenuesExcludingInterestAndDividends', 'us-gaap_RegulatedAndUnregulatedOperatingRevenue'];
+const REVENUE_CONCEPT_CANDIDATES = [
+  'us-gaap_RevenuesNetOfInterestExpense',
+  'us-gaap_Revenues',
+  'us-gaap_SalesRevenueNet',
+  'us-gaap_RevenuesExcludingInterestAndDividends',
+  'us-gaap_RegulatedAndUnregulatedOperatingRevenue',
+  // A BDC's real "top line" -- see SEC_REVENUE_CONCEPTS' own comment
+  // (verified live for GECC). Added here too so a BDC whose Finnhub
+  // financials-reported coverage is actually healthy (no enrichment
+  // needed) still gets its revenue recognized directly.
+  'us-gaap_GrossInvestmentIncomeOperating',
+];
 
 // ---------------------------------------------------------------------------
 // SEC XBRL fallback for revenue-growth gaps — Finnhub's own financials-
@@ -1099,7 +1110,28 @@ const SEC_TICKERS_URL = 'https://www.sec.gov/files/company_tickers.json';
 const SEC_COMPANYFACTS_BASE = 'https://data.sec.gov/api/xbrl/companyfacts';
 const SEC_USER_AGENT = 'stock-analyzer-app stock-metrics-pipeline contact:jadrayescpp@gmail.com';
 const SEC_FETCH_TIMEOUT_MS = 30000; // see extractFilingTextFacts.js in the sibling foreign-filings-pipeline repo for why a bare fetch() needs an explicit ceiling
-const SEC_REVENUE_CONCEPTS = ['Revenues', 'RevenueFromContractWithCustomerExcludingAssessedTax', 'RevenueFromContractWithCustomerIncludingAssessedTax', 'SalesRevenueNet', 'RevenuesNetOfInterestExpense'];
+const SEC_REVENUE_CONCEPTS = [
+  'Revenues',
+  'RevenueFromContractWithCustomerExcludingAssessedTax',
+  'RevenueFromContractWithCustomerIncludingAssessedTax',
+  'SalesRevenueNet',
+  'RevenuesNetOfInterestExpense',
+  // RegulatedAndUnregulatedOperatingRevenue was already recognized by the
+  // PRIMARY (Finnhub-based) findReportedRevenue via REVENUE_CONCEPT_
+  // CANDIDATES, but missing here meant a sparse-Finnhub-coverage utility
+  // (verified live: DTE, whose real revenue concept switched from
+  // "Revenues" -- stopped ~2018 -- to this one, real and current through
+  // Q1 2026) couldn't get it from the SEC-XBRL enrichment path either.
+  // findSecValueForFyFp prefixes with "us-gaap_" before returning, so this
+  // flows into the exact same REVENUE_CONCEPT_CANDIDATES match downstream.
+  'RegulatedAndUnregulatedOperatingRevenue',
+  // A Business Development Company's real "top line" -- verified live for
+  // GECC (Great Elm Capital Corp): a BDC's income statement has no
+  // standard Revenue/RevenueFromContract concept at all, just this one
+  // (total investment income earned across its portfolio), real and
+  // current through Q2 2026.
+  'GrossInvestmentIncomeOperating',
+];
 
 async function fetchSecJson(url) {
   const controller = new AbortController();
