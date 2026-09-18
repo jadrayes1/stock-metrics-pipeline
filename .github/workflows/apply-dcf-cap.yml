@@ -102,43 +102,92 @@ jobs:
       - name: Install yfinance
         run: pip install yfinance
 
-      - name: Fetch candidates and current metrics from gist
-        run: |
-          mkdir -p src/data
-          curl -sf "https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/dcfCapCandidates.json" -o dcfCapCandidates.json
-          curl -sf "https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/marketMetrics.json" -o src/data/marketMetrics.json
+      - name: Fetch candidates list from gist
+        run: curl -sf "https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/dcfCapCandidates.json" -o dcfCapCandidates.json
 
       - name: Fetch analyst price targets for DCF cap/fallback candidates
         env:
           TARGET_SYMBOL: ${{ inputs.symbol }}
         run: python3 scripts/fetchDcfCapTargets.py
 
-      - name: Apply DCF cap and mid-range fallback
-        run: node scripts/applyDcfCap.js
-
+      # Fetching marketMetrics.json + applying the DCF cap + publishing are
+      # combined into ONE step below (rather than three separate ones)
+      # specifically so a rejected push can retry the WHOLE sequence
+      # against a freshly-refetched base -- applyDcfCap.js does a WHOLESALE
+      # overwrite of marketMetrics.json (see its own header: it's not a
+      # targeted per-ticker merge the way generate-sector-metrics.yml's
+      # TARGET_SYMBOL path is), so re-cloning the gist alone on retry isn't
+      # enough -- src/data/marketMetrics.json itself has to be refetched and
+      # re-capped too, or a retry would still overwrite a sibling writer's
+      # change with the ORIGINAL (now-stale) local copy. applyDcfCap.js is
+      # cheap and idempotent (just re-applies the SAME already-fetched
+      # analystPriceTargets.json -- no need to re-run the slow yfinance step
+      # above on retry), so redoing fetch+apply per attempt costs seconds,
+      # not minutes.
+      #
+      # Root-caused live 2026-09-18: fetching marketMetrics.json before the
+      # ~80-90 minute yfinance step above (the ORIGINAL structure of this
+      # job) meant applyDcfCap.js always patched a base that was up to
+      # 80-90 minutes stale by the time this workflow got around to
+      # publishing, silently discarding anything published elsewhere in
+      # that window -- the actual mechanism behind marketMetrics.json being
+      # frozen at a month-old snapshot for weeks (see commit 107cc70's own
+      # concurrency-group fix, which serializes runs but doesn't by itself
+      # fix THIS staleness). Fetching AFTER the slow step instead costs
+      # nothing extra (a single JSON download, seconds).
+      #
+      # `--force-with-lease` (instead of a bare `--force`) plus this retry
+      # loop closes the remaining race precisely rather than just shrinking
+      # its window: if the remote has moved since our clone (another gist
+      # writer -- a sibling repo, a TARGET_SYMBOL backfill in the OTHER
+      # concurrency group, etc. -- published in the interim), the push is
+      # REJECTED instead of blindly overwriting; the whole fetch+apply+push
+      # sequence then retries against a fresh clone, which naturally picks
+      # up whatever just landed for every ticker THIS run didn't itself
+      # re-cap. Bounded at 5 attempts so persistent contention fails loudly
+      # (visible in this run's log, triggers the existing failure-issue
+      # step below) instead of looping forever.
+      #
       # Only marketMetrics.json changes here -- everything else in the gist
       # (trend caches, coverageAudit.json, dcfCapCandidates.json itself)
-      # comes along unmodified from the fresh clone, since it's never
-      # touched locally before the orphan commit below.
-      - name: Publish updated metrics to gist
+      # comes along unmodified from each attempt's fresh clone, since
+      # nothing else is ever touched locally before the orphan commit.
+      - name: Apply DCF cap and publish to gist
         env:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
         run: |
-          git clone --depth 1 "https://${GIST_TOKEN}@gist.github.com/${GIST_ID}.git" gist-clone
-          if diff -q src/data/marketMetrics.json gist-clone/marketMetrics.json >/dev/null 2>&1; then
-            echo "No changes to publish."
-          else
+          set -e
+          CLONE_URL="https://${GIST_TOKEN}@gist.github.com/${GIST_ID}.git"
+          mkdir -p src/data
+          attempt=1
+          while true; do
+            curl -sf "https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/marketMetrics.json" -o src/data/marketMetrics.json
+            node scripts/applyDcfCap.js
+            rm -rf gist-clone
+            git clone --depth 1 "$CLONE_URL" gist-clone
+            if diff -q src/data/marketMetrics.json gist-clone/marketMetrics.json >/dev/null 2>&1; then
+              echo "No changes to publish."
+              break
+            fi
+            EXPECTED_SHA=$(git -C gist-clone rev-parse HEAD)
             cp src/data/marketMetrics.json gist-clone/marketMetrics.json
-            cd gist-clone
-            git config user.email "actions@github.com"
-            git config user.name "stock-metrics-pipeline"
-            git checkout --orphan latest-snapshot
-            git add -A
-            git commit -m "Apply DCF cap $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            git branch -M main
-            git push --force origin main
-          fi
+            ( cd gist-clone
+              git config user.email "actions@github.com"
+              git config user.name "stock-metrics-pipeline"
+              git checkout --orphan latest-snapshot
+              git add -A
+              git commit -m "Apply DCF cap $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              git branch -M main
+              git push --force-with-lease="main:${EXPECTED_SHA}" origin main
+            ) && { echo "Published on attempt $attempt."; break; }
+            attempt=$((attempt + 1))
+            if [ "$attempt" -gt 5 ]; then
+              echo "::error::Publish rejected 5 times in a row -- the gist kept changing underneath this run. Not forcing; re-dispatch once things settle."
+              exit 1
+            fi
+            echo "Push rejected (remote moved since clone) — retrying with a fresh fetch (attempt ${attempt}/5)..."
+          done
 
       - name: Report failure
         if: failure()
