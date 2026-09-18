@@ -3524,7 +3524,22 @@ async function processSymbol(symbol, apiKey, ctx) {
   // end for this recently-listed, Oct 2024, company) is broken. Add an
   // entry here only after independently fetching and confirming that
   // specific field's own implausibility, same bar as TIER1_ALSO_CORRUPTED_SYMBOLS.
-  const KNOWN_IMPLAUSIBLE_NATIVE_FIELDS = { HTLM: ['revenueGrowth'] };
+  const KNOWN_IMPLAUSIBLE_NATIVE_FIELDS = {
+    HTLM: ['revenueGrowth'],
+    // GECC (Great Elm Capital Corp, a BDC) -- verified live 2026-09-18:
+    // Finnhub's native revenueGrowthTTMYoy reads 5768.97% (57.6897),
+    // wildly inconsistent with the real SEC-reconstructed yearly figure
+    // (27.12%, FY'25) that became available the same day once this file's
+    // own SEC_REVENUE_CONCEPTS gained GrossInvestmentIncomeOperating (a
+    // BDC's real revenue-equivalent) -- most likely Finnhub's own ratio
+    // engine, like the domestic reconstruction before today's fix, wasn't
+    // built with a BDC's non-standard income-statement concepts in mind
+    // either. Nulling lets the card-value backfill below (line ~3863,
+    // "if (values[key] != null) continue") pick up the real reconstructed
+    // figure instead of leaving a gap -- not just suppressing a bad value
+    // the way HTLM's entry does, since a good replacement now exists.
+    GECC: ['revenueGrowth'],
+  };
   for (const field of KNOWN_IMPLAUSIBLE_NATIVE_FIELDS[symbol] || []) {
     values[field] = null;
   }
