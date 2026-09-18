@@ -48,6 +48,28 @@ permissions:
   contents: read
   issues: write
 
+# Shares a concurrency group with generate-sector-metrics.yml/apply-dcf-cap.yml
+# -- see generate-sector-metrics.yml's own comment for the full root-cause
+# history. This workflow's own publish step below was, until now, still a
+# bare `gh gist edit` call with no compare-and-swap protection at all --
+# verified live 2026-09-18 as a REAL, ongoing contributor to marketMetrics.json
+# staying frozen for a month even AFTER the git-clone/force-with-lease fix
+# landed elsewhere: a successful, verified git push from generate-sector-
+# metrics.yml (new commit confirmed via the GitHub API) was found completely
+# absent from the gist's revision history minutes later, with this
+# workflow's own unprotected publish the only other writer active in that
+# window. `gh gist edit`'s REST-API read-modify-write has no way to detect
+# or reject a stale base the way git's own force-with-lease does, so it can
+# silently republish an old full snapshot over a fresher one from ANY other
+# writer -- including ones in a completely different repository, which a
+# same-repo concurrency group alone can never protect against. Converted
+# below to the same git-clone + force-with-lease + retry pattern as the
+# other two -- that's the actual cross-repo-safe mechanism; the concurrency
+# group here is just an optimization against same-repo contention.
+concurrency:
+  group: gist-publish
+  cancel-in-progress: false
+
 jobs:
   generate:
     runs-on: ubuntu-latest
@@ -70,10 +92,37 @@ jobs:
 
       - name: Publish to gist
         env:
-          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
         run: |
-          gh gist edit "${{ secrets.GIST_ID }}" --filename pfcfTrendCache.json pfcfTrendCache.json || \
-          gh gist edit "${{ secrets.GIST_ID }}" --add pfcfTrendCache.json
+          set -e
+          CLONE_URL="https://${GIST_TOKEN}@gist.github.com/${GIST_ID}.git"
+          attempt=1
+          while true; do
+            rm -rf gist-clone
+            git clone --depth 1 "$CLONE_URL" gist-clone
+            if diff -q pfcfTrendCache.json gist-clone/pfcfTrendCache.json >/dev/null 2>&1; then
+              echo "No changes to publish."
+              break
+            fi
+            EXPECTED_SHA=$(git -C gist-clone rev-parse HEAD)
+            cp pfcfTrendCache.json gist-clone/pfcfTrendCache.json
+            ( cd gist-clone
+              git config user.email "actions@github.com"
+              git config user.name "stock-metrics-pipeline"
+              git checkout --orphan latest-snapshot
+              git add -A
+              git commit -m "Update P/FCF trend cache $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              git branch -M main
+              git push --force-with-lease="main:${EXPECTED_SHA}" origin main
+            ) && { echo "Published on attempt $attempt."; break; }
+            attempt=$((attempt + 1))
+            if [ "$attempt" -gt 5 ]; then
+              echo "::error::Publish rejected 5 times in a row -- the gist kept changing underneath this run. Not forcing; re-dispatch once things settle."
+              exit 1
+            fi
+            echo "Push rejected (remote moved since clone) — retrying (attempt ${attempt}/5)..."
+          done
 
       - name: Report failure
         if: failure()
