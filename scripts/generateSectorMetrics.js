@@ -1543,10 +1543,43 @@ async function fetchSecUsGaapFacts(cik) {
 // cumulative here, under-counting after de-cumulation — this pipeline has
 // no per-point reconciliation cross-check today (unlike the foreign-
 // filings pipeline's extractor), so this isn't caught automatically.
+// Deliberately left preferring the cumulative fact on a tie -- an earlier
+// attempt at reversing this default, tested against AAPL's 15+ years of
+// real historic facts as a regression check, corrupted fiscal-Q4 derivation
+// for several years (a double-counting artifact from how AAPL's own historic
+// XBRL tagging ambiguity interacts with a changed default). See
+// pickStandaloneDurationFact below for how the SPCX-style "no earlier
+// quarter to anchor against" case is handled instead, without touching this
+// proven, already-correct default at all.
 function pickDurationFact(facts, fy, fp) {
   const matches = (facts || []).filter((f) => f.fy === fy && f.fp === fp && f.start && f.end && f.val != null);
   if (!matches.length) return null;
   matches.sort((a, b) => new Date(b.end) - new Date(a.end) || new Date(a.start) - new Date(b.start) || new Date(b.filed || 0) - new Date(a.filed || 0));
+  return matches[0];
+}
+
+const STANDALONE_QUARTER_MAX_DAYS = 120;
+
+// A narrow, ADDITIVE fallback -- never overrides pickDurationFact's own
+// selection above, only offers an alternate when decumulateYtdByYear finds
+// no earlier quarter to anchor a subtraction against (see its use there).
+// Restricted to genuinely short (<=120 day) durations, so it can never
+// mistake a cumulative fact for a standalone one. Verified live for SPCX
+// (SpaceX): its only 10-Q on file is a Q2, with no Q1 ever filed (its
+// first-ever quarterly SEC report), yet that same 10-Q also tags a real,
+// directly-disclosed 3-month revenue/net income/operating income fact
+// alongside the 6-/9-month cumulative one pickDurationFact prefers by
+// default -- this recovers it without needing an anchor to subtract
+// against, and without changing what gets published for any ticker/year
+// that already has one.
+function pickStandaloneDurationFact(facts, fy, fp) {
+  const matches = (facts || []).filter((f) => {
+    if (f.fy !== fy || f.fp !== fp || !f.start || !f.end || f.val == null) return false;
+    const days = (new Date(f.end) - new Date(f.start)) / (1000 * 60 * 60 * 24);
+    return days > 0 && days <= STANDALONE_QUARTER_MAX_DAYS;
+  });
+  if (!matches.length) return null;
+  matches.sort((a, b) => new Date(b.end) - new Date(a.end) || new Date(b.filed || 0) - new Date(a.filed || 0));
   return matches[0];
 }
 
@@ -1568,6 +1601,18 @@ function findSecValueForFyFp(gaapFacts, concepts, fy, fp, kind) {
   for (const concept of concepts) {
     const facts = gaapFacts[concept]?.units?.USD || [];
     const fact = kind === 'instant' ? pickInstantFact(facts, fy, fp) : pickDurationFact(facts, fy, fp);
+    if (fact) return { value: fact.val, concept: `us-gaap_${concept}`, end: fact.end };
+  }
+  return null;
+}
+
+// See pickStandaloneDurationFact's own comment for the rationale. Duration
+// concepts only (kind='instant' balance-sheet facts have no such ambiguity
+// -- a snapshot has no "cumulative vs standalone" distinction).
+function findStandaloneSecValueForFyFp(gaapFacts, concepts, fy, fp) {
+  for (const concept of concepts) {
+    const facts = gaapFacts[concept]?.units?.USD || [];
+    const fact = pickStandaloneDurationFact(facts, fy, fp);
     if (fact) return { value: fact.val, concept: `us-gaap_${concept}`, end: fact.end };
   }
   return null;
@@ -1677,7 +1722,25 @@ function buildSecSyntheticReports(gaapFacts, cik, isFinancial = false) {
     // statement concepts are the most commonly available.
     const endDate = revenueFact?.end || niiFact?.end || netIncomeFact?.end || ebitFact?.end || ocfFact?.end || capexFact?.end || equityFact?.end || cashFact?.end || debtFact?.end || null;
 
-    const entry = { cik: normalizedCik, form: 'SEC-XBRL', report: { ic: icItems, cf: cfItems, bs: bsReportItems }, endDate };
+    // See pickStandaloneDurationFact's own comment (SPCX) -- purely
+    // additive alongside icItems/cfItems/bsReportItems above (which are
+    // completely unchanged), only ever consulted by decumulateYtdByYear's
+    // own orphan-quarter fallback when there's no earlier quarter to anchor
+    // a normal cumulative subtraction against. bs is a snapshot, no
+    // standalone-vs-cumulative distinction applies there.
+    const standaloneRevenueFact = useBankRevenue ? null : findStandaloneSecValueForFyFp(gaapFacts, SEC_REVENUE_CONCEPTS, fy, fp);
+    const standaloneNetIncomeFact = findStandaloneSecValueForFyFp(gaapFacts, SEC_NET_INCOME_CONCEPTS, fy, fp);
+    const standaloneEbitFact = findStandaloneSecValueForFyFp(gaapFacts, SEC_EBIT_CONCEPTS, fy, fp) || findStandaloneSecValueForFyFp(gaapFacts, SEC_PRETAX_INCOME_CONCEPTS, fy, fp);
+    const standaloneIc = [standaloneRevenueFact, standaloneNetIncomeFact, standaloneEbitFact]
+      .filter(Boolean)
+      .map((r) => ({ concept: r.concept, label: `${r.concept} (SEC XBRL enrichment, standalone)`, value: r.value }));
+    const standaloneOcfFact = findStandaloneSecValueForFyFp(gaapFacts, SEC_OCF_CONCEPTS, fy, fp);
+    const standaloneCapexFact = findStandaloneSecValueForFyFp(gaapFacts, SEC_CAPEX_CONCEPTS, fy, fp);
+    const standaloneCf = [standaloneOcfFact, standaloneCapexFact]
+      .filter(Boolean)
+      .map((r) => ({ concept: r.concept, label: `${r.concept} (SEC XBRL enrichment, standalone)`, value: r.value }));
+
+    const entry = { cik: normalizedCik, form: 'SEC-XBRL', report: { ic: icItems, cf: cfItems, bs: bsReportItems, standaloneIc, standaloneCf }, endDate };
     if (fp === 'FY') annualReports.push({ ...entry, year: fy });
     else if (quarterNumber[fp]) quarterlyReports.push({ ...entry, year: fy, quarter: quarterNumber[fp] });
   }
@@ -1884,8 +1947,8 @@ function findReportedCapexQ(cfItems) {
 
 // A real quarter is ~90-92 days; a YTD-cumulative Q2/Q3 report spans ~181/272
 // days -- comfortable separation for telling the two apart from a report's
-// own startDate/endDate.
-const STANDALONE_QUARTER_MAX_DAYS = 120;
+// own startDate/endDate. (STANDALONE_QUARTER_MAX_DAYS itself now declared up
+// near pickStandaloneDurationFact, which needs it earlier in the file.)
 function reportDurationDays(report) {
   if (!report?.startDate || !report?.endDate) return null;
   const start = new Date(report.startDate);
@@ -1929,6 +1992,13 @@ function decumulateYtdByYear(quarterlyReports, annualReports, findValue, section
   const ytdByYear = {};
   const isStandaloneDisclosure = {};
   const annualByYear = {};
+  // See pickStandaloneDurationFact's own comment (SPCX) -- a narrow,
+  // ADDITIVE fallback consulted ONLY when a quarter has no earlier
+  // same-fiscal-year quarter to decumulate against (see its use below);
+  // never overrides the normal cumulative-subtraction/already-standalone
+  // paths above, which are completely unchanged.
+  const orphanFallback = {};
+  const fallbackSection = section === 'ic' ? 'standaloneIc' : section === 'cf' ? 'standaloneCf' : null;
 
   for (const q of quarterlyReports || []) {
     if (!q?.quarter) continue;
@@ -1939,6 +2009,14 @@ function decumulateYtdByYear(quarterlyReports, annualReports, findValue, section
     const duration = reportDurationDays(q);
     isStandaloneDisclosure[q.year] = isStandaloneDisclosure[q.year] || {};
     isStandaloneDisclosure[q.year][q.quarter] = duration != null && duration <= STANDALONE_QUARTER_MAX_DAYS;
+
+    if (fallbackSection) {
+      const fallbackValue = findValue(q.report?.[fallbackSection] || []);
+      if (fallbackValue != null) {
+        orphanFallback[q.year] = orphanFallback[q.year] || {};
+        orphanFallback[q.year][q.quarter] = fallbackValue;
+      }
+    }
   }
   for (const a of annualReports || []) {
     const value = findValue(a?.report?.[section] || []);
@@ -1949,6 +2027,7 @@ function decumulateYtdByYear(quarterlyReports, annualReports, findValue, section
   for (const [yearStr, q] of Object.entries(ytdByYear)) {
     const year = Number(yearStr);
     const standaloneFlags = isStandaloneDisclosure[year] || {};
+    const fallback = orphanFallback[year] || {};
     // cumulativeThrough[n] = the true YTD-cumulative total through fiscal
     // quarter n, regardless of whether quarter n's OWN report happened to
     // disclose a cumulative or already-standalone figure — needed to
@@ -1963,6 +2042,16 @@ function decumulateYtdByYear(quarterlyReports, annualReports, findValue, section
       if (standaloneFlags[2]) {
         standalone[`${year}-2`] = q[2];
         if (cumulativeThrough[1] != null) cumulativeThrough[2] = cumulativeThrough[1] + q[2];
+      } else if (cumulativeThrough[1] == null && fallback[2] != null) {
+        standalone[`${year}-2`] = fallback[2];
+        // Deliberately NOT setting cumulativeThrough[2] -- a company can
+        // genuinely have been operating, with a real Q1 that simply
+        // predates its SEC-reporting obligation (verified live: SPCX's
+        // actual first-ever 10-Q is a Q2) -- treating "just Q2" as
+        // "cumulative since fiscal year start" would understate a LATER
+        // quarter that subtracts against it by whatever the real (unknown
+        // to us) Q1 was. Publish this quarter's own real value and stop --
+        // never let an admittedly-incomplete chain propagate forward.
       } else {
         cumulativeThrough[2] = q[2];
         if (cumulativeThrough[1] != null) standalone[`${year}-2`] = q[2] - cumulativeThrough[1];
@@ -1973,6 +2062,9 @@ function decumulateYtdByYear(quarterlyReports, annualReports, findValue, section
       if (standaloneFlags[3]) {
         standalone[`${year}-3`] = q[3];
         if (cumulativeThrough[2] != null) cumulativeThrough[3] = cumulativeThrough[2] + q[3];
+      } else if (cumulativeThrough[2] == null && fallback[3] != null) {
+        standalone[`${year}-3`] = fallback[3];
+        // Same reasoning as Q2's own branch above -- no cumulativeThrough[3].
       } else {
         cumulativeThrough[3] = q[3];
         if (cumulativeThrough[2] != null) standalone[`${year}-3`] = q[3] - cumulativeThrough[2];
