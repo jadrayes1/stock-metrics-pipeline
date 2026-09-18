@@ -114,6 +114,10 @@ on:
         description: 'Optional: set to 1 for verbose SEC-enrichment tracing (DEBUG_SEC_ENRICHMENT)'
         required: false
         type: string
+      debugTraceSymbol:
+        description: 'Optional: call processSymbol for exactly this one symbol and print its result/error, then exit early without publishing (DEBUG_TRACE_SYMBOL)'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -160,6 +164,7 @@ jobs:
           TARGET_SYMBOL: ${{ inputs.symbol }}
           DEBUG_SEC_ENRICHMENT: ${{ inputs.debug }}
           DEBUG_REVENUE_ITEMS: ${{ inputs.debug }}
+          DEBUG_TRACE_SYMBOL: ${{ inputs.debugTraceSymbol }}
         run: node scripts/generateSectorMetrics.js
 
       # DCF cap + fallback (real analyst price targets via yfinance,

@@ -4164,6 +4164,21 @@ async function main() {
     foreignFilingsCache,
   };
 
+  if (process.env.DEBUG_TRACE_SYMBOL) {
+    const target = process.env.DEBUG_TRACE_SYMBOL.toUpperCase();
+    try {
+      const r = await processSymbol(target, apiKeys[0], ctx);
+      console.error('DEBUG trace result status=', r.status, 'metrics=', JSON.stringify(r.metrics));
+      console.error('DEBUG yearlyTrends=', JSON.stringify(r.yearlyTrends));
+      console.error('DEBUG quarterlyTrends=', JSON.stringify(r.quarterlyTrends));
+      console.error('DEBUG ttmTrends=', JSON.stringify(r.ttmTrends));
+    } catch (err) {
+      console.error('DEBUG trace threw:', err && err.stack ? err.stack : err);
+    }
+    console.error('DEBUG trace done, exiting early');
+    return;
+  }
+
   // Split the universe across one worker per key, interleaved (round-robin
   // by index) rather than contiguous halves — cheap insurance against any
   // systematic clustering in the alphabetically-sorted universe (e.g. a
