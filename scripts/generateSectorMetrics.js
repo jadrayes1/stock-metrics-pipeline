@@ -4165,15 +4165,18 @@ async function main() {
   };
 
   if (process.env.DEBUG_TRACE_SYMBOL) {
-    const target = process.env.DEBUG_TRACE_SYMBOL.toUpperCase();
-    try {
-      const r = await processSymbol(target, apiKeys[0], ctx);
-      console.error('DEBUG trace result status=', r.status, 'metrics=', JSON.stringify(r.metrics));
-      console.error('DEBUG yearlyTrends=', JSON.stringify(r.yearlyTrends));
-      console.error('DEBUG quarterlyTrends=', JSON.stringify(r.quarterlyTrends));
-      console.error('DEBUG ttmTrends=', JSON.stringify(r.ttmTrends));
-    } catch (err) {
-      console.error('DEBUG trace threw:', err && err.stack ? err.stack : err);
+    const targets = process.env.DEBUG_TRACE_SYMBOL.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
+    for (const target of targets) {
+      try {
+        const r = await processSymbol(target, apiKeys[0], ctx);
+        console.error(`DEBUG [${target}] trace result status=`, r.status, 'metrics=', JSON.stringify(r.metrics));
+        console.error(`DEBUG [${target}] yearlyTrends=`, JSON.stringify(r.yearlyTrends));
+        console.error(`DEBUG [${target}] quarterlyTrends=`, JSON.stringify(r.quarterlyTrends));
+        console.error(`DEBUG [${target}] ttmTrends=`, JSON.stringify(r.ttmTrends));
+      } catch (err) {
+        console.error(`DEBUG [${target}] trace threw:`, err && err.stack ? err.stack : err);
+      }
+      await sleep(REQUEST_SPACING_MS);
     }
     console.error('DEBUG trace done, exiting early');
     return;
