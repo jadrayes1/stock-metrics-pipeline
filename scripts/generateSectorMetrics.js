@@ -1446,6 +1446,37 @@ function hasRecentQuarterlyGap(quarterlyFinancials, scanEntries = RECENT_GAP_SCA
 // nobody needs filled -- exactly the kind of broad per-ticker overhead
 // growth this file's own REQUEST_SPACING_MS/fetchDcfCapTargets.py fixes
 // were about eliminating, not reintroducing.
+// A report can exist with a real, recent date yet still be missing revenue
+// specifically -- hasRecentQuarterlyGap above only checks whether report
+// DATES are recent, so a ticker with real, dated, but revenue-less recent
+// reports never trips it, and only the narrow adjacent-gap revenue patcher
+// (fillMissingRevenueInExistingReports, run just before this file's own
+// SEC-XBRL broad-enrichment trigger check) ever runs for it -- which can
+// only bridge a gap next to an EXISTING real revenue figure, not restart
+// coverage after a long stretch with none. Verified live for OMER: many
+// real, dated Finnhub report entries through 2025-2026 exist but never
+// carried a revenue figure at all ("Finnhub tagged the wrong statement as
+// 'ic'", confirmed via a debug trace), so revenueGrowth/profitMargin/
+// fcfMargin all silently froze years behind while roic (revenue-
+// independent) and the report dates themselves stayed current -- exactly
+// the shape hasRecentQuarterlyGap can't see. Checked AFTER the narrow
+// patcher already ran (whatever real revenue it found is already merged
+// in), so this only fires when that narrower mechanism genuinely wasn't
+// enough -- scoped to 2+ of the most recent scanEntries still missing
+// revenue, not just one, so an isolated one-off gap deep in otherwise-
+// healthy recent history (which the narrow patcher alone can usually
+// already bridge) doesn't force every ticker with a single old gap through
+// the heavier broad-enrichment path.
+const RECENT_REVENUE_GAP_MIN_COUNT = 2;
+function hasRecentRevenueGap(quarterlyFinancials, scanEntries = RECENT_GAP_SCAN_ENTRIES) {
+  const dated = (quarterlyFinancials || [])
+    .filter((r) => r?.endDate && !isNaN(new Date(r.endDate)))
+    .sort((a, b) => new Date(b.endDate) - new Date(a.endDate))
+    .slice(0, scanEntries);
+  if (!dated.length) return false;
+  return findReportsMissingRevenue(dated).length >= RECENT_REVENUE_GAP_MIN_COUNT;
+}
+
 const MID_SEQUENCE_GAP_RECENT_YEARS = 2;
 function hasMidSequenceQuarterGap(quarterlyFinancials) {
   const years = [...new Set((quarterlyFinancials || []).map((r) => r?.year).filter((y) => y != null))].sort((a, b) => b - a);
@@ -3756,7 +3787,8 @@ async function processSymbol(symbol, apiKey, ctx) {
     quarterlyFinancials.length < SEC_ENRICHMENT_SPARSE_QUARTERLY_THRESHOLD ||
     annualReportedFinancials.length < SEC_ENRICHMENT_SPARSE_ANNUAL_THRESHOLD ||
     hasRecentQuarterlyGap(quarterlyFinancials) ||
-    hasMidSequenceQuarterGap(quarterlyFinancials)
+    hasMidSequenceQuarterGap(quarterlyFinancials) ||
+    hasRecentRevenueGap(quarterlyFinancials)
   ) {
     if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG enrichment triggered for', symbol, 'q=', quarterlyFinancials.length, 'a=', annualReportedFinancials.length);
     try {
@@ -4498,6 +4530,7 @@ module.exports = {
   decodeTrendQualifiedMask,
   hasRecentQuarterlyGap,
   hasMidSequenceQuarterGap,
+  hasRecentRevenueGap,
   pickDurationFact,
   pickInstantFact,
   decumulateYtdByYear,
