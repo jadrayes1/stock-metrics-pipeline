@@ -803,6 +803,22 @@ function findReportedDilutedShares(icItems) {
   const basicLabelMatch = icItems.find((item) => /basic.*shares|weighted average.*basic/i.test(item.label || ''));
   if (plausible(basicLabelMatch?.value)) return basicLabelMatch.value;
 
+  // ifrs-full's own plain WeightedAverageShares concept (added to
+  // SEC_SHARES_CONCEPTS for B/Barrick Mining Corp, see fetchSecUsGaapFacts'
+  // own comment) doesn't specify basic vs. diluted the way the two us-gaap
+  // concepts above do, so its label ("...WeightedAverageShares (SEC XBRL
+  // enrichment)") matches neither the "diluted" nor "basic" regexes above
+  // and fell through to null even though the real figure was right there —
+  // verified live for B, where this silently blocked P/E from ever using
+  // the otherwise-correctly-enriched net income. Checked by exact concept
+  // name (matching this file's own "us-gaap_" label-prefix convention,
+  // used regardless of the fact's true source taxonomy) after the more
+  // specific basic/diluted checks above, since a real but unspecified
+  // share count is still better than falling through to the EPS-derived
+  // approximation below.
+  const genericMatch = icItems.find((item) => item.concept === 'us-gaap_WeightedAverageShares');
+  if (plausible(genericMatch?.value)) return genericMatch.value;
+
   // Falls back to EarningsPerShareBasic when EarningsPerShareDiluted isn't
   // tagged at all -- verified live: SMID's real annual 10-K only discloses
   // one combined line, "Basic and diluted earnings per share" (tagged as
