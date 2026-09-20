@@ -443,6 +443,31 @@ function hasMidSequenceQuarterGap(quarterlyFinancials) {
   return false;
 }
 
+// A ticker's Finnhub coverage can look perfectly healthy by every check
+// above (recent report dates, no mid-sequence gaps -- both driven by
+// whichever fields OCF/capex/P-FCF happen to populate) while still being
+// stale specifically for the concepts P/E needs (net income, shares).
+// Verified live for B (Barrick Mining Corp, formerly Barrick Gold,
+// renamed 2025-04-29): its quarterlyReports/annualReports never tripped
+// any of the checks above, yet its own already-published P/E trend sat
+// frozen at Q3 '24/FY '23, over a year stale -- the same "Finnhub tagged
+// the wrong statement" shape already fixed for OMER's revenue
+// (hasRecentRevenueGap in generateSectorMetrics.js), just for P/E's own
+// inputs instead. Checked against the PREVIOUSLY-published .pe trend
+// (the fresh one doesn't exist yet at this point) as a direct, general
+// signal that doesn't depend on guessing which specific Finnhub field is
+// broken this time.
+function isPeCacheStale(existingPe, maxQuartersBehind = 3) {
+  const points = existingPe?.ttm;
+  if (!points || !points.length) return false; // nothing published yet -- the sparse-count trigger above already covers a brand-new ticker
+  const match = /^Q(\d) '(\d\d)$/.exec(points[points.length - 1]?.label || '');
+  if (!match) return false; // unparseable label (e.g. an annual-cadence "FY 'YY") -- fail open, don't force enrichment on a guess
+  const lastOrdinal = (2000 + Number(match[2])) * 4 + Number(match[1]);
+  const now = new Date();
+  const currentOrdinal = now.getFullYear() * 4 + (Math.floor(now.getMonth() / 3) + 1);
+  return currentOrdinal - lastOrdinal > maxQuartersBehind;
+}
+
 // Builds report entries shaped exactly like the real Finnhub ones
 // buildPfcfTrendFromFilingsAndPrices/its siblings already consume (only
 // .year/.quarter/.cik/.report are ever read downstream) — see
@@ -1477,7 +1502,8 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
       quarterlyReports.length < SEC_ENRICHMENT_SPARSE_QUARTERLY_THRESHOLD ||
       annualReports.length < SEC_ENRICHMENT_SPARSE_ANNUAL_THRESHOLD ||
       hasRecentQuarterlyGap(quarterlyReports) ||
-      hasMidSequenceQuarterGap(quarterlyReports)
+      hasMidSequenceQuarterGap(quarterlyReports) ||
+      isPeCacheStale(existingCacheEntry?.pe)
     ) {
       const cik = secTickerToCikMap.get((RENAMED_TICKER_FINANCIALS_ALIASES[symbol] || symbol).toUpperCase()) || secTickerToCikMap.get(symbol.toUpperCase());
       if (cik) {
@@ -1799,6 +1825,7 @@ module.exports = {
   mergeSyntheticPfcfReports,
   hasRecentQuarterlyGap,
   hasMidSequenceQuarterGap,
+  isPeCacheStale,
 };
 
 // Matches the require.main guard already used in the sibling
