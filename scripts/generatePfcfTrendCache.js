@@ -111,7 +111,11 @@ const SEC_INVESTING_SUBTOTAL_CONCEPTS = ['NetCashProvidedByUsedInInvestingActivi
 const SEC_NET_INCOME_CONCEPTS = ['NetIncomeLoss', 'ProfitLoss'];
 // Diluted checked first, same preference order as findReportedDilutedShares
 // below (basic is only a fallback there too).
-const SEC_SHARES_CONCEPTS = ['WeightedAverageNumberOfDilutedSharesOutstanding', 'WeightedAverageNumberOfSharesOutstandingBasic'];
+// WeightedAverageShares is ifrs-full's own plain name for this (verified
+// live for B/Barrick, see fetchSecUsGaapFacts' own comment) -- checked
+// last since the two us-gaap names above are more specific (basic vs.
+// diluted) when both are available.
+const SEC_SHARES_CONCEPTS = ['WeightedAverageNumberOfDilutedSharesOutstanding', 'WeightedAverageNumberOfSharesOutstandingBasic', 'WeightedAverageShares'];
 // Verified live: SENEA's OWN filing history tags this exact concept in TWO
 // different scales across different years — 10-Qs filed 2023-2024 report
 // val ~7000-8000 ("in thousands", i.e. really ~7-8 million shares), while
@@ -317,9 +321,28 @@ async function fetchSecTickerToCikMap() {
   return map;
 }
 
+// Despite the name (kept for call-site continuity across both this file
+// and generateSectorMetrics.js's identical copy), returns BOTH us-gaap AND
+// ifrs-full concepts merged into one object -- verified live for B
+// (Barrick Mining Corp, formerly Barrick Gold, renamed 2025-04-29): it's a
+// 40-F Canadian filer whose REAL, current FY2025 figures (net income,
+// weighted average shares) are tagged EXCLUSIVELY under ifrs-full
+// (ProfitLoss, WeightedAverageShares) -- its us-gaap facts exist but stop
+// years earlier. Since this enrichment mechanism only ever checked
+// us-gaap, it found nothing for B even once triggered by stale Finnhub
+// coverage, leaving P/E's TTM/quarterly/yearly all frozen at Q3 '24/FY '23
+// while every other metric (sourced from a different code path) stayed
+// current. The concept-candidate lists below already recognize several
+// ifrs-full names alongside their us-gaap equivalents (e.g.
+// SEC_NET_INCOME_CONCEPTS already includes 'ProfitLoss') -- they just
+// never got real ifrs-full data to search through. A same-name collision
+// between the two taxonomies is exceedingly unlikely (separate namespaces,
+// maintained by different standards bodies) and not worth guarding
+// against here; ifrs-full wins on the rare conflict since it's fetched
+// second.
 async function fetchSecUsGaapFacts(cik) {
   const data = await fetchSecJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
-  return data?.facts?.['us-gaap'] || {};
+  return { ...(data?.facts?.['us-gaap'] || {}), ...(data?.facts?.['ifrs-full'] || {}) };
 }
 
 // Same cumulative-vs-exact / same-fy-fp-comparative disambiguation as

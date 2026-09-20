@@ -1538,9 +1538,17 @@ const SEC_CASH_CONCEPTS = ['CashAndCashEquivalentsAtCarryingValue', 'CashAndCash
 const SEC_BANK_NII_CONCEPTS = ['InterestIncomeExpenseNet'];
 const SEC_BANK_NONINTEREST_INCOME_CONCEPTS = ['NoninterestIncome'];
 
+// Despite the name (kept for call-site continuity with generatePfcfTrend
+// Cache.js's identical copy), returns BOTH us-gaap AND ifrs-full concepts
+// merged into one object -- see that file's own comment for the full
+// verified-live rationale (B/Barrick Mining Corp, a 40-F Canadian filer
+// whose real current figures are tagged exclusively under ifrs-full). A
+// same-name collision between the two taxonomies is exceedingly unlikely
+// and not worth guarding against; ifrs-full wins on the rare conflict
+// since it's fetched second.
 async function fetchSecUsGaapFacts(cik) {
   const data = await fetchSecJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
-  return data?.facts?.['us-gaap'] || {};
+  return { ...(data?.facts?.['us-gaap'] || {}), ...(data?.facts?.['ifrs-full'] || {}) };
 }
 
 // Flow (ic/cf) concepts: Finnhub's own quarterly reports are YTD-cumulative
