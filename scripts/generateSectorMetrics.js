@@ -3685,7 +3685,7 @@ async function processSymbol(symbol, apiKey, ctx) {
   const previousNativeForSymbol = previouslyPublishedNativeTrends[symbol] || {};
   const mergedNativeForSymbol = {};
   for (const key of ['roic', 'revenueGrowth', 'profitMargin', 'fcfMargin', 'peRatio', 'pfcfRatio']) {
-    const published = pickTrendToPublish(previousNativeForSymbol[key], freshNativeTrends[key]);
+    const published = pickCadenceMetric(previousNativeForSymbol[key], freshNativeTrends[key]);
     if (published.length) mergedNativeForSymbol[key] = published;
   }
 
@@ -3956,7 +3956,7 @@ async function processSymbol(symbol, apiKey, ctx) {
       // A single metric's oddly-shaped filing shouldn't take down the
       // others — pickTrendToPublish falls back to the previous run.
     }
-    const published = pickTrendToPublish(previousYearlyForSymbol[key], fresh);
+    const published = pickCadenceMetric(previousYearlyForSymbol[key], fresh);
     if (published.length) mergedYearlyForSymbol[key] = published;
   }
   for (const key of Object.keys(quarterlyBuilders)) {
@@ -3967,7 +3967,7 @@ async function processSymbol(symbol, apiKey, ctx) {
       if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG quarterly builder threw', symbol, key, e.message, e.stack);
       // Same graceful-degradation philosophy as above.
     }
-    const published = pickTrendToPublish(previousQuarterlyForSymbol[key], fresh);
+    const published = pickCadenceMetric(previousQuarterlyForSymbol[key], fresh);
     if (published.length) mergedQuarterlyForSymbol[key] = published;
   }
   for (const key of Object.keys(ttmBuilders)) {
@@ -3978,7 +3978,7 @@ async function processSymbol(symbol, apiKey, ctx) {
       if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG ttm builder threw', symbol, key, e.message, e.stack);
       // Same graceful-degradation philosophy as above.
     }
-    const published = pickTrendToPublish(previousTtmForSymbol[key], fresh);
+    const published = pickCadenceMetric(previousTtmForSymbol[key], fresh);
     if (published.length) {
       mergedTtmForSymbol[key] = published;
       // Backfill the CARD value too, not just the trend cache, whenever
