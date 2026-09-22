@@ -2754,14 +2754,21 @@ function buildProfitMarginTTMFromFilings(quarterlyReports, annualReports) {
 // otherwise EXCLUDE the period; every ticker whose netted figure is already
 // positive is completely unaffected (this is a no-op for the vast majority
 // of tickers, which never hit the primary calculation going negative).
-// Genuinely exclude only when even debt+equity alone is non-positive (e.g.
-// negative book equity exceeding debt) — the ISPR/AGEN case, where there's
-// truly no real capital base to measure a return against.
+// Can still come out negative even after that fallback — a real state for
+// a company like IBRX, whose accumulated losses have pushed book equity
+// deeply negative with no offsetting debt (the ISPR/AGEN/CCXI case). This
+// used to return null there and exclude the period entirely; per explicit
+// product decision, it's published instead — every call site below divides
+// by Math.abs(investedCapital) rather than the raw (possibly negative)
+// figure, so EBIT's own sign drives ROIC's sign instead of a negative
+// denominator flipping it (a lossmaking company reads as negative ROIC,
+// not a flattering positive one). Only null on a genuine division-by-zero
+// (debt + equity - cash landing on exactly 0), vanishingly rare.
 function computeInvestedCapital(debt, equity, cash) {
   const netOfCash = debt + equity - cash;
   if (netOfCash > 0) return netOfCash;
   const withoutCash = debt + equity;
-  return withoutCash > 0 ? withoutCash : null;
+  return withoutCash !== 0 ? withoutCash : null;
 }
 
 function buildRoicQuarterlyFromFilings(quarterlyReports, annualReports, isBank) {
@@ -2806,14 +2813,21 @@ function buildRoicQuarterlyFromFilings(quarterlyReports, annualReports, isBank) 
   }
 
   return ebitRecords
-    .filter((r) => investedCapitalByQuarter[`${r.year}-${r.quarter}`] > 0)
+    .filter((r) => {
+      const ic = investedCapitalByQuarter[`${r.year}-${r.quarter}`];
+      return ic != null && ic !== 0;
+    })
     .map((r) => {
       // Annualized (x4) — EBIT/NOPAT is a flow figure that shrinks to ~1/4
       // at quarterly granularity, but Invested Capital is a point-in-time
       // balance-sheet snapshot that doesn't shrink with it; see the
       // identical note in buildRoicQuarterlyFromFilings in src/utils/metrics.js.
       const annualizedNopat = r.ebit * (1 - ROIC_ASSUMED_TAX_RATE) * 4;
-      const value = clampImplausible(annualizedNopat / investedCapitalByQuarter[`${r.year}-${r.quarter}`]);
+      // Math.abs — see computeInvestedCapital's own comment: a negative
+      // invested capital is published (not excluded), with EBIT's own sign
+      // driving ROIC's sign instead of the denominator flipping it.
+      const investedCapital = Math.abs(investedCapitalByQuarter[`${r.year}-${r.quarter}`]);
+      const value = clampImplausible(annualizedNopat / investedCapital);
       return value != null ? { label: calendarQuarterLabel(calendarLabels, r.year, r.quarter), value } : null;
     })
     .filter(Boolean)
@@ -2838,9 +2852,10 @@ function buildRoicYearlyFromFilings(annualReports, isBank) {
       // out for bank filers.
       const cash = isBank ? 0 : findReportedCashBalance(annualReport?.report?.bs || []) || 0;
       const investedCapital = computeInvestedCapital(debt, equity, cash);
-      if (!(investedCapital > 0)) return null;
+      if (investedCapital == null || investedCapital === 0) return null;
       const nopat = r.ebit * (1 - ROIC_ASSUMED_TAX_RATE);
-      const value = clampImplausible(nopat / investedCapital);
+      // Math.abs — see computeInvestedCapital's own comment.
+      const value = clampImplausible(nopat / Math.abs(investedCapital));
       return value != null ? { label: calendarYearlyLabel(calendarLabels, r.year), value } : null;
     })
     .filter(Boolean)
@@ -2875,7 +2890,7 @@ function buildRoicTTMFromFilings(quarterlyReports, annualReports, isBank) {
   }
 
   const standaloneQuarters = Object.keys(ebit)
-    .filter((key) => investedCapitalByQuarter[key] > 0)
+    .filter((key) => investedCapitalByQuarter[key] != null && investedCapitalByQuarter[key] !== 0)
     .map((key) => {
       const [year, quarter] = key.split('-').map(Number);
       return { year, quarter, nopat: ebit[key] * (1 - ROIC_ASSUMED_TAX_RATE), investedCapital: investedCapitalByQuarter[key] };
@@ -2895,7 +2910,8 @@ function buildRoicTTMFromFilings(quarterlyReports, annualReports, isBank) {
       // under the sanity clamp while the properly-annualized quarterly figure
       // for the same quarter was correctly clamped as implausible.
       const ttmNopat = partial ? rawNopat * (4 / quarters.length) : rawNopat;
-      const value = clampImplausible(ttmNopat / anchor.investedCapital);
+      // Math.abs — see computeInvestedCapital's own comment.
+      const value = clampImplausible(ttmNopat / Math.abs(anchor.investedCapital));
       return value != null ? { label: calendarQuarterLabel(calendarLabels, anchor.year, anchor.quarter), value, partial, quartersUsed: quarters.length } : null;
     })
     .filter(Boolean)
