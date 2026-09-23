@@ -2353,6 +2353,16 @@ function findReportedNetIncome(icItems) {
   return labelMatch ? labelMatch.value : null;
 }
 
+// Matches any income-tax-expense concept name (IncomeTaxExpenseBenefit,
+// CurrentIncomeTaxExpenseBenefit, DeferredIncomeTaxExpenseBenefit, a
+// company-specific extension concept containing the same words, etc.) or
+// label text -- deliberately broad, since this is checked for ABSENCE
+// (see findReportedEBIT's pass-through-entity fallback below), where a
+// false NEGATIVE (missing a real tax line this pattern should have caught)
+// is the only failure mode that matters -- a false positive here just
+// means an extra, harmless concept/label happens to mention "tax".
+const HAS_TAX_EXPENSE_PATTERN = /income\s*tax/i;
+
 function findReportedEBIT(icItems) {
   const match = icItems.find((item) => item.concept === 'us-gaap_OperatingIncomeLoss');
   if (match) return match.value;
@@ -2394,7 +2404,32 @@ function findReportedEBIT(icItems) {
   // concept check now catches. Checked by concept name, matching how
   // buildSecSyntheticReports itself labeled the fact.
   const preTaxConceptMatch = icItems.find((item) => SEC_PRETAX_INCOME_CONCEPTS.some((c) => item.concept === `us-gaap_${c}`));
-  return preTaxConceptMatch ? preTaxConceptMatch.value : null;
+  if (preTaxConceptMatch) return preTaxConceptMatch.value;
+
+  // A REIT or other pass-through entity pays no corporate income tax at
+  // all, so its real income statement has no tax-expense line anywhere to
+  // separate pretax income from net income -- they're the same number.
+  // Verified live: ARR (ARMOUR Residential, a mortgage REIT) has no
+  // Operating Income, no pre-tax-income line, AND no income-tax-expense
+  // concept or label anywhere in its real, current, otherwise-complete
+  // income statement (15 substantive line items present, including net
+  // income/EPS/share counts -- a genuinely thin/sparse Finnhub crawl would
+  // plausibly be missing MANY lines across the board, not selectively just
+  // this one). HAS_TAX_EXPENSE_PATTERN checked broadly (concept OR label)
+  // so this only fires on a true absence, not a differently-worded line
+  // this file just doesn't recognize yet. Net income is used AS-IS, not
+  // adjusted -- ROIC_ASSUMED_TAX_RATE is still applied unconditionally
+  // downstream, which for a genuinely tax-exempt filer slightly UNDERSTATES
+  // its real ROIC (never overstates it, and never risks double-taxing a
+  // normal taxable company, since this tier only fires when literally no
+  // tax line exists anywhere in the report).
+  const hasAnyTaxExpenseLine = icItems.some((item) => HAS_TAX_EXPENSE_PATTERN.test(item.concept || '') || HAS_TAX_EXPENSE_PATTERN.test(item.label || ''));
+  if (!hasAnyTaxExpenseLine) {
+    const netIncome = findReportedNetIncome(icItems);
+    if (netIncome != null) return netIncome;
+  }
+
+  return null;
 }
 
 // "IncludingPortionAttributableToNoncontrollingInterest" added -- verified
