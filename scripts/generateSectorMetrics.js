@@ -4502,20 +4502,37 @@ async function main() {
     metrics[symbol] = prevMetrics;
     recoveredFromFailure++;
   }
+  // `metrics[symbol]` is unconditionally set for any successfully-
+  // processed, non-dead ticker (see the worker loop above -- `result.
+  // metrics[symbol] = r.metrics` has no `if` guard the way `result.
+  // nativeTrends[symbol]`/etc. do), so it's a reliable "was this ticker
+  // actually processed this run" signal independent of whether that
+  // ticker's trends specifically came back empty. Added to all 4 trend-
+  // cache restore checks below -- without it, a ticker whose fresh
+  // computation legitimately determines a cadence should now be EMPTY
+  // (e.g. the recency floor correctly suppressing years-stale data once
+  // nothing newer exists) was indistinguishable from a ticker this run
+  // never touched at all, so the "recover from a partial-run failure"
+  // restore silently undid the correct empty result every time, restoring
+  // the old stale data right back. Verified live: PDD's quarterly/ttm
+  // roic+fcfMargin correctly computed to nothing (confirmed via a direct
+  // debug trace showing quarterlyTrends=null/ttmTrends=null) but a real
+  // publish dispatch still republished the original years-stale Q4 '21
+  // point unchanged -- this fallback-restore loop is why.
   for (const [symbol, prevTrends] of Object.entries(previouslyPublished.nativeTrends)) {
-    if (nativeTrends[symbol] || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
+    if (nativeTrends[symbol] || metrics[symbol] || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
     nativeTrends[symbol] = prevTrends;
   }
   for (const [symbol, prevTrends] of Object.entries(previouslyPublished.yearlyTrends)) {
-    if (yearlyTrends[symbol] || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
+    if (yearlyTrends[symbol] || metrics[symbol] || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
     yearlyTrends[symbol] = prevTrends;
   }
   for (const [symbol, prevTrends] of Object.entries(previouslyPublished.quarterlyTrends)) {
-    if (quarterlyTrends[symbol] || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
+    if (quarterlyTrends[symbol] || metrics[symbol] || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
     quarterlyTrends[symbol] = prevTrends;
   }
   for (const [symbol, prevTrends] of Object.entries(previouslyPublished.ttmTrends)) {
-    if (ttmTrends[symbol] || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
+    if (ttmTrends[symbol] || metrics[symbol] || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
     ttmTrends[symbol] = prevTrends;
   }
   if (recoveredFromFailure) {
