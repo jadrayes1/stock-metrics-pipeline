@@ -1510,7 +1510,7 @@ const SEC_PRETAX_INCOME_CONCEPTS = [
   'IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments',
 ];
 const SEC_OCF_CONCEPTS = OPERATING_SUBTOTAL_CONCEPTS.map((c) => c.replace(/^us-gaap_/, ''));
-const SEC_CAPEX_CONCEPTS = ['PaymentsToAcquirePropertyPlantAndEquipment', 'PaymentsToAcquireProductiveAssets', 'PaymentsForCapitalImprovements', 'PaymentsToAcquireOtherPropertyPlantAndEquipment'];
+const SEC_CAPEX_CONCEPTS = ['PaymentsToAcquirePropertyPlantAndEquipment', 'PaymentsToAcquireProductiveAssets', 'PaymentsForCapitalImprovements', 'PaymentsToAcquireOtherPropertyPlantAndEquipment', 'PaymentsToAcquireRealEstateAndRealEstateJointVentures'];
 // Same "no Investing Activities section at all -> capex defaults to $0"
 // reasoning as findReportedCapexQ's own comment (the SPRO fix), applied at
 // the SEC-synthesis layer -- verified live: SGLY never tags ANY of
@@ -1947,6 +1947,13 @@ function findReportedCapexQ(cfItems) {
     // Verified live: JTAI (Jet.AI) tags capitalized software/IP spend under
     // this standard concept in its 2023-2024 10-Qs instead of any PP&E variant.
     'us-gaap_PaymentsToAcquireIntangibleAssets',
+    // Verified live: CHCI (Comstock Holding Companies, a real-estate
+    // developer/asset manager) stopped tagging PaymentsToAcquireProperty
+    // PlantAndEquipment after 2019 (real PP&E growth continued per its
+    // balance sheet, just no longer funneled through that concept) and
+    // tags its actual, current, much larger capex-equivalent spend here
+    // instead -- e.g. $3.37M (Q1 '26), $11.86M (Q2 '26), real and current.
+    'us-gaap_PaymentsToAcquireRealEstateAndRealEstateJointVentures',
   ];
   // Summed rather than first-match — verified live: DAL splits its real
   // capex across TWO simultaneous lines ("Flight equipment, including

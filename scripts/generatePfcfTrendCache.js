@@ -104,7 +104,7 @@ const RECENT_GAP_SCAN_ENTRIES = 16;
 const EXPECTED_QUARTERLY_GAP_DAYS = 200;
 const MID_SEQUENCE_GAP_RECENT_YEARS = 2;
 const SEC_OCF_CONCEPTS = ['NetCashProvidedByUsedInOperatingActivities', 'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'];
-const SEC_CAPEX_CONCEPTS = ['PaymentsToAcquirePropertyPlantAndEquipment', 'PaymentsToAcquireProductiveAssets', 'PaymentsForCapitalImprovements', 'PaymentsToAcquireOtherPropertyPlantAndEquipment'];
+const SEC_CAPEX_CONCEPTS = ['PaymentsToAcquirePropertyPlantAndEquipment', 'PaymentsToAcquireProductiveAssets', 'PaymentsForCapitalImprovements', 'PaymentsToAcquireOtherPropertyPlantAndEquipment', 'PaymentsToAcquireRealEstateAndRealEstateJointVentures'];
 const SEC_INVESTING_SUBTOTAL_CONCEPTS = ['NetCashProvidedByUsedInInvestingActivities', 'NetCashProvidedByUsedInInvestingActivitiesContinuingOperations'];
 // P/E's numerator -- same SEC-XBRL enrichment benefit P/FCF's OCF/capex/
 // shares already get for sparse/stale Finnhub coverage.
@@ -720,6 +720,11 @@ function findReportedCapexQ(cfItems) {
     'us-gaap_PaymentsForFlightEquipment',
     'us-gaap_PaymentsToAcquireOtherProductiveAssets',
     'us-gaap_PaymentsToAcquireIntangibleAssets',
+    // Verified live: CHCI (Comstock Holding Companies) tags its real,
+    // current, much larger capex-equivalent spend here instead of any PP&E
+    // variant -- see the identical addition + comment in
+    // generateSectorMetrics.js's own findReportedCapexQ.
+    'us-gaap_PaymentsToAcquireRealEstateAndRealEstateJointVentures',
   ];
   // Summed rather than first-match — verified live: DAL splits its real
   // capex across TWO simultaneous lines ("Flight equipment, including
