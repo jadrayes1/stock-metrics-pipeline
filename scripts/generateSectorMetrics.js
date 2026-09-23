@@ -1909,6 +1909,17 @@ function findReportedRevenue(icItems) {
   if (netInterestIncome && nonInterestIncome) {
     return netInterestIncome.value + nonInterestIncome.value;
   }
+  // A mortgage REIT (verified live: ARR/ARMOUR Residential) has no separate
+  // non-interest-income line at all -- Net Interest Income alone genuinely
+  // IS its complete top line (Finnhub's own reported label for this exact
+  // concept literally reads "Net Interest Income", not a partial figure
+  // needing anything added to it). Only used when nonInterestIncome is
+  // absent from the report ENTIRELY, not just null-valued, so a real bank
+  // whose non-interest income happens to be a genuine (rare) zero for one
+  // quarter still gets the combined figure above, never this narrower one.
+  if (netInterestIncome && !nonInterestIncome) {
+    return netInterestIncome.value;
+  }
 
   return null;
 }
