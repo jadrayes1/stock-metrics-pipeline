@@ -2721,6 +2721,9 @@ function buildRevenueGrowthQuarterlyFromFilings(quarterlyReports, annualReports)
 function buildRevenueGrowthYearlyFromFilings(annualReports) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(null, annualReports);
   const records = buildAnnualFlowPoints(annualReports, { revenue: { fn: findReportedRevenue, section: 'ic' } });
+  if (process.env.DEBUG_SEC_ENRICHMENT) {
+    console.error('DEBUG buildRevenueGrowthYearlyFromFilings records', JSON.stringify(records));
+  }
   const points = [];
   for (let i = 1; i < records.length; i++) {
     if (records[i].year !== records[i - 1].year + 1) continue;
