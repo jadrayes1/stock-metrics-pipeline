@@ -4420,9 +4420,17 @@ async function main() {
   // merges just the target symbol's fresh entry into the currently-
   // published gist files instead of copying these local files verbatim.
   if (process.env.TARGET_SYMBOL) {
-    const target = process.env.TARGET_SYMBOL.toUpperCase();
-    symbols = symbols.filter((s) => s.toUpperCase() === target);
-    console.log(`TARGET_SYMBOL=${target} set — restricting this run to: ${symbols.join(', ') || '(not found in universe)'}`);
+    // Comma-split, matching DEBUG_TRACE_SYMBOL's own parsing a few dozen
+    // lines below in this same file -- this branch never had it. Verified
+    // live 2026-09-26: dispatching symbol=MAAS,ADUR compared every real
+    // ticker against the literal, un-split string "MAAS,ADUR", matched
+    // nothing, and silently ran the rest of this script against zero
+    // symbols -- no crash, no error, just "(not found in universe)" in the
+    // log and a no-op publish (mergeSingleSymbolIntoGist.js had the
+    // identical gap, fixed separately).
+    const targets = new Set(process.env.TARGET_SYMBOL.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean));
+    symbols = symbols.filter((s) => targets.has(s.toUpperCase()));
+    console.log(`TARGET_SYMBOL set — restricting this run to: ${symbols.join(', ') || '(none found in universe)'}`);
   }
   console.log(
     `Fetching industry + fundamentals + DCF inputs for ${symbols.length} tickers across ${apiKeys.length} API key(s) ` +
