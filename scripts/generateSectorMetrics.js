@@ -804,12 +804,38 @@ function fixMislabeledQuarterlyYears(quarterlyReports, annualReports) {
   });
 }
 
+// AVAH (Aveanna Healthcare) files on a 52/53-week fiscal calendar -- its
+// real FY2025 ends 2026-01-03 (three days into the next calendar year, all
+// but 3 of its ~371 days fall in 2025), and Finnhub tags this report's
+// year as 2026 (the raw end-date's calendar year) instead of 2025 (the
+// year the fiscal period is actually named after). Verified live: this
+// leaves years [2022, 2023, 2024, 2026] with a GAP where 2025 should be --
+// not a duplicate-year collision (fixMislabeledAnnualYears' own trigger
+// above, which only fires when two reports collide onto the same year),
+// so that existing, more general fix never touches this. profitMargin/
+// fcfMargin/roic are unaffected since they're single-year ratios with no
+// year-over-year pairing requirement; revenueGrowth's own year===year-1+1
+// adjacency guard has no valid pair to use the mislabeled 2026 entry with,
+// so it silently comes back completely empty. Narrowly scoped to this one
+// ticker and this one verified end date rather than a general "January
+// year-end" rule, which risks misclassifying a genuinely different real
+// fiscal-calendar shape for some other filer.
+function fixAvahMislabeledFiscalYear(symbol, reports) {
+  if (symbol !== 'AVAH') return reports;
+  return (reports || []).map((r) => {
+    if (r.year !== 2026 || !r.endDate) return r;
+    const end = new Date(r.endDate);
+    const isEarlyJan2026 = end.getUTCFullYear() === 2026 && end.getUTCMonth() === 0 && end.getUTCDate() <= 10;
+    return isEarlyJan2026 ? { ...r, year: 2025 } : r;
+  });
+}
+
 async function fetchReportedFinancialsFor(symbol, apiKey) {
   const requestSymbol = resolveFinancialsReportedSymbol(symbol);
   const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${requestSymbol}&freq=annual&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
-  return fixMislabeledAnnualYears(normalizeReportedFinancials(Array.isArray(data?.data) ? data.data : []));
+  return fixAvahMislabeledFiscalYear(symbol, fixMislabeledAnnualYears(normalizeReportedFinancials(Array.isArray(data?.data) ? data.data : [])));
 }
 
 // ---------------------------------------------------------------------------
