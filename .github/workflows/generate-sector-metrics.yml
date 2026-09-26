@@ -195,7 +195,16 @@ jobs:
       # required. This job now only needs to publish dcfCapCandidates.json
       # (below) so that workflow knows which tickers to look up.
 
+      # Skipped for a symbol/debugTraceSymbol dispatch -- neither one writes
+      # a real src/data/marketMetrics.json (a debugTraceSymbol run exits
+      # early before ever reaching that write; a symbol-only run's local
+      # files aren't a valid whole-universe snapshot either -- see
+      # mergeSingleSymbolIntoGist.js's own header). Verified live
+      # 2026-09-26: a debugTraceSymbol=CAR dispatch crashed here with
+      # ENOENT on marketMetrics.json -- this step only ever makes sense
+      # against a full-universe run's real output.
       - name: Audit metric coverage
+        if: ${{ !inputs.symbol && !inputs.debugTraceSymbol }}
         run: node scripts/auditMetricsCoverage.js
 
       # Git-based push, not `gh gist edit` (which goes through the Gist API
@@ -218,7 +227,19 @@ jobs:
       # ones directly (rather than via `git diff --cached`, which would
       # always show everything as new against an orphan branch's empty
       # history) so an unchanged day still skips the force-push.
+      # Skipped for a debugTraceSymbol-only dispatch -- that mode's own
+      # documented contract is "print its result/error, then exit early
+      # without publishing" (see DEBUG_TRACE_SYMBOL in
+      # generateSectorMetrics.js), but this step's own branching only ever
+      # checked TARGET_SYMBOL (inputs.symbol), so a debugTraceSymbol-only
+      # run (inputs.symbol empty) fell through to the full-universe branch
+      # below and would have crashed diffing a marketMetrics.json that
+      # debugTraceSymbol mode never wrote -- same ENOENT shape as the
+      # Audit-metric-coverage step just above, just one step later. A
+      # symbol-only (TARGET_SYMBOL) dispatch is unaffected -- it still runs
+      # this step normally via its own existing branch below.
       - name: Publish to gist
+        if: ${{ !inputs.debugTraceSymbol }}
         env:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
