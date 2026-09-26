@@ -822,6 +822,9 @@ function fixMislabeledQuarterlyYears(quarterlyReports, annualReports) {
 // fiscal-calendar shape for some other filer.
 function fixAvahMislabeledFiscalYear(symbol, reports) {
   if (symbol !== 'AVAH') return reports;
+  if (process.env.DEBUG_SEC_ENRICHMENT) {
+    console.error('DEBUG fixAvahMislabeledFiscalYear input', JSON.stringify((reports || []).map((r) => ({ year: r.year, startDate: r.startDate, endDate: r.endDate, cik: r.cik }))));
+  }
   return (reports || []).map((r) => {
     if (r.year !== 2026 || !r.endDate) return r;
     const end = new Date(r.endDate);
