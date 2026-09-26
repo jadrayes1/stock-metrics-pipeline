@@ -1980,8 +1980,18 @@ function findReportedCapexQ(cfItems) {
   // company-specific extension concept, never a standard us-gaap one, so
   // only a label match can catch it -- same class of gap "flight equipment"
   // was added for DAL, just a different phrasing.
+  //
+  // "investment in vehicles" added for CAR (Avis Budget Group) -- verified
+  // live: its real cash flow statement tags fleet purchases under a
+  // company-specific extension (car_InvestmentInVehicles, ~$7.8B/half-year
+  // -- roughly 70x its much smaller, separately-tagged "Property and
+  // equipment additions" line), never any standard us-gaap concept, so
+  // this too can only be caught by label. The dominant capex line for any
+  // rental-car business, not a minor one -- fcfMargin/P-FCF were
+  // completely null without it despite Finnhub's own native fcfMargin
+  // metric (a different calculation) showing real data.
   const labelMatch = cfItems.find((item) =>
-    /purchases? of property|payments? (for|to) acquire (other )?property|capital expenditures|capital spending|capital improvements|flight equipment|deposits? (on|for) aircraft/i.test(
+    /purchases? of property|payments? (for|to) acquire (other )?property|capital expenditures|capital spending|capital improvements|flight equipment|deposits? (on|for) aircraft|investment in vehicles/i.test(
       item.label || ''
     )
   );

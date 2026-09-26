@@ -740,8 +740,12 @@ function findReportedCapexQ(cfItems) {
   // company-specific extension concept (JTAI_PaymentsForOtherDepositsOnAircraft),
   // never a standard us-gaap one, so only a label match can catch it -- same
   // class of gap "flight equipment" was added for DAL, just a different phrasing.
+  // "investment in vehicles" added for CAR (Avis Budget Group) -- verified
+  // live: its dominant capex line (~$7.8B/half-year, ~70x its much smaller
+  // separately-tagged PP&E line) is tagged car_InvestmentInVehicles, a
+  // custom extension never exposed via companyfacts.
   const labelMatch = cfItems.find((item) =>
-    /purchases? of property|payments? (for|to) acquire (other )?property|capital expenditures|capital spending|capital improvements|flight equipment|deposits? (on|for) aircraft/i.test(
+    /purchases? of property|payments? (for|to) acquire (other )?property|capital expenditures|capital spending|capital improvements|flight equipment|deposits? (on|for) aircraft|investment in vehicles/i.test(
       item.label || ''
     )
   );
