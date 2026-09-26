@@ -4273,14 +4273,23 @@ async function processSymbol(symbol, apiKey, ctx) {
     // comment above -- LARGER in magnitude than MAAS's wrong value, so a
     // fixed clamp threshold can't tell these apart; only a second,
     // independently-computed source that either agrees (ASST -- nothing
-    // to compare against disagrees) or disagrees (MAAS) can). ADUR shows
-    // the identical shape (-6340% raw vs. -52.5% reconstructed, ~121x).
+    // to compare against disagrees) or disagrees (MAAS) can). ADUR looked
+    // like the same shape at first glance (-6340% raw vs. -5253%
+    // reconstructed) but turned out NOT to be a bug at all once verified
+    // against its real SEC data: revenue of just CAD 231,212 against a
+    // CAD 12.1M net loss for FY'25 genuinely produces a -5253% margin,
+    // and the two only disagree by ~1.2x (a real, tiny, cash-burning
+    // company with declining revenue -- Finnhub's more current TTM window
+    // being somewhat worse than the last full fiscal year is unsurprising,
+    // not a red flag). The 10x threshold below is deliberately picked to
+    // sit comfortably above that kind of normal cross-period variance
+    // while still being nowhere near MAAS's ~132x.
     // Checks this run's own reconstruction first (TTM -> quarterly ->
     // yearly, matching every other fallback's own preference order in
     // this file), then foreignFilingsCache's, so either source of truth
     // can catch this regardless of which pipeline actually covers a given
     // ticker well.
-    const MARGIN_DISCREPANCY_RATIO = 10; // one differs from the other by more than 10x -- comfortably outside normal estimation-method noise between Finnhub's own TTM figure and this pipeline's from-scratch reconstruction, comfortably below MAAS/ADUR's ~120-130x
+    const MARGIN_DISCREPANCY_RATIO = 10; // one differs from the other by more than 10x -- comfortably outside normal estimation-method/cross-period noise (ADUR's real ~1.2x), comfortably below a genuine data bug (MAAS's ~132x)
     for (const key of ['profitMargin', 'fcfMargin']) {
       if (values[key] == null) continue;
       const latest = (points) => (points?.length ? points[points.length - 1].value : null);
