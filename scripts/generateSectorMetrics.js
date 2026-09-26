@@ -4258,6 +4258,41 @@ async function processSymbol(symbol, apiKey, ctx) {
     if (values.revenueGrowth == null) values.revenueGrowth = latestForeignFilingsMetric('revenueGrowth');
     if (values.profitMargin == null) values.profitMargin = latestForeignFilingsMetric('profitMargin');
     if (values.fcfMargin == null) values.fcfMargin = latestForeignFilingsMetric('fcfMargin');
+
+    // profitMargin/fcfMargin's raw scalar (extractMetricValues, above) is
+    // relayed directly from Finnhub's own pre-computed current.
+    // netProfitMarginTTM/fcfMargin field -- NOT independently computed by
+    // this pipeline at all, unlike every other value here. Verified live:
+    // MAAS's raw Finnhub netProfitMarginTTM was -3320% while this
+    // pipeline's OWN from-scratch reconstruction (real, matched net
+    // income/revenue from the SAME Finnhub financials-reported data)
+    // correctly computes -25.09% -- a ~132x disagreement, meaning
+    // Finnhub's own pre-computed figure is wrong at the source for this
+    // ticker, not a genuinely extreme-but-real case like ASST's (whose
+    // real profitMargin/fcfMargin is ~-13,250%, per MAX_ABS_RATIO's own
+    // comment above -- LARGER in magnitude than MAAS's wrong value, so a
+    // fixed clamp threshold can't tell these apart; only a second,
+    // independently-computed source that either agrees (ASST -- nothing
+    // to compare against disagrees) or disagrees (MAAS) can). ADUR shows
+    // the identical shape (-6340% raw vs. -52.5% reconstructed, ~121x).
+    // Checks this run's own reconstruction first (TTM -> quarterly ->
+    // yearly, matching every other fallback's own preference order in
+    // this file), then foreignFilingsCache's, so either source of truth
+    // can catch this regardless of which pipeline actually covers a given
+    // ticker well.
+    const MARGIN_DISCREPANCY_RATIO = 10; // one differs from the other by more than 10x -- comfortably outside normal estimation-method noise between Finnhub's own TTM figure and this pipeline's from-scratch reconstruction, comfortably below MAAS/ADUR's ~120-130x
+    for (const key of ['profitMargin', 'fcfMargin']) {
+      if (values[key] == null) continue;
+      const latest = (points) => (points?.length ? points[points.length - 1].value : null);
+      const reconstructed = latest(mergedTtmForSymbol[key]) ?? latest(mergedQuarterlyForSymbol[key]) ?? latest(mergedYearlyForSymbol[key]) ?? latestForeignFilingsMetric(key);
+      if (reconstructed == null) continue;
+      const reconstructedAbs = Math.abs(reconstructed);
+      if (reconstructedAbs === 0) continue; // no useful baseline to compare a ratio against
+      if (Math.abs(values[key]) / reconstructedAbs > MARGIN_DISCREPANCY_RATIO) {
+        values[key] = reconstructed;
+        cardValuesReconstructed = true;
+      }
+    }
   }
 
   return {
