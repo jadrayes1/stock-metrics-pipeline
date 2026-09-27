@@ -804,41 +804,52 @@ function fixMislabeledQuarterlyYears(quarterlyReports, annualReports) {
   });
 }
 
-// AVAH (Aveanna Healthcare) files on a 52/53-week fiscal calendar -- its
-// real FY2025 ends 2026-01-03 (three days into the next calendar year, all
-// but 3 of its ~371 days fall in 2025), and Finnhub tags this report's
-// year as 2026 (the raw end-date's calendar year) instead of 2025 (the
-// year the fiscal period is actually named after). Verified live: this
-// leaves years [2022, 2023, 2024, 2026] with a GAP where 2025 should be --
-// not a duplicate-year collision (fixMislabeledAnnualYears' own trigger
-// above, which only fires when two reports collide onto the same year),
-// so that existing, more general fix never touches this. profitMargin/
-// fcfMargin/roic are unaffected since they're single-year ratios with no
-// year-over-year pairing requirement; revenueGrowth's own year===year-1+1
-// adjacency guard has no valid pair to use the mislabeled 2026 entry with,
-// so it silently comes back completely empty. Narrowly scoped to this one
-// ticker and this one verified end date rather than a general "January
-// year-end" rule, which risks misclassifying a genuinely different real
-// fiscal-calendar shape for some other filer.
-function fixAvahMislabeledFiscalYear(symbol, reports) {
-  if (symbol !== 'AVAH') return reports;
-  if (process.env.DEBUG_SEC_ENRICHMENT) {
-    console.error('DEBUG fixAvahMislabeledFiscalYear input', JSON.stringify((reports || []).map((r) => ({ year: r.year, startDate: r.startDate, endDate: r.endDate, cik: r.cik }))));
-  }
-  return (reports || []).map((r) => {
-    if (r.year !== 2026 || !r.endDate) return r;
-    const end = new Date(r.endDate);
-    const isEarlyJan2026 = end.getUTCFullYear() === 2026 && end.getUTCMonth() === 0 && end.getUTCDate() <= 10;
-    return isEarlyJan2026 ? { ...r, year: 2025 } : r;
-  });
-}
-
 async function fetchReportedFinancialsFor(symbol, apiKey) {
   const requestSymbol = resolveFinancialsReportedSymbol(symbol);
   const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${requestSymbol}&freq=annual&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
-  return fixAvahMislabeledFiscalYear(symbol, fixMislabeledAnnualYears(normalizeReportedFinancials(Array.isArray(data?.data) ? data.data : [])));
+  return fixMislabeledAnnualYears(normalizeReportedFinancials(Array.isArray(data?.data) ? data.data : []));
+}
+
+// AVAH (Aveanna Healthcare) files on a 52/53-week fiscal calendar -- its
+// real FY2025 ends 2026-01-03 (three days into the next calendar year),
+// and BOTH Finnhub's own financials-reported "year" field AND SEC's own
+// raw XBRL `fy` tag independently mislabel this report as 2026 -- verified
+// against AVAH's own 10-K prose, which refers to this period as "fiscal
+// 2025" twice and never once as "fiscal 2026". Applied here (after CIK-
+// continuity normalization, on the fully-merged annualReportedFinancials),
+// not inside fetchReportedFinancialsFor, because the separate SEC-XBRL
+// enrichment path (buildSecSyntheticReports) reads that same raw `fy` tag
+// directly and would otherwise inject its OWN, still-mislabeled "2026"
+// entry alongside Finnhub's now-corrected one, creating a real (year,
+// revenue)-duplicate rather than fixing the gap -- confirmed live: two
+// entries with the exact same revenue, one relabeled to 2025 and one
+// still 2026, made revenueGrowth compute a spurious 2025->2026 "growth" of
+// exactly 0%. Deduping keeps whichever source's entry appears first; both
+// represent the same already-reconciled real period. Not a duplicate-year
+// collision in fixMislabeledAnnualYears' own sense (that fires when two
+// SEPARATE real fiscal years collide onto one label) -- this is one real
+// fiscal year mislabeled by two independent sources, closing a GAP rather
+// than resolving a collision. Narrowly scoped to this one ticker and this
+// one verified end date rather than a general "January year-end" rule,
+// which risks misclassifying a genuinely different real fiscal-calendar
+// shape for some other filer.
+function fixAvahMislabeledFiscalYear(symbol, reports) {
+  if (symbol !== 'AVAH') return reports;
+  const corrected = (reports || []).map((r) => {
+    if (r.year !== 2026 || !r.endDate) return r;
+    const end = new Date(r.endDate);
+    const isEarlyJan2026 = end.getUTCFullYear() === 2026 && end.getUTCMonth() === 0 && end.getUTCDate() <= 10;
+    return isEarlyJan2026 ? { ...r, year: 2025 } : r;
+  });
+  const seenYears = new Set();
+  return corrected.filter((r) => {
+    if (r.year == null) return true;
+    if (seenYears.has(r.year)) return false;
+    seenYears.add(r.year);
+    return true;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -3960,6 +3971,7 @@ async function processSymbol(symbol, apiKey, ctx) {
   // CIK for both the old and new filer entity).
   quarterlyFinancials = normalizeCikContinuity(symbol, quarterlyFinancials);
   annualReportedFinancials = normalizeCikContinuity(symbol, annualReportedFinancials);
+  annualReportedFinancials = fixAvahMislabeledFiscalYear(symbol, annualReportedFinancials);
 
   // Cross-cadence derivation — fills a missing quarter/year using ONLY real
   // arithmetic on already-known real (or SEC-enriched, from above) facts,
