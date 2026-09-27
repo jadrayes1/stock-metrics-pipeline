@@ -809,7 +809,11 @@ async function fetchReportedFinancialsFor(symbol, apiKey) {
   const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${requestSymbol}&freq=annual&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
-  return fixMislabeledAnnualYears(normalizeReportedFinancials(Array.isArray(data?.data) ? data.data : []));
+  const fixed = fixMislabeledAnnualYears(normalizeReportedFinancials(Array.isArray(data?.data) ? data.data : []));
+  if (process.env.DEBUG_SEC_ENRICHMENT) {
+    console.error(`DEBUG fetchReportedFinancialsFor(${symbol}) raw annual reports`, JSON.stringify(fixed.map((r) => ({ year: r.year, startDate: r.startDate, endDate: r.endDate }))));
+  }
+  return fixed;
 }
 
 // AVAH (Aveanna Healthcare) files on a 52/53-week fiscal calendar -- its
