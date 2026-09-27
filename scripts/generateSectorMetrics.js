@@ -809,11 +809,7 @@ async function fetchReportedFinancialsFor(symbol, apiKey) {
   const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/financials-reported?symbol=${requestSymbol}&freq=annual&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
-  const fixed = fixMislabeledAnnualYears(normalizeReportedFinancials(Array.isArray(data?.data) ? data.data : []));
-  if (process.env.DEBUG_SEC_ENRICHMENT) {
-    console.error(`DEBUG fetchReportedFinancialsFor(${symbol}) raw annual reports`, JSON.stringify(fixed.map((r) => ({ year: r.year, startDate: r.startDate, endDate: r.endDate }))));
-  }
-  return fixed;
+  return fixMislabeledAnnualYears(normalizeReportedFinancials(Array.isArray(data?.data) ? data.data : []));
 }
 
 // AVAH (Aveanna Healthcare) files on a 52/53-week fiscal calendar -- its
@@ -846,6 +842,41 @@ function fixAvahMislabeledFiscalYear(symbol, reports) {
     const end = new Date(r.endDate);
     const isEarlyJan2026 = end.getUTCFullYear() === 2026 && end.getUTCMonth() === 0 && end.getUTCDate() <= 10;
     return isEarlyJan2026 ? { ...r, year: 2025 } : r;
+  });
+  const seenYears = new Set();
+  return corrected.filter((r) => {
+    if (r.year == null) return true;
+    if (seenYears.has(r.year)) return false;
+    seenYears.add(r.year);
+    return true;
+  });
+}
+
+// STX (Seagate Technology) shows the same symptom as AVAH -- yearly
+// profitMargin/fcfMargin/roic all real, yearly revenueGrowth completely
+// empty -- but via a genuinely different, unpredictable mechanism, not a
+// January-crossing fiscal calendar (STX's fiscal year ends in late June,
+// no calendar-year-boundary ambiguity at all). Verified live: Finnhub
+// tags the real period 2024-06-29 to 2025-06-27 as year 2027 -- not even
+// internally consistent with SEC's own raw XBRL for the same period,
+// which shows fy=2027 in one filing and fy=2026 in another (neither
+// matches the real period's own calendar year, 2025). profitMargin/
+// fcfMargin/roic are unaffected because their DISPLAY label comes from
+// the real end date directly (no ambiguity to obscure here, unlike AVAH's
+// January-adjacent case) -- only revenueGrowth's year===year-1+1 adjacency
+// guard actually depends on the mislabeled fiscal-KEY year, which has no
+// valid neighbor at 2027, so it silently comes back empty for what would
+// otherwise be a current, real point. Narrowly scoped to this one ticker
+// and this one verified end date, same "AVAH-only" precedent as above --
+// this Finnhub/SEC tagging glitch has no predictable pattern (unlike a
+// January fiscal-year-end) to generalize a rule from safely.
+function fixStxMislabeledFiscalYear(symbol, reports) {
+  if (symbol !== 'STX') return reports;
+  const corrected = (reports || []).map((r) => {
+    if (r.year !== 2027 || !r.endDate) return r;
+    const end = new Date(r.endDate);
+    const isRealFy2025End = end.getUTCFullYear() === 2025 && end.getUTCMonth() === 5; // June
+    return isRealFy2025End ? { ...r, year: 2025 } : r;
   });
   const seenYears = new Set();
   return corrected.filter((r) => {
@@ -3976,6 +4007,7 @@ async function processSymbol(symbol, apiKey, ctx) {
   quarterlyFinancials = normalizeCikContinuity(symbol, quarterlyFinancials);
   annualReportedFinancials = normalizeCikContinuity(symbol, annualReportedFinancials);
   annualReportedFinancials = fixAvahMislabeledFiscalYear(symbol, annualReportedFinancials);
+  annualReportedFinancials = fixStxMislabeledFiscalYear(symbol, annualReportedFinancials);
 
   // Cross-cadence derivation — fills a missing quarter/year using ONLY real
   // arithmetic on already-known real (or SEC-enriched, from above) facts,
