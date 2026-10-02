@@ -846,6 +846,53 @@ function findReportedDilutedShares(icItems) {
   return null;
 }
 
+// Narrow SEC-XBRL fallback for a report that EXISTS (real Finnhub coverage)
+// but whose own `ic` array has no usable shares count -- same "Finnhub
+// tagged the wrong statement as ic" root cause verified live for NFG in
+// generateSectorMetrics.js (its real income statement, with Revenue/
+// Operating Income/share counts, was never the section Finnhub's crawl
+// extracted; only its Statement of Comprehensive Income was). Mirrors that
+// file's findReportsMissingRevenue/fillMissingRevenueInExistingReports
+// shape exactly, reusing THIS file's own SEC_SHARES_CONCEPTS/
+// MIN_PLAUSIBLE_SHARES (shares live under units.shares, not units.USD --
+// see buildSecSyntheticPfcfReports' own fact lookup just above). The broad
+// sparse-ticker enrichment above can't reach this case: NFG has 48
+// quarterly + 16 annual real reports, nowhere near
+// SEC_ENRICHMENT_SPARSE_QUARTERLY_THRESHOLD -- every period already
+// "exists", just without a usable shares line for findReportedDilutedShares
+// to find, which is exactly what this narrow fix targets instead.
+function findReportsMissingShares(reports) {
+  return (reports || []).filter((r) => r?.startDate && r?.endDate && r.report?.ic?.length && findReportedDilutedShares(r.report.ic) == null);
+}
+
+async function fetchSecSharesFactsByPeriod(cik) {
+  const data = await fetchSecJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
+  const gaap = data?.facts?.['us-gaap'] || {};
+  const byPeriod = new Map();
+  for (const concept of SEC_SHARES_CONCEPTS) {
+    const facts = gaap[concept]?.units?.shares || [];
+    for (const f of facts) {
+      if (f.val == null || f.val < MIN_PLAUSIBLE_SHARES || !f.start || !f.end) continue;
+      const key = `${f.start}|${f.end}`;
+      if (!byPeriod.has(key)) byPeriod.set(key, f.val);
+    }
+  }
+  return byPeriod;
+}
+
+function fillMissingSharesInExistingReports(reports, byPeriod) {
+  let filled = 0;
+  for (const r of findReportsMissingShares(reports)) {
+    const start = r.startDate.slice(0, 10);
+    const end = r.endDate.slice(0, 10);
+    const value = byPeriod.get(`${start}|${end}`);
+    if (value == null) continue;
+    r.report.ic.push({ concept: 'us-gaap_WeightedAverageNumberOfDilutedSharesOutstanding', label: 'Weighted Average Diluted Shares (SEC XBRL fallback)', value });
+    filled++;
+  }
+  return filled;
+}
+
 // A real quarter is ~90-92 days; a YTD-cumulative Q2/Q3 report spans ~181/272
 // days -- comfortable separation for telling the two apart from a report's
 // own startDate/endDate. (STANDALONE_QUARTER_MAX_DAYS itself now declared
@@ -1537,6 +1584,28 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
         const merged = mergeSyntheticPfcfReports(quarterlyReports, annualReports, synthesized);
         quarterlyReports = merged.quarterlyReports;
         annualReports = merged.annualReports;
+      }
+    }
+
+    // Narrow fix for a report that EXISTS but has no usable shares line --
+    // see findReportsMissingShares' own comment. Independent of (and run
+    // regardless of) the broad sparse-ticker enrichment above, since a
+    // ticker like NFG has plenty of real reports and would never trigger
+    // that block at all.
+    {
+      const reportsMissingShares = [...findReportsMissingShares(quarterlyReports), ...findReportsMissingShares(annualReports)];
+      if (reportsMissingShares.length) {
+        const cik = secTickerToCikMap.get((RENAMED_TICKER_FINANCIALS_ALIASES[symbol] || symbol).toUpperCase()) || secTickerToCikMap.get(symbol.toUpperCase());
+        if (cik) {
+          const byPeriod = await fetchSecSharesFactsByPeriod(cik);
+          if (byPeriod.size) {
+            const filledQ = fillMissingSharesInExistingReports(quarterlyReports, byPeriod);
+            const filledA = fillMissingSharesInExistingReports(annualReports, byPeriod);
+            if (filledQ || filledA) {
+              console.log(`  ${symbol}: filled missing shares into ${filledQ} quarterly + ${filledA} annual existing report(s) from SEC (Finnhub tagged the wrong statement as 'ic')`);
+            }
+          }
+        }
       }
     }
 

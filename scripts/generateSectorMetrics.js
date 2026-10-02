@@ -1415,6 +1415,53 @@ function fillMissingRevenueInExistingReports(reports, byPeriod) {
   return filled;
 }
 
+// Same shape as findReportsMissingRevenue/fetchSecRevenueFactsByPeriod/
+// fillMissingRevenueInExistingReports above, for EBIT instead of revenue --
+// verified live NFG's gap isn't actually limited to revenue: the exact same
+// "Finnhub tagged the wrong statement (Statement of Comprehensive Income)
+// as ic" root cause also means its real income statement's Operating
+// Income line is never present, blocking roic specifically (the only one
+// of the 4 cadence metrics that needs EBIT -- revenueGrowth/profitMargin/
+// fcfMargin only need revenue/netIncome/ocf/capex, all otherwise present or
+// already backfilled above). SEC_EBIT_CONCEPTS already exists (used by the
+// broad sparse-ticker enrichment below) -- reused here as-is, not
+// redefined, so both paths stay in sync automatically. findReportedEBIT's
+// own pretax-income/no-tax-line fallbacks still apply unmodified once this
+// injects a real OperatingIncomeLoss fact -- this only needs to cover the
+// concept-match tier, the same way the revenue fix only ever injects
+// us-gaap_Revenues (findReportedRevenue's own fallbacks handle the rest).
+function findReportsMissingEbit(reports) {
+  return (reports || []).filter((r) => r?.startDate && r?.endDate && r.report?.ic?.length && findReportedEBIT(r.report.ic) == null);
+}
+
+async function fetchSecEbitFactsByPeriod(cik) {
+  const data = await fetchSecJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
+  const gaap = data?.facts?.['us-gaap'] || {};
+  const byPeriod = new Map();
+  for (const concept of SEC_EBIT_CONCEPTS) {
+    const facts = gaap[concept]?.units?.USD || [];
+    for (const f of facts) {
+      if (f.val == null || !f.start || !f.end) continue;
+      const key = `${f.start}|${f.end}`;
+      if (!byPeriod.has(key)) byPeriod.set(key, f.val);
+    }
+  }
+  return byPeriod;
+}
+
+function fillMissingEbitInExistingReports(reports, byPeriod) {
+  let filled = 0;
+  for (const r of findReportsMissingEbit(reports)) {
+    const start = r.startDate.slice(0, 10);
+    const end = r.endDate.slice(0, 10);
+    const value = byPeriod.get(`${start}|${end}`);
+    if (value == null) continue;
+    r.report.ic.push({ concept: 'us-gaap_OperatingIncomeLoss', label: 'Operating Income (SEC XBRL fallback)', value });
+    filled++;
+  }
+  return filled;
+}
+
 // ---------------------------------------------------------------------------
 // Broad SEC XBRL enrichment — for tickers whose Finnhub financials-reported
 // coverage is severely sparse (verified live: Berkshire Hathaway/BRK.A has
@@ -3926,6 +3973,22 @@ async function processSymbol(symbol, apiKey, ctx) {
           }
         }
       }
+
+      // Same fix, for EBIT -- see findReportsMissingEbit's own comment.
+      // Independent of the revenue fix above: a ticker can be missing
+      // either, both, or neither, so this always checks on its own rather
+      // than being gated behind reportsMissingRevenue.length.
+      const reportsMissingEbit = [...findReportsMissingEbit(quarterlyFinancials), ...findReportsMissingEbit(annualReportedFinancials)];
+      if (reportsMissingEbit.length) {
+        const byPeriod = await fetchSecEbitFactsByPeriod(cik);
+        if (byPeriod.size) {
+          const filledQ = fillMissingEbitInExistingReports(quarterlyFinancials, byPeriod);
+          const filledA = fillMissingEbitInExistingReports(annualReportedFinancials, byPeriod);
+          if (filledQ || filledA) {
+            console.log(`  ${symbol}: filled missing EBIT into ${filledQ} quarterly + ${filledA} annual existing report(s) from SEC (Finnhub tagged the wrong statement as 'ic')`);
+          }
+        }
+      }
     }
   } catch {
     // Non-fatal — same graceful-degradation philosophy as the fetch above.
@@ -4746,6 +4809,9 @@ module.exports = {
   findAnnualRevenueGapsNeedingBackfill,
   findReportsMissingRevenue,
   fillMissingRevenueInExistingReports,
+  findReportsMissingEbit,
+  fetchSecEbitFactsByPeriod,
+  fillMissingEbitInExistingReports,
   fetchSecTickerToCikMap,
   buildRevenueGrowthQuarterlyFromFilings,
   buildRevenueGrowthTTMFromFilings,
