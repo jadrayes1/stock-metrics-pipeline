@@ -2401,6 +2401,53 @@ const NATIVE_QUARTERLY_FIELD_MAP = {
   pfcfRatio: 'pfcfTTM',
 };
 
+// A YoY comparison via array position (sales[i] vs sales[i+4]) assumes
+// Finnhub's own salesPerShare series always has exactly 4 real entries per
+// year — true for a normal quarterly filer, but FALSE for a foreign filer
+// whose own disclosure cadence is thinner than that. Verified live: BTI
+// (British American Tobacco, half-year + full-year reporting only — SEC
+// XBRL confirms zero real standalone-quarter facts) has a salesPerShare
+// array with just 2 entries/year, so sales[i+4] lands 2 YEARS before
+// sales[i], not 1 — the old code silently computed a 2-year change and
+// labeled it as a single year's "quarterly" growth. Confirmed by hand:
+// the previously-published "Q2 '26" value matched
+// (2026-06-30 value - 2024-06-30 value) / 2024-06-30 value exactly.
+//
+// Fix: ANNUALIZE using the real gap (compound-growth formula) rather than
+// dropping the point — product decision is to show a clearly-derived
+// estimate over nothing, same spirit as the TTM builders' own partial-
+// window annualization (`rawNopat * (4 / quarters.length)`) elsewhere in
+// this file. Returns null only when there's genuinely nothing to compute
+// from (missing value, non-positive growth base, or a nonsensical/zero
+// day gap) — never fabricates, only rescales a real comparison onto a
+// comparable 1-year basis. `annualized: true` marks a point that needed
+// this (gap not already ~1 year), so a consumer can flag it as an
+// estimate rather than treating it identically to a real same-length
+// comparison.
+function daysBetweenPeriods(laterPeriod, earlierPeriod) {
+  const later = new Date(laterPeriod);
+  const earlier = new Date(earlierPeriod);
+  if (Number.isNaN(later.getTime()) || Number.isNaN(earlier.getTime())) return null;
+  return (later - earlier) / (1000 * 60 * 60 * 24);
+}
+
+function yoyGrowthAnnualized(thisValue, priorValue, thisPeriod, priorPeriod) {
+  if (thisValue == null || !priorValue) return null;
+  const rawGrowth = (thisValue - priorValue) / priorValue;
+  const days = daysBetweenPeriods(thisPeriod, priorPeriod);
+  if (days == null || days <= 0) return null;
+  if (days > 300 && days < 430) return { value: rawGrowth, annualized: false };
+  // Annualizing a very short gap amplifies noise into an unreliable
+  // headline rate (e.g. a 30-day gap raised to the 365/30 power) — below
+  // half a year, there isn't enough real time elapsed to responsibly
+  // project a 1-year-equivalent rate from it at all.
+  if (days < 180) return null;
+  const base = 1 + rawGrowth;
+  if (base <= 0) return null; // a near-total/negative base has no real annualized equivalent
+  const annualizedValue = clampImplausible(Math.pow(base, 365 / days) - 1);
+  return annualizedValue != null ? { value: annualizedValue, annualized: true } : null;
+}
+
 function extractNativeQuarterlySeries(quarterly, metricKey) {
   const series = quarterly || {};
   if (metricKey === 'revenueGrowth') {
@@ -2409,8 +2456,8 @@ function extractNativeQuarterlySeries(quarterly, metricKey) {
     for (let i = 0; i < sales.length - 4 && points.length < QUARTERS_OF_HISTORY; i++) {
       const thisQuarter = sales[i];
       const yearAgo = sales[i + 4];
-      const value = thisQuarter?.v != null && yearAgo?.v ? (thisQuarter.v - yearAgo.v) / yearAgo.v : null;
-      points.push({ label: quarterLabelFromPeriod(thisQuarter?.period), value });
+      const result = yoyGrowthAnnualized(thisQuarter?.v, yearAgo?.v, thisQuarter?.period, yearAgo?.period);
+      points.push({ label: quarterLabelFromPeriod(thisQuarter?.period), value: result?.value ?? null, ...(result?.annualized ? { annualized: true } : {}) });
     }
     return points.reverse();
   }
