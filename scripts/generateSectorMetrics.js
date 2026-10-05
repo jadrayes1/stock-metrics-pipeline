@@ -4320,6 +4320,27 @@ async function processSymbol(symbol, apiKey, ctx) {
   const previousQuarterlyForSymbol = previouslyPublishedQuarterlyTrends[symbol] || {};
   const previousTtmForSymbol = previouslyPublishedTtmTrends[symbol] || {};
 
+  // The separate foreign-filings-pipeline (generateForeignFilingsCache.js)
+  // already publishes real, verified trend points for revenueGrowth/
+  // profitMargin/fcfMargin/roic for foreign filers in the exact same
+  // {label, value} shape this script publishes natively — but until now
+  // nothing here ever looked at it for the TREND ARRAYS, only for the
+  // scalar card value (see latestForeignFilingsMetric below). That's a
+  // real, separate gap from the scalar-only fix: a foreign 20-F filer with
+  // zero Finnhub financials-reported coverage (so EVERY builder above
+  // comes back empty) stays with an empty trend forever even when
+  // foreignFilingsCache.json already has good data. Verified live: GRRR
+  // (Gorilla Technology Group, a genuine 20-F filer) has real FY'20-FY'24
+  // yearly data for all 4 metrics in foreignFilingsCache.json while its
+  // own trendsYearly.json entry was completely missing. Only used when
+  // this symbol's own reconstruction AND the previously-published trend
+  // both have nothing, same "only ever fills an empty slot" guarantee as
+  // every other cross-pipeline fallback in this file. Many foreign filers
+  // only ever have yearly data in that cache (6-Ks without a full
+  // quarterly P&L) — quarterly/ttm fall back to this same object but will
+  // just stay empty for those tickers, which is correct, not a bug.
+  const foreignFilingsTrendsForSymbol = ctx.foreignFilingsCache[symbol];
+
   let cardValuesReconstructed = false;
 
   for (const key of Object.keys(yearlyBuilders)) {
@@ -4331,7 +4352,11 @@ async function processSymbol(symbol, apiKey, ctx) {
       // A single metric's oddly-shaped filing shouldn't take down the
       // others — pickTrendToPublish falls back to the previous run.
     }
-    const published = pickCadenceMetric(previousYearlyForSymbol[key], fresh);
+    let published = pickCadenceMetric(previousYearlyForSymbol[key], fresh);
+    if (!published.length) {
+      const foreignPoints = foreignFilingsTrendsForSymbol?.yearly?.[key];
+      if (foreignPoints?.length) published = foreignPoints;
+    }
     if (published.length) mergedYearlyForSymbol[key] = published;
   }
   for (const key of Object.keys(quarterlyBuilders)) {
@@ -4342,7 +4367,11 @@ async function processSymbol(symbol, apiKey, ctx) {
       if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG quarterly builder threw', symbol, key, e.message, e.stack);
       // Same graceful-degradation philosophy as above.
     }
-    const published = pickCadenceMetric(previousQuarterlyForSymbol[key], fresh);
+    let published = pickCadenceMetric(previousQuarterlyForSymbol[key], fresh);
+    if (!published.length) {
+      const foreignPoints = foreignFilingsTrendsForSymbol?.quarterly?.[key];
+      if (foreignPoints?.length) published = foreignPoints;
+    }
     if (published.length) mergedQuarterlyForSymbol[key] = published;
   }
   for (const key of Object.keys(ttmBuilders)) {
@@ -4353,7 +4382,11 @@ async function processSymbol(symbol, apiKey, ctx) {
       if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG ttm builder threw', symbol, key, e.message, e.stack);
       // Same graceful-degradation philosophy as above.
     }
-    const published = pickCadenceMetric(previousTtmForSymbol[key], fresh);
+    let published = pickCadenceMetric(previousTtmForSymbol[key], fresh);
+    if (!published.length) {
+      const foreignPoints = foreignFilingsTrendsForSymbol?.ttm?.[key];
+      if (foreignPoints?.length) published = foreignPoints;
+    }
     if (published.length) {
       mergedTtmForSymbol[key] = published;
       // Backfill the CARD value too, not just the trend cache, whenever
