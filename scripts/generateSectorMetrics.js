@@ -1476,6 +1476,56 @@ function fillMissingEbitInExistingReports(reports, byPeriod) {
   return filled;
 }
 
+// Same shape again, for TOTAL EQUITY -- a different real gap from NFG's
+// (missing EBIT), same underlying bug class. Verified live for CEG
+// (Constellation Energy Corp): Finnhub's crawled balance sheet for its most
+// recent quarter tags "Total equity" under
+// us-gaap_LimitedLiabilityCompanyLlcMembersEquityIncludingPortionAttributableToNoncontrollingInterest
+// -- an LLC-specific concept -- instead of the standard
+// us-gaap_StockholdersEquity(IncludingPortionAttributableToNoncontrollingInterest)
+// concepts findReportedTotalEquity actually recognizes, even though SEC's
+// own raw companyfacts for the SAME exact period has a real, current fact
+// under the standard concept too (CEG's own 10-Q is a combined filing with
+// a wholly-owned LLC co-registrant -- Finnhub's crawl appears to have
+// picked up that subsidiary's own equity line for this report instead of
+// the parent corporation's). Equity is an INSTANT (point-in-time) balance-
+// sheet fact, unlike revenue/EBIT's duration facts -- SEC tags it with an
+// `end` date and no `start` at all, so this keys byPeriod on end-date alone// -- see pickInstantFact's own comment for why a balance-sheet fact can't
+// use the start|end key the duration-concept version above does.
+function findReportsMissingEquity(reports) {
+  return (reports || []).filter((r) => r?.endDate && r.report?.bs?.length && findReportedTotalEquity(r.report.bs) == null);
+}
+
+async function fetchSecEquityFactsByPeriod(cik) {
+  const data = await fetchSecJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
+  const gaap = data?.facts?.['us-gaap'] || {};
+  const latestByEnd = new Map(); // end date -> { val, filed }
+  for (const concept of SEC_EQUITY_CONCEPTS) {
+    const facts = gaap[concept]?.units?.USD || [];
+    for (const f of facts) {
+      if (f.val == null || f.start || !f.end) continue; // instant only -- no start date
+      const existing = latestByEnd.get(f.end);
+      if (!existing || (f.filed && (!existing.filed || f.filed > existing.filed))) {
+        latestByEnd.set(f.end, { val: f.val, filed: f.filed });
+      }
+    }
+  }
+  const byEnd = new Map();
+  for (const [end, entry] of latestByEnd) byEnd.set(end, entry.val);
+  return byEnd;
+}
+
+function fillMissingEquityInExistingReports(reports, byEnd) {
+  let filled = 0;
+  for (const r of findReportsMissingEquity(reports)) {
+    const value = byEnd.get(r.endDate.slice(0, 10));
+    if (value == null) continue;
+    r.report.bs.push({ concept: 'us-gaap_StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest', label: 'Total Equity (SEC XBRL fallback)', value });
+    filled++;
+  }
+  return filled;
+}
+
 // ---------------------------------------------------------------------------
 // Broad SEC XBRL enrichment — for tickers whose Finnhub financials-reported
 // coverage is severely sparse (verified live: Berkshire Hathaway/BRK.A has
@@ -4075,6 +4125,23 @@ async function processSymbol(symbol, apiKey, ctx) {
           }
         }
       }
+
+      // Same fix again, for TOTAL EQUITY -- see findReportsMissingEquity's
+      // own comment. A different real gap from NFG's (missing EBIT),
+      // verified live for CEG (Constellation Energy Corp): Finnhub's
+      // crawled balance sheet tags an LLC co-registrant's equity concept
+      // instead of the parent corporation's standard one.
+      const reportsMissingEquity = [...findReportsMissingEquity(quarterlyFinancials), ...findReportsMissingEquity(annualReportedFinancials)];
+      if (reportsMissingEquity.length) {
+        const byEnd = await fetchSecEquityFactsByPeriod(cik);
+        if (byEnd.size) {
+          const filledQ = fillMissingEquityInExistingReports(quarterlyFinancials, byEnd);
+          const filledA = fillMissingEquityInExistingReports(annualReportedFinancials, byEnd);
+          if (filledQ || filledA) {
+            console.log(`  ${symbol}: filled missing total equity into ${filledQ} quarterly + ${filledA} annual existing report(s) from SEC (Finnhub tagged a different registrant's balance sheet)`);
+          }
+        }
+      }
     }
   } catch {
     // Non-fatal — same graceful-degradation philosophy as the fetch above.
@@ -4898,6 +4965,9 @@ module.exports = {
   findReportsMissingEbit,
   fetchSecEbitFactsByPeriod,
   fillMissingEbitInExistingReports,
+  findReportsMissingEquity,
+  fetchSecEquityFactsByPeriod,
+  fillMissingEquityInExistingReports,
   fetchSecTickerToCikMap,
   buildRevenueGrowthQuarterlyFromFilings,
   buildRevenueGrowthTTMFromFilings,
