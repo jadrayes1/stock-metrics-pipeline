@@ -1268,21 +1268,45 @@ function findRevenueGapsNeedingBackfill(quarterlyReports) {
   return gaps;
 }
 
-// SEC facts keyed "start|end" -> value, across every candidate revenue
-// concept, for an exact-date lookup against each gap found above.
-async function fetchSecRevenueFactsByPeriod(cik) {
-  const data = await fetchSecJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
-  const gaap = data?.facts?.['us-gaap'] || {};
-  const byPeriod = new Map();
-  for (const concept of SEC_REVENUE_CONCEPTS) {
-    const facts = gaap[concept]?.units?.USD || [];
+// SEC facts keyed "start|end" -> value, across every candidate concept in
+// the given list, for an exact-date lookup against each gap found above.
+// Prefers whichever fact was FILED most recently for a given period --
+// verified live, SDEV (formerly NovaBay Pharmaceuticals, divested its
+// pharma business into "discontinued operations" during a 2026 crypto
+// pivot): SEC's raw companyfacts carries BOTH the ORIGINAL 2024 quarterly
+// revenue (e.g. $2,441,000 for Q3'24, filed 2024-11-07, back when that
+// revenue was still "continuing operations") AND a LATER-filed restated
+// comparative for the EXACT SAME period ($0, filed 2025-11-07, once that
+// revenue was reclassified into discontinued operations) -- the old
+// first-wins logic below kept whichever fact SEC's API happened to list
+// first (the original, pre-restatement one), comparing it against 2025's
+// own (correctly $0, post-restatement) figure and producing a fake "-100%"
+// revenue decline that doesn't reflect what actually happened -- both
+// periods genuinely have $0 CONTINUING-operations revenue once restated
+// consistently, so the real answer is "no comparable growth figure
+// exists," not a crash. A company's own later filing is the authoritative,
+// most-current statement of what a period's figure actually is.
+function fetchSecFactsByPeriod(gaapFacts, concepts) {
+  const latestByPeriod = new Map(); // key -> { val, filed }
+  for (const concept of concepts) {
+    const facts = gaapFacts[concept]?.units?.USD || [];
     for (const f of facts) {
       if (f.val == null || !f.start || !f.end) continue;
       const key = `${f.start}|${f.end}`;
-      if (!byPeriod.has(key)) byPeriod.set(key, f.val);
+      const existing = latestByPeriod.get(key);
+      if (!existing || (f.filed && (!existing.filed || f.filed > existing.filed))) {
+        latestByPeriod.set(key, { val: f.val, filed: f.filed });
+      }
     }
   }
+  const byPeriod = new Map();
+  for (const [key, entry] of latestByPeriod) byPeriod.set(key, entry.val);
   return byPeriod;
+}
+
+async function fetchSecRevenueFactsByPeriod(cik) {
+  const data = await fetchSecJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
+  return fetchSecFactsByPeriod(data?.facts?.['us-gaap'] || {}, SEC_REVENUE_CONCEPTS);
 }
 
 // Finds fiscal years with quarterly coverage in quarterlyReports whose
@@ -1436,17 +1460,7 @@ function findReportsMissingEbit(reports) {
 
 async function fetchSecEbitFactsByPeriod(cik) {
   const data = await fetchSecJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
-  const gaap = data?.facts?.['us-gaap'] || {};
-  const byPeriod = new Map();
-  for (const concept of SEC_EBIT_CONCEPTS) {
-    const facts = gaap[concept]?.units?.USD || [];
-    for (const f of facts) {
-      if (f.val == null || !f.start || !f.end) continue;
-      const key = `${f.start}|${f.end}`;
-      if (!byPeriod.has(key)) byPeriod.set(key, f.val);
-    }
-  }
-  return byPeriod;
+  return fetchSecFactsByPeriod(data?.facts?.['us-gaap'] || {}, SEC_EBIT_CONCEPTS);
 }
 
 function fillMissingEbitInExistingReports(reports, byPeriod) {
@@ -2172,7 +2186,23 @@ function reportDurationDays(report) {
 // startDate/endDate (an SEC-XBRL-synthesized entry; see
 // buildSecSyntheticReports) always defaults to "cumulative", since
 // pickDurationFact deliberately selects the cumulative fact for those.
-function decumulateYtdByYear(quarterlyReports, annualReports, findValue, section = 'ic') {
+// disallowNegative (new) -- opted into ONLY by revenue callers, never by
+// net income/OCF/EBIT (which legitimately go negative). Guards against a
+// real failure mode in the subtraction chain itself, not just a bad input:
+// verified live, SDEV (formerly NovaBay Pharmaceuticals, divested its
+// pharma business into "discontinued operations" during a 2026 crypto
+// pivot) -- a LATER 10-Q's comparative column restated one exact 9-month
+// YTD period to $0 (correctly, per fetchSecFactsByPeriod's own latest-
+// filed fix above) while an EARLIER quarter's cumulative-through value for
+// the SAME fiscal year was never itself restated (no later filing happened
+// to redisclose that exact sub-period) -- subtracting the new, correctly-
+// restated figure from the old, still-unrestated one produces a negative
+// "standalone quarter revenue," which is never real (a per-quarter revenue
+// figure can't genuinely go negative) and would otherwise flow straight
+// into a misleading growth percentage. Rejecting it here, inside the
+// subtraction chain, catches this even though neither individual input
+// value was itself invalid in isolation -- only their combination was.
+function decumulateYtdByYear(quarterlyReports, annualReports, findValue, section = 'ic', disallowNegative = false) {
   const currentCik = quarterlyReports?.[0]?.cik ?? annualReports?.[0]?.cik;
   const sameCik = (r) => currentCik == null || r.cik === currentCik;
   quarterlyReports = (quarterlyReports || []).filter(sameCik);
@@ -2261,6 +2291,11 @@ function decumulateYtdByYear(quarterlyReports, annualReports, findValue, section
     }
 
     if (cumulativeThrough[3] != null && annualByYear[year] != null) standalone[`${year}-4`] = annualByYear[year] - cumulativeThrough[3];
+  }
+  if (disallowNegative) {
+    for (const key of Object.keys(standalone)) {
+      if (standalone[key] < 0) delete standalone[key];
+    }
   }
   return standalone;
 }
@@ -2786,8 +2821,8 @@ function clampImplausible(value) {
 // once — mirrors buildStandaloneFlowQuarters in src/utils/metrics.js.
 function buildStandaloneFlowQuarters(quarterlyReports, annualReports, fieldSpecs) {
   const perField = {};
-  for (const [name, { fn, section }] of Object.entries(fieldSpecs)) {
-    perField[name] = decumulateYtdByYear(quarterlyReports, annualReports, fn, section);
+  for (const [name, { fn, section, disallowNegative }] of Object.entries(fieldSpecs)) {
+    perField[name] = decumulateYtdByYear(quarterlyReports, annualReports, fn, section, disallowNegative);
   }
   const keys = new Set();
   for (const map of Object.values(perField)) Object.keys(map).forEach((k) => keys.add(k));
@@ -2834,7 +2869,7 @@ function buildFcfMarginQuarterlyFromFilings(quarterlyReports, annualReports) {
   const records = buildStandaloneFlowQuarters(quarterlyReports, annualReports, {
     ocf: { fn: findReportedOperatingCashFlowQ, section: 'cf' },
     capex: { fn: findReportedCapexQ, section: 'cf' },
-    revenue: { fn: findReportedRevenue, section: 'ic' },
+    revenue: { fn: findReportedRevenue, section: 'ic', disallowNegative: true },
   });
   return records
     .map((r) => ({ label: calendarQuarterLabel(calendarLabels, r.year, r.quarter), value: clampImplausible(r.revenue ? (r.ocf - r.capex) / r.revenue : null) }))
@@ -2847,7 +2882,7 @@ function buildFcfMarginYearlyFromFilings(annualReports) {
   const records = buildAnnualFlowPoints(annualReports, {
     ocf: { fn: findReportedOperatingCashFlowQ, section: 'cf' },
     capex: { fn: findReportedCapexQ, section: 'cf' },
-    revenue: { fn: findReportedRevenue, section: 'ic' },
+    revenue: { fn: findReportedRevenue, section: 'ic', disallowNegative: true },
   });
   return records
     .map((r) => ({ label: calendarYearlyLabel(calendarLabels, r.year), value: clampImplausible(r.revenue ? (r.ocf - r.capex) / r.revenue : null) }))
@@ -2859,7 +2894,11 @@ function buildFcfMarginYearlyFromFilings(annualReports) {
 
 function buildRevenueGrowthQuarterlyFromFilings(quarterlyReports, annualReports) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
-  const standalone = decumulateYtdByYear(quarterlyReports, annualReports, findReportedRevenue, 'ic');
+  const standalone = decumulateYtdByYear(quarterlyReports, annualReports, findReportedRevenue, 'ic', true);
+  if (process.env.DEBUG_SEC_ENRICHMENT) {
+    console.error('DEBUG buildRevenueGrowthQuarterlyFromFilings standalone', JSON.stringify(standalone));
+    console.error('DEBUG buildRevenueGrowthQuarterlyFromFilings quarterlyReports years/quarters/ciks', JSON.stringify((quarterlyReports || []).map((q) => ({ year: q.year, quarter: q.quarter, cik: q.cik, form: q.form }))));
+  }
   const chronological = Object.keys(standalone)
     .map((key) => {
       const [year, quarter] = key.split('-').map(Number);
@@ -2904,7 +2943,7 @@ function buildRevenueGrowthYearlyFromFilings(annualReports) {
 
 function buildRevenueGrowthTTMFromFilings(quarterlyReports, annualReports) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
-  const records = buildStandaloneFlowQuarters(quarterlyReports, annualReports, { revenue: { fn: findReportedRevenue, section: 'ic' } });
+  const records = buildStandaloneFlowQuarters(quarterlyReports, annualReports, { revenue: { fn: findReportedRevenue, section: 'ic', disallowNegative: true } });
   const windows = buildTrailingWindows(records, 4).filter((w) => !w.partial);
 
   const ttmByKey = {};
@@ -2951,7 +2990,7 @@ function buildProfitMarginYearlyFromFilings(annualReports) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(null, annualReports);
   const records = buildAnnualFlowPoints(annualReports, {
     netIncome: { fn: findReportedNetIncome, section: 'ic' },
-    revenue: { fn: findReportedRevenue, section: 'ic' },
+    revenue: { fn: findReportedRevenue, section: 'ic', disallowNegative: true },
   });
   return records
     .map((r) => ({ label: calendarYearlyLabel(calendarLabels, r.year), value: clampImplausible(r.revenue ? r.netIncome / r.revenue : null) }))
@@ -2963,7 +3002,7 @@ function buildProfitMarginTTMFromFilings(quarterlyReports, annualReports) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
   const records = buildStandaloneFlowQuarters(quarterlyReports, annualReports, {
     netIncome: { fn: findReportedNetIncome, section: 'ic' },
-    revenue: { fn: findReportedRevenue, section: 'ic' },
+    revenue: { fn: findReportedRevenue, section: 'ic', disallowNegative: true },
   });
   return buildTrailingWindows(records, 4)
     .map(({ quarters, anchor, partial }) => {

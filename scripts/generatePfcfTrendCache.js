@@ -865,18 +865,28 @@ function findReportsMissingShares(reports) {
   return (reports || []).filter((r) => r?.startDate && r?.endDate && r.report?.ic?.length && findReportedDilutedShares(r.report.ic) == null);
 }
 
+// Prefers whichever fact was FILED most recently for a given period --
+// see generateSectorMetrics.js's fetchSecFactsByPeriod for the full
+// rationale (verified live via SDEV: a later restated comparative for an
+// already-disclosed period is the authoritative figure, not whichever one
+// SEC's API happens to list first).
 async function fetchSecSharesFactsByPeriod(cik) {
   const data = await fetchSecJson(`${SEC_COMPANYFACTS_BASE}/CIK${cik}.json`);
   const gaap = data?.facts?.['us-gaap'] || {};
-  const byPeriod = new Map();
+  const latestByPeriod = new Map();
   for (const concept of SEC_SHARES_CONCEPTS) {
     const facts = gaap[concept]?.units?.shares || [];
     for (const f of facts) {
       if (f.val == null || f.val < MIN_PLAUSIBLE_SHARES || !f.start || !f.end) continue;
       const key = `${f.start}|${f.end}`;
-      if (!byPeriod.has(key)) byPeriod.set(key, f.val);
+      const existing = latestByPeriod.get(key);
+      if (!existing || (f.filed && (!existing.filed || f.filed > existing.filed))) {
+        latestByPeriod.set(key, { val: f.val, filed: f.filed });
+      }
     }
   }
+  const byPeriod = new Map();
+  for (const [key, entry] of latestByPeriod) byPeriod.set(key, entry.val);
   return byPeriod;
 }
 
