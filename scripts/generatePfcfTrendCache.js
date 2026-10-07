@@ -1792,9 +1792,18 @@ async function main() {
   const twelveDataKeys = readTwelveDataApiKeys();
 
   console.log('Fetching current ticker universe + P/FCF gap list from the published sector-metrics feed...');
+  // Cache-busting query param on these two gist reads specifically (not a
+  // change to fetchJson itself, which is also shared with Finnhub/Twelve
+  // Data calls that shouldn't get an unexpected extra param) -- verified
+  // live elsewhere this session: GitHub's raw-gist CDN served a genuinely
+  // stale file minutes after a real, confirmed-via-git-clone push, the
+  // same CDN-staleness trap this project's own standing instruction
+  // already works around manually for human-run `gh gist` reads. A per-
+  // request-unique URL can never be served from a stale cache entry.
+  const cacheBust = `_cb=${Date.now()}`;
   const [metricsDataset, existingTrendCache, secTickerToCikMap] = await Promise.all([
-    fetchJson(GIST_METRICS_URL),
-    fetchJson(GIST_PFCF_TREND_URL).catch(() => ({ trends: {} })), // first-ever run: no existing cache yet
+    fetchJson(`${GIST_METRICS_URL}?${cacheBust}`),
+    fetchJson(`${GIST_PFCF_TREND_URL}?${cacheBust}`).catch(() => ({ trends: {} })), // first-ever run: no existing cache yet
     fetchSecTickerToCikMap().catch(() => new Map()), // non-fatal — SEC enrichment below just never triggers without it
   ]);
 

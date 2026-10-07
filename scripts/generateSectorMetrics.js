@@ -3365,9 +3365,23 @@ const GIST_FOREIGN_PFCF_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7
 // either.
 const GIST_FOREIGN_FILINGS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/foreignFilingsCache.json';
 
+// A cache-busting query param on EVERY call -- verified live: GitHub's raw-
+// gist CDN (gist.githubusercontent.com/.../raw/...) served a genuinely
+// stale foreignFilingsCache.json for this exact URL minutes after a real,
+// confirmed-via-git-clone push (ASR/PAC/TSM's freshly-fixed quarterly/ttm
+// data vanished from this run's own merge, even though a direct git clone
+// run moments earlier already showed it present) -- the SAME CDN-staleness
+// trap this project's own standing instruction already works around
+// manually ("always git clone the gist fresh, never trust `gh gist view
+// --raw`"), just hit here via this script's OWN fetch instead of a human
+// running a CLI command. Every GIST_*_URL below funnels through this one
+// function, so fixing it here covers every cross-pipeline read at once --
+// a plain cache-Control header can't be relied on for a CDN outside this
+// project's control, but a per-request-unique URL can never be served
+// from a stale cache entry at all.
 async function fetchJsonSafe(url) {
   try {
-    const res = await fetch(url);
+    const res = await fetch(`${url}${url.includes('?') ? '&' : '?'}_cb=${Date.now()}`);
     if (!res.ok) return null;
     return await res.json();
   } catch {
