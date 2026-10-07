@@ -954,6 +954,14 @@ const DEBT_CONCEPTS = [
   'us-gaap_SecuredDebt',
   'us-gaap_UnsecuredDebt',
   'us-gaap_OtherBorrowings',
+  // ifrs-full's own debt concepts -- verified live for TSM (LongtermBorrowings
+  // $970.5M, CurrentPortionOfLongtermBorrowings $1.83B, ShorttermBorrowings
+  // $4.14B, all clean USD-unit facts). This list feeds SEC_DEBT_CONCEPTS via
+  // the .map() below too, so this one addition covers both the real-Finnhub-
+  // bsItems path and the SEC-enrichment-synthesized path at once.
+  'us-gaap_LongtermBorrowings',
+  'us-gaap_CurrentPortionOfLongtermBorrowings',
+  'us-gaap_ShorttermBorrowings',
 ];
 const DEBT_LABEL_KEYWORDS = ['term debt', 'commercial paper', 'notes payable', 'loans and notes payable', 'current maturities of long-term debt', 'short-term debt', 'short-term borrowings'];
 
@@ -1161,6 +1169,10 @@ const REVENUE_CONCEPT_CANDIDATES = [
   // financials-reported coverage is actually healthy (no enrichment
   // needed) still gets its revenue recognized directly.
   'us-gaap_GrossInvestmentIncomeOperating',
+  // ifrs-full's real "Revenue" concept, always re-prefixed "us-gaap_" by
+  // findSecValueForFyFp regardless of its true taxonomy -- see
+  // SEC_REVENUE_CONCEPTS' own comment (verified live for TSM).
+  'us-gaap_Revenue',
 ];
 
 // ---------------------------------------------------------------------------
@@ -1206,6 +1218,22 @@ const SEC_REVENUE_CONCEPTS = [
   // (total investment income earned across its portfolio), real and
   // current through Q2 2026.
   'GrossInvestmentIncomeOperating',
+  // ifrs-full's own revenue concept -- verified live: TSM (Taiwan
+  // Semiconductor) has ZERO Finnhub financials-reported coverage at all
+  // (quarterly AND annual), so it depends entirely on this SEC-enrichment
+  // path, but none of the us-gaap concepts above ever match a 20-F filer's
+  // real tag. TSM's real ifrs-full "Revenue" has clean USD-unit facts for
+  // 8 straight fiscal years (FY'17-'24), alongside a separate, much larger
+  // TWD-unit series for the exact same concept/periods -- findSecValueFor
+  // FyFp's own `.units.USD` filter already picks only the USD one, so this
+  // doesn't risk the TWD/USD mixups that corrupted the previously-published
+  // (now-replaced) revenueGrowth figure. Also needs 'us-gaap_Revenue' added
+  // to REVENUE_CONCEPT_CANDIDATES below -- findSecValueForFyFp always
+  // prefixes with "us-gaap_" regardless of which taxonomy a concept
+  // actually came from (same convention ProfitLoss/NET_INCOME_CONCEPT_
+  // CANDIDATES already relies on), so findReportedRevenue only recognizes
+  // this synthesized fact if that exact prefixed string is in its own list.
+  'Revenue',
 ];
 
 async function fetchSecJson(url) {
@@ -1694,9 +1722,38 @@ const SEC_EBIT_CONCEPTS = ['OperatingIncomeLoss'];
 const SEC_PRETAX_INCOME_CONCEPTS = [
   'IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest',
   'IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments',
+  // ifrs-full has no direct "OperatingIncomeLoss" equivalent (verified live:
+  // TSM tags no us-gaap-style operating-income concept at all) -- its real
+  // pretax-income line, ProfitLossBeforeTax, is a clean USD-unit fact for
+  // all 8 fiscal years. findReportedEBIT already falls back to whatever's
+  // in this list for bank filers/BRK.A with the exact same reasoning (pretax
+  // income as the closest EBIT-equivalent when no operating-income line
+  // exists) -- this is additive to that same established fallback, not a
+  // new code path.
+  'ProfitLossBeforeTax',
 ];
-const SEC_OCF_CONCEPTS = OPERATING_SUBTOTAL_CONCEPTS.map((c) => c.replace(/^us-gaap_/, ''));
-const SEC_CAPEX_CONCEPTS = ['PaymentsToAcquirePropertyPlantAndEquipment', 'PaymentsToAcquireProductiveAssets', 'PaymentsForCapitalImprovements', 'PaymentsToAcquireOtherPropertyPlantAndEquipment', 'PaymentsToAcquireRealEstateAndRealEstateJointVentures'];
+const SEC_OCF_CONCEPTS = [
+  ...OPERATING_SUBTOTAL_CONCEPTS.map((c) => c.replace(/^us-gaap_/, '')),
+  // ifrs-full's own operating-cash-flow subtotal -- verified live for TSM
+  // (clean USD-unit facts, all 8 fiscal years). Also needs an exact-concept
+  // check added to findReportedOperatingCashFlowQ below, mirroring its
+  // existing ContinuingOperations fallback (buildSecSyntheticReports' label
+  // for a synthesized fact is concept-name-derived, not natural spaced
+  // text, so the label regex above it can never match this either).
+  'CashFlowsFromUsedInOperatingActivities',
+];
+const SEC_CAPEX_CONCEPTS = [
+  'PaymentsToAcquirePropertyPlantAndEquipment',
+  'PaymentsToAcquireProductiveAssets',
+  'PaymentsForCapitalImprovements',
+  'PaymentsToAcquireOtherPropertyPlantAndEquipment',
+  'PaymentsToAcquireRealEstateAndRealEstateJointVentures',
+  // ifrs-full's real capex concept -- verified live for TSM AND previously
+  // confirmed for ASR (see foreign-filings-pipeline's CAPEX_CONCEPTS), so
+  // this isn't a single-ticker guess. Also needs an exact-concept check
+  // added to findReportedCapexQ's own concept list below.
+  'PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities',
+];
 // Same "no Investing Activities section at all -> capex defaults to $0"
 // reasoning as findReportedCapexQ's own comment (the SPRO fix), applied at
 // the SEC-synthesis layer -- verified live: SGLY never tags ANY of
@@ -1707,9 +1764,17 @@ const SEC_CAPEX_CONCEPTS = ['PaymentsToAcquirePropertyPlantAndEquipment', 'Payme
 // no matched capex concept just drops capex as "not found," blocking
 // fcfMargin/P-FCF for that quarter even though $0 is the real answer.
 const SEC_INVESTING_SUBTOTAL_CONCEPTS = ['NetCashProvidedByUsedInInvestingActivities', 'NetCashProvidedByUsedInInvestingActivitiesContinuingOperations'];
-const SEC_EQUITY_CONCEPTS = ['StockholdersEquity', 'StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest'];
+// 'Equity' is ifrs-full's own total-equity concept -- verified live for TSM
+// (clean USD-unit facts, all 8 fiscal years). Also needs an exact-concept
+// check added to findReportedTotalEquity below -- its label regex requires
+// "total...holders...equity" wording that a SEC-synthesized fact's
+// concept-name-derived label ("Equity (SEC XBRL enrichment)") never has.
+const SEC_EQUITY_CONCEPTS = ['StockholdersEquity', 'StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest', 'Equity'];
 const SEC_DEBT_CONCEPTS = DEBT_CONCEPTS.map((c) => c.replace(/^us-gaap_/, ''));
-const SEC_CASH_CONCEPTS = ['CashAndCashEquivalentsAtCarryingValue', 'CashAndCashEquivalentsAtFairValue', 'Cash'];
+// 'CashAndCashEquivalents' is ifrs-full's own cash concept -- verified live
+// for TSM (clean USD-unit facts). Also needs an exact-concept check added
+// to findReportedCashBalance's own altMatch below.
+const SEC_CASH_CONCEPTS = ['CashAndCashEquivalentsAtCarryingValue', 'CashAndCashEquivalentsAtFairValue', 'Cash', 'CashAndCashEquivalents'];
 // Mirrors findReportedRevenue's own bank fallback (netInterestIncome +
 // nonInterestIncome) -- verified live: WAL (a bank) DOES tag a standard
 // us-gaap_RevenueFromContractWithCustomerExcludingAssessedTax fact (real,
@@ -2122,7 +2187,12 @@ function findReportedOperatingCashFlowQ(cfItems) {
   // buildSecSyntheticReports can also synthesize under when a filer only
   // tags that one and not the primary concept above.
   const continuingOpsMatch = cfItems.find((item) => item.concept === 'us-gaap_NetCashProvidedByUsedInOperatingActivitiesContinuingOperations');
-  return continuingOpsMatch ? continuingOpsMatch.value : null;
+  if (continuingOpsMatch) return continuingOpsMatch.value;
+  // ifrs-full's own OCF subtotal, always re-prefixed "us-gaap_" by
+  // findSecValueForFyFp -- see SEC_OCF_CONCEPTS' own comment (verified live
+  // for TSM).
+  const ifrsMatch = cfItems.find((item) => item.concept === 'us-gaap_CashFlowsFromUsedInOperatingActivities');
+  return ifrsMatch ? ifrsMatch.value : null;
 }
 
 // A separate copy from extractDcfInputs's inline capex extraction above
@@ -2151,6 +2221,10 @@ function findReportedCapexQ(cfItems) {
     // tags its actual, current, much larger capex-equivalent spend here
     // instead -- e.g. $3.37M (Q1 '26), $11.86M (Q2 '26), real and current.
     'us-gaap_PaymentsToAcquireRealEstateAndRealEstateJointVentures',
+    // ifrs-full's own capex concept, always re-prefixed "us-gaap_" by
+    // findSecValueForFyFp -- see SEC_CAPEX_CONCEPTS' own comment (verified
+    // live for TSM).
+    'us-gaap_PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities',
   ];
   // Summed rather than first-match — verified live: DAL splits its real
   // capex across TWO simultaneous lines ("Flight equipment, including
@@ -2709,7 +2783,12 @@ function findReportedTotalEquity(bsItems) {
   const match = bsItems.find((item) => item.concept === 'us-gaap_StockholdersEquity' || item.concept === 'us-gaap_StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest');
   if (match) return match.value;
   const labelMatch = bsItems.find((item) => /total (share|stock)holders.{0,5}equity/i.test(item.label || ''));
-  return labelMatch ? labelMatch.value : null;
+  if (labelMatch) return labelMatch.value;
+  // ifrs-full's own total-equity concept, always re-prefixed "us-gaap_" by
+  // findSecValueForFyFp -- see SEC_EQUITY_CONCEPTS' own comment (verified
+  // live for TSM).
+  const ifrsMatch = bsItems.find((item) => item.concept === 'us-gaap_Equity');
+  return ifrsMatch ? ifrsMatch.value : null;
 }
 
 function findReportedCashBalance(bsItems) {
@@ -2724,7 +2803,10 @@ function findReportedCashBalance(bsItems) {
   // synthesize under when a filer tags cash under one of those instead of
   // the primary concept above.
   const altMatch = bsItems.find((item) => item.concept === 'us-gaap_CashAndCashEquivalentsAtFairValue' || item.concept === 'us-gaap_Cash');
-  return altMatch ? altMatch.value : null;
+  if (altMatch) return altMatch.value;
+  // ifrs-full's own cash concept -- verified live for TSM.
+  const ifrsMatch = bsItems.find((item) => item.concept === 'us-gaap_CashAndCashEquivalents');
+  return ifrsMatch ? ifrsMatch.value : null;
 }
 
 // ---------------------------------------------------------------------------
