@@ -3106,10 +3106,45 @@ function buildStandaloneFlowQuarters(quarterlyReports, annualReports, fieldSpecs
 // Reads the ANNUAL report directly (no de-cumulation — a 10-K's own figures
 // already ARE the full fiscal year's totals) — mirrors buildAnnualFlowPoints
 // in src/utils/metrics.js.
+// Annual FLOW metrics (revenue, OCF, capex, net income, EBIT) are duration
+// quantities, so a report covering only part of a year is not comparable
+// with a full one -- treating it as that fiscal year understates the figure
+// and distorts every growth and margin computed from it.
+//
+// Verified live: UNIT's (Uniti Group) FY2024 annual report runs
+// 2024-04-19 -> 2024-12-31 with an entirely empty income statement --
+// 2024-04-19 is the incorporation date of Windstream Parent, the registrant
+// that survived the 2025 merger and took the UNIT ticker. That 8.4-month
+// formation stub occupied the 2024 slot, so there was never a consecutive
+// full-year pair and yearly revenueGrowth came out empty at every cadence,
+// no matter how many other years were available.
+//
+// A transition-period annual (a filer changing its fiscal year end) is
+// excluded by the same rule, which is the correct outcome for flow
+// comparability: a 9-month "year" must not be compared against a 12-month
+// one as growth. 52/53-week retail fiscal years (~364-371 days) stay well
+// inside the bounds. A report whose dates are missing or unparseable is
+// KEPT, so a filer we know nothing about can never lose data to this check.
+const MIN_ANNUAL_PERIOD_DAYS = 300;
+const MAX_ANNUAL_PERIOD_DAYS = 400;
+
+function isFullYearAnnualPeriod(r) {
+  if (!r?.startDate || !r?.endDate) return true;
+  const days = (new Date(r.endDate) - new Date(r.startDate)) / 86400000;
+  if (!Number.isFinite(days) || days <= 0) return true;
+  return days >= MIN_ANNUAL_PERIOD_DAYS && days <= MAX_ANNUAL_PERIOD_DAYS;
+}
+
 function buildAnnualFlowPoints(annualReports, fieldSpecs) {
   const currentCik = annualReports?.[0]?.cik;
   const sameCik = (r) => currentCik == null || r.cik === currentCik;
-  const filtered = (annualReports || []).filter(sameCik);
+  const filtered = (annualReports || []).filter(sameCik).filter((r) => {
+    if (isFullYearAnnualPeriod(r)) return true;
+    if (process.env.DEBUG_SEC_ENRICHMENT) {
+      console.error(`DEBUG annual-flow skipping partial period year=${r?.year} ${r?.startDate} -> ${r?.endDate}`);
+    }
+    return false;
+  });
 
   return filtered
     .map((a) => {
