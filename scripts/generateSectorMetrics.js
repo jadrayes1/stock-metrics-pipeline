@@ -1371,6 +1371,32 @@ function hasSparseAnnualHistory(annualReports) {
 // than the reference annual: a well-covered ticker takes this path never, so
 // its published yearly series cannot move. Values still come only from a
 // real SEC-filed figure at an exact fiscal-period date match, never derived.
+// Finds annual reports that EXIST but whose income-statement section has no
+// revenue findReportedRevenue can read. Both gap finders above are
+// presence-based -- they ask whether a YEAR is missing, never whether a
+// present year actually carries a usable revenue figure -- so this shape
+// slipped through entirely.
+//
+// Verified live: UNIT's FY2024 annual report is present but revenue-less
+// ("2025:true","2024:false"), the same mis-tagging that already cost it EBIT
+// ("Finnhub tagged the wrong statement as 'ic'"). With FY2024 revenue
+// unreadable there is no consecutive pair to compare, so yearly
+// revenueGrowth was empty at every cadence no matter how many OTHER years
+// were present -- adding FY2023 alone did not help.
+//
+// Looks the value up at the report's OWN dates, so there is no fiscal-year
+// shifting to guess wrong, and takes it only on an exact period match.
+function findAnnualReportsMissingRevenue(annualReports) {
+  const out = [];
+  for (const r of annualReports || []) {
+    if (!r?.year || !r.startDate || !r.endDate) continue;
+    if (!Array.isArray(r?.report?.ic)) continue;
+    if (findReportedRevenue(r.report.ic) != null) continue;
+    out.push({ year: r.year, expectedStart: String(r.startDate).slice(0, 10), expectedEnd: String(r.endDate).slice(0, 10), existing: r });
+  }
+  return out;
+}
+
 function findSecOnlyAnnualRevenueYears(annualReports, byPeriod) {
   const annualYears = new Set((annualReports || []).filter((r) => r?.year).map((r) => r.year));
   const referenceAnnual = (annualReports || []).find((r) => r?.year && r.startDate && r.endDate);
@@ -1428,7 +1454,10 @@ async function backfillRevenueGapsFromSec(symbol, cik, quarterlyReports, annualR
   // Only sparse-history tickers pay the extra lookup, and only they can gain
   // earlier years from it -- see findSecOnlyAnnualRevenueYears.
   const mayNeedSecAnnualHistory = hasSparseAnnualHistory(annualReports);
-  if (!quarterlyGaps.length && !annualGapsFromQuarters.length && !mayNeedSecAnnualHistory) return { quarterlyReports, annualReports };
+  const annualsMissingRevenue = findAnnualReportsMissingRevenue(annualReports);
+  if (!quarterlyGaps.length && !annualGapsFromQuarters.length && !mayNeedSecAnnualHistory && !annualsMissingRevenue.length) {
+    return { quarterlyReports, annualReports };
+  }
   if (!cik) return { quarterlyReports, annualReports };
 
   const byPeriod = await fetchSecRevenueFactsByPeriod(cik);
@@ -1479,8 +1508,21 @@ async function backfillRevenueGapsFromSec(symbol, cik, quarterlyReports, annualR
       report: { ic: [{ concept: 'us-gaap_Revenues', label: 'Revenues (SEC XBRL fallback)', value }] },
     });
   }
-  if (filledQuarters.length || filledAnnuals.length) {
-    console.log(`  ${symbol}: backfilled ${filledQuarters.length} quarterly + ${filledAnnuals.length} annual revenue gap(s) from SEC (Finnhub crawl gap)`);
+  // Injected into the EXISTING report rather than pushed as a second entry
+  // for a year that already has one, so nothing downstream sees a duplicate.
+  let injectedAnnualRevenue = 0;
+  for (const target of annualsMissingRevenue) {
+    const value = byPeriod.get(`${target.expectedStart}|${target.expectedEnd}`);
+    if (value == null) continue;
+    target.existing.report.ic.push({ concept: 'us-gaap_Revenues', label: 'Revenues (SEC XBRL fallback)', value });
+    injectedAnnualRevenue++;
+  }
+
+  if (filledQuarters.length || filledAnnuals.length || injectedAnnualRevenue) {
+    console.log(
+      `  ${symbol}: backfilled ${filledQuarters.length} quarterly + ${filledAnnuals.length} annual revenue gap(s) from SEC (Finnhub crawl gap)` +
+        (injectedAnnualRevenue ? `, and filled revenue into ${injectedAnnualRevenue} revenue-less annual report(s)` : '')
+    );
   }
   if (process.env.DEBUG_SEC_ENRICHMENT) {
     console.error(
