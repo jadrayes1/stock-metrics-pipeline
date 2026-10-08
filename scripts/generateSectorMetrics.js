@@ -1347,8 +1347,10 @@ function shiftYearOfDate(dateStr, deltaYears) {
 const SPARSE_ANNUAL_HISTORY_THRESHOLD = 3;
 const MAX_SEC_ANNUAL_BACKFILL_YEARS = 12;
 
+// Counts only FULL-YEAR reports: a partial-period one contributes nothing to
+// any annual flow metric, so a ticker holding one is still sparse in practice.
 function hasSparseAnnualHistory(annualReports) {
-  const years = new Set((annualReports || []).filter((r) => r?.year).map((r) => r.year));
+  const years = new Set((annualReports || []).filter((r) => r?.year && isFullYearAnnualPeriod(r)).map((r) => r.year));
   return years.size > 0 && years.size < SPARSE_ANNUAL_HISTORY_THRESHOLD;
 }
 
@@ -1397,9 +1399,16 @@ function findAnnualReportsMissingRevenue(annualReports) {
   return out;
 }
 
+// A year whose ONLY annual report is a partial period counts as missing
+// here: isFullYearAnnualPeriod excludes that report from every annual flow
+// metric anyway, so without this the year stays permanently blank. Verified
+// live for UNIT's 2024 formation stub, which left 2023 and 2025 as a
+// non-consecutive pair and so still produced no revenueGrowth.
 function findSecOnlyAnnualRevenueYears(annualReports, byPeriod) {
-  const annualYears = new Set((annualReports || []).filter((r) => r?.year).map((r) => r.year));
-  const referenceAnnual = (annualReports || []).find((r) => r?.year && r.startDate && r.endDate);
+  const annualYears = new Set(
+    (annualReports || []).filter((r) => r?.year && isFullYearAnnualPeriod(r)).map((r) => r.year)
+  );
+  const referenceAnnual = (annualReports || []).find((r) => r?.year && r.startDate && r.endDate && isFullYearAnnualPeriod(r));
   if (!referenceAnnual || !byPeriod?.size) return [];
   const gaps = [];
   for (let delta = -1; delta >= -MAX_SEC_ANNUAL_BACKFILL_YEARS; delta--) {
@@ -1544,6 +1553,7 @@ async function backfillRevenueGapsFromSec(symbol, cik, quarterlyReports, annualR
         })),
         injectedAnnualRevenue,
         missingRevenueTargets: annualsMissingRevenue.map((t) => `${t.year}:${t.expectedStart}|${t.expectedEnd}`),
+        quarterlyYearsPresent: [...new Set((quarterlyReports || []).filter((r) => r?.year).map((r) => r.year))].sort(),
         secAnnualPeriodsAvailable: [...byPeriod.keys()].filter((k) => {
           const [s, e] = k.split('|');
           const days = (new Date(e) - new Date(s)) / 86400000;
