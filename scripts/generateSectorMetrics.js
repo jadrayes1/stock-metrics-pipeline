@@ -1533,6 +1533,17 @@ async function backfillRevenueGapsFromSec(symbol, cik, quarterlyReports, annualR
         annualGapsProposed: annualGaps.map((g) => `${g.year}:${g.expectedStart}|${g.expectedEnd}`),
         annualGapsMatched: filledAnnuals.map((r) => r.year),
         annualRevenueUsable: (annualReports || []).map((r) => `${r?.year}:${findReportedRevenue(r?.report?.ic || []) != null}`),
+        annualShapes: (annualReports || []).map((r) => ({
+          year: r?.year,
+          start: r?.startDate,
+          end: r?.endDate,
+          icIsArray: Array.isArray(r?.report?.ic),
+          icLen: r?.report?.ic?.length ?? null,
+          sections: r?.report ? Object.keys(r.report) : null,
+          icConcepts: (r?.report?.ic || []).slice(0, 8).map((i) => i.concept),
+        })),
+        injectedAnnualRevenue,
+        missingRevenueTargets: annualsMissingRevenue.map((t) => `${t.year}:${t.expectedStart}|${t.expectedEnd}`),
         secAnnualPeriodsAvailable: [...byPeriod.keys()].filter((k) => {
           const [s, e] = k.split('|');
           const days = (new Date(e) - new Date(s)) / 86400000;
