@@ -1337,6 +1337,55 @@ async function fetchSecRevenueFactsByPeriod(cik) {
   return fetchSecFactsByPeriod(data?.facts?.['us-gaap'] || {}, SEC_REVENUE_CONCEPTS);
 }
 
+function shiftYearOfDate(dateStr, deltaYears) {
+  const d = new Date(dateStr);
+  return new Date(Date.UTC(d.getUTCFullYear() + deltaYears, d.getUTCMonth(), d.getUTCDate())).toISOString().slice(0, 10);
+}
+
+// A ticker with almost no annual reports can't produce a yearly
+// revenueGrowth point at all, since growth needs two years to compare.
+const SPARSE_ANNUAL_HISTORY_THRESHOLD = 3;
+const MAX_SEC_ANNUAL_BACKFILL_YEARS = 12;
+
+function hasSparseAnnualHistory(annualReports) {
+  const years = new Set((annualReports || []).filter((r) => r?.year).map((r) => r.year));
+  return years.size > 0 && years.size < SPARSE_ANNUAL_HISTORY_THRESHOLD;
+}
+
+// Finds EARLIER fiscal years that SEC companyfacts covers but annualReports
+// is missing entirely. findAnnualRevenueGapsNeedingBackfill above only ever
+// proposes years that already have QUARTERLY coverage, because its job was
+// unblocking Q4 derivation (Dominion/D). That leaves a different shape
+// unfixed: a ticker whose registrant is NEW, where the data provider has
+// barely any history at all but the filer's own 10-K discloses prior years
+// as comparative columns, which land in companyfacts under the same CIK.
+//
+// Verified live: UNIT (Uniti Group) merged with Windstream in 2025, and the
+// surviving registrant (CIK 2020795, formerly Windstream Parent) has just
+// one annual report in Finnhub, so yearly revenueGrowth was empty at every
+// cadence -- while SEC companyfacts for that same CIK holds FY2023 ($1,150M)
+// and FY2024 ($1,167M) alongside FY2025 ($2,235M). Those comparatives are
+// Uniti's own pre-merger scale, so no cross-CIK stitching is needed.
+//
+// Deliberately gated on hasSparseAnnualHistory and limited to years EARLIER
+// than the reference annual: a well-covered ticker takes this path never, so
+// its published yearly series cannot move. Values still come only from a
+// real SEC-filed figure at an exact fiscal-period date match, never derived.
+function findSecOnlyAnnualRevenueYears(annualReports, byPeriod) {
+  const annualYears = new Set((annualReports || []).filter((r) => r?.year).map((r) => r.year));
+  const referenceAnnual = (annualReports || []).find((r) => r?.year && r.startDate && r.endDate);
+  if (!referenceAnnual || !byPeriod?.size) return [];
+  const gaps = [];
+  for (let delta = -1; delta >= -MAX_SEC_ANNUAL_BACKFILL_YEARS; delta--) {
+    const year = referenceAnnual.year + delta;
+    if (annualYears.has(year)) continue;
+    const expectedStart = shiftYearOfDate(referenceAnnual.startDate, delta);
+    const expectedEnd = shiftYearOfDate(referenceAnnual.endDate, delta);
+    if (byPeriod.has(`${expectedStart}|${expectedEnd}`)) gaps.push({ year, expectedStart, expectedEnd });
+  }
+  return gaps;
+}
+
 // Finds fiscal years with quarterly coverage in quarterlyReports whose
 // matching ANNUAL report is entirely missing from annualReports — blocks
 // Q4 derivation (Q4 = full-year total - 9mo YTD) for that year, and
@@ -1375,12 +1424,26 @@ function findAnnualRevenueGapsNeedingBackfill(quarterlyReports, annualReports) {
 // {quarterlyReports, annualReports}, both unchanged when nothing to fill.
 async function backfillRevenueGapsFromSec(symbol, cik, quarterlyReports, annualReports) {
   const quarterlyGaps = findRevenueGapsNeedingBackfill(quarterlyReports);
-  const annualGaps = findAnnualRevenueGapsNeedingBackfill(quarterlyReports, annualReports);
-  if (!quarterlyGaps.length && !annualGaps.length) return { quarterlyReports, annualReports };
+  const annualGapsFromQuarters = findAnnualRevenueGapsNeedingBackfill(quarterlyReports, annualReports);
+  // Only sparse-history tickers pay the extra lookup, and only they can gain
+  // earlier years from it -- see findSecOnlyAnnualRevenueYears.
+  const mayNeedSecAnnualHistory = hasSparseAnnualHistory(annualReports);
+  if (!quarterlyGaps.length && !annualGapsFromQuarters.length && !mayNeedSecAnnualHistory) return { quarterlyReports, annualReports };
   if (!cik) return { quarterlyReports, annualReports };
 
   const byPeriod = await fetchSecRevenueFactsByPeriod(cik);
   if (!byPeriod.size) return { quarterlyReports, annualReports };
+
+  const seenGapYears = new Set(annualGapsFromQuarters.map((g) => g.year));
+  const annualGaps = [...annualGapsFromQuarters];
+  if (mayNeedSecAnnualHistory) {
+    for (const gap of findSecOnlyAnnualRevenueYears(annualReports, byPeriod)) {
+      if (!seenGapYears.has(gap.year)) {
+        seenGapYears.add(gap.year);
+        annualGaps.push(gap);
+      }
+    }
+  }
 
   const referenceCik = quarterlyReports[0]?.cik ?? annualReports?.[0]?.cik;
   const filledQuarters = [];
