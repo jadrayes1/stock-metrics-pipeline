@@ -1482,6 +1482,22 @@ async function backfillRevenueGapsFromSec(symbol, cik, quarterlyReports, annualR
   if (filledQuarters.length || filledAnnuals.length) {
     console.log(`  ${symbol}: backfilled ${filledQuarters.length} quarterly + ${filledAnnuals.length} annual revenue gap(s) from SEC (Finnhub crawl gap)`);
   }
+  if (process.env.DEBUG_SEC_ENRICHMENT) {
+    console.error(
+      `DEBUG revenue-backfill ${symbol}`,
+      JSON.stringify({
+        annualYearsBefore: (annualReports || []).map((r) => r?.year),
+        sparse: mayNeedSecAnnualHistory,
+        annualGapsProposed: annualGaps.map((g) => `${g.year}:${g.expectedStart}|${g.expectedEnd}`),
+        annualGapsMatched: filledAnnuals.map((r) => r.year),
+        secAnnualPeriodsAvailable: [...byPeriod.keys()].filter((k) => {
+          const [s, e] = k.split('|');
+          const days = (new Date(e) - new Date(s)) / 86400000;
+          return days > 300 && days < 400;
+        }),
+      })
+    );
+  }
   return {
     quarterlyReports: filledQuarters.length ? [...quarterlyReports, ...filledQuarters] : quarterlyReports,
     annualReports: filledAnnuals.length ? [...(annualReports || []), ...filledAnnuals] : annualReports,
