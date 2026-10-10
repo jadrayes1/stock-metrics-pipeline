@@ -154,7 +154,25 @@ const ALLOWED_MICS = new Set(['XNAS', 'XNYS', 'XASE']); // NASDAQ, NYSE, NYSE Am
 // unintentional omission from the original list rather than a deliberate
 // choice, not a special "ADR" concept this pipeline needs to treat
 // differently downstream.
-const ALLOWED_TYPES = new Set(['Common Stock', 'REIT', 'ADR']);
+// 'NY Reg Shrs' added 2026-10-10, the same omission one class further out:
+// ASML was absent from marketMetrics, every trends file AND the ticker
+// search index -- not missing data, missing from the universe entirely --
+// because Finnhub tags it `type: "NY Reg Shrs"` ("ASML HOLDING NV-NY REG
+// SHS"), which is also the share class its 13F holders report as "N Y
+// REGISTRY SHS". A New York registry share is a direct registration of the
+// foreign company's own shares, so it is if anything closer to common stock
+// than the ADRs this list already allows, and every metric here applies
+// unchanged. Verified live against Finnhub's own /stock/symbol response
+// (DEBUG_UNIVERSE_TYPES): just 5 symbols on the allowed MICs carry this
+// type, so this cannot quietly flood the universe.
+//
+// Deliberately NOT added: 'MLP' (24), 'Ltd Part' (5) and 'Royalty Trst'
+// (10) are real operating businesses whose metrics would partly compute,
+// but their partnership/trust accounting differs enough (no ordinary
+// shareholders' equity, distributions rather than dividends) that ROIC and
+// the valuation multiples need their own thinking first -- a separate
+// decision, not a filter tweak.
+const ALLOWED_TYPES = new Set(['Common Stock', 'REIT', 'ADR', 'NY Reg Shrs']);
 
 // This script runs server-side (locally or in the pipeline repo's GitHub
 // Actions workflow), never bundled into the app, so it reads keys straight
