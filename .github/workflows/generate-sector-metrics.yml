@@ -118,6 +118,10 @@ on:
         description: 'Optional: call processSymbol for exactly this one symbol and print its result/error, then exit early without publishing (DEBUG_TRACE_SYMBOL)'
         required: false
         type: string
+      debugUniverseTypes:
+        description: 'Optional: comma-separated tickers to look up in Finnhub raw /stock/symbol response; also logs the type distribution across the allowed MICs (DEBUG_UNIVERSE_TYPES)'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -180,6 +184,7 @@ jobs:
           DEBUG_SEC_ENRICHMENT: ${{ inputs.debug }}
           DEBUG_REVENUE_ITEMS: ${{ inputs.debug }}
           DEBUG_TRACE_SYMBOL: ${{ inputs.debugTraceSymbol }}
+          DEBUG_UNIVERSE_TYPES: ${{ inputs.debugUniverseTypes }}
         run: node scripts/generateSectorMetrics.js
 
       # DCF cap + fallback (real analyst price targets via yfinance,

@@ -187,6 +187,16 @@ async function fetchUniverse(apiKey) {
   const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/symbol?exchange=US&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status} fetching symbol universe`);
   const all = await res.json();
+  if (process.env.DEBUG_UNIVERSE_TYPES) {
+    const byType = {};
+    for (const s of all) if (ALLOWED_MICS.has(s.mic)) byType[s.type || '(null)'] = (byType[s.type || '(null)'] || 0) + 1;
+    console.error('DEBUG universe types on allowed MICs:', JSON.stringify(byType));
+    const probe = (process.env.DEBUG_UNIVERSE_TYPES || '').split(',').map((x) => x.trim().toUpperCase()).filter(Boolean);
+    for (const sym of probe) {
+      const hits = all.filter((s) => (s.symbol || '').toUpperCase() === sym);
+      console.error(`DEBUG universe probe ${sym}:`, hits.length ? JSON.stringify(hits.map((h) => ({ mic: h.mic, type: h.type, desc: h.description }))) : 'NOT IN FINNHUB UNIVERSE');
+    }
+  }
   return all
     .filter((s) => ALLOWED_MICS.has(s.mic) && ALLOWED_TYPES.has(s.type))
     .map((s) => ({ symbol: s.symbol, name: s.description || null, type: s.type || null }))
