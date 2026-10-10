@@ -87,6 +87,35 @@ for (const file of ['trendsNative.json', 'trendsQuarterly.json', 'trendsYearly.j
   console.log(`Merged ${targets.join(', ')} into ${file}.`);
 }
 
+// tickerSearchIndex.json — merge the target's own row only. The index this
+// run built is complete (buildTickerSearchIndex reads the full unfiltered
+// universe BEFORE any TARGET_SYMBOL filtering), but it was never published
+// from a targeted run at all, so a ticker newly entering the universe could
+// get real metrics and real trends and still not be findable in search.
+// Verified live: ASML had marketMetrics and 12 points per yearly metric
+// published while tickerSearchIndex.json was still the previous full run's
+// copy, which predated the ALLOWED_TYPES fix that admitted it. Merging the
+// row rather than copying the file wholesale means a partial universe fetch
+// can only ever fail to ADD a ticker, never drop the ones already listed.
+const freshSearchIndex = readJson('src/data/tickerSearchIndex.json');
+const gistSearchIndexPath = path.join(GIST_CLONE_DIR, 'tickerSearchIndex.json');
+const gistSearchIndex = readJson(gistSearchIndexPath);
+let searchRowsChanged = 0;
+for (const target of targets) {
+  const freshRow = (freshSearchIndex.tickers || []).find((r) => r.symbol === target);
+  const existingIdx = (gistSearchIndex.tickers || []).findIndex((r) => r.symbol === target);
+  if (!freshRow) continue;
+  if (existingIdx >= 0) gistSearchIndex.tickers[existingIdx] = freshRow;
+  else gistSearchIndex.tickers.push(freshRow);
+  searchRowsChanged++;
+}
+if (searchRowsChanged) {
+  gistSearchIndex.tickers.sort((a, b) => a.symbol.localeCompare(b.symbol));
+  gistSearchIndex.generatedAt = freshSearchIndex.generatedAt;
+  writeJson(gistSearchIndexPath, gistSearchIndex);
+  console.log(`Merged ${searchRowsChanged} row(s) into tickerSearchIndex.json (${gistSearchIndex.tickers.length} tickers total).`);
+}
+
 // dcfCapCandidates.json — merge candidates[target] only (every other
 // ticker's candidate must survive untouched, or apply-dcf-cap.yml's next
 // workflow_run-triggered pass would silently stop reprocessing them).
