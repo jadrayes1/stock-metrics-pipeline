@@ -1137,10 +1137,44 @@ function buildPfcfTrendFromFilingsAndPrices(quarterlyReports, annualReports, mon
     const endDate = endDateByKey[`${year}-${quarter}`];
     const price = findClosestMonthlyPrice(monthlyPrices, endDate ? new Date(endDate) : quarterEndDate(year, quarter));
     const value = price != null && ttmFcfPerShare !== 0 ? price / ttmFcfPerShare : null;
-    return { label: `Q${quarter} '${String(year).slice(-2)}`, value, partial, quartersUsed: quarters.length };
+    return { label: calendarQuarterLabelFor(endDateByKey, year, quarter), value, partial, quartersUsed: quarters.length };
   });
 
   return points.slice(-QUARTERS_OF_HISTORY);
+}
+
+// Finnhub's own `year`/`quarter` fields follow each filer's OWN fiscal-year
+// numbering, not the calendar, and this file labelled its points straight
+// from them while every OTHER trend in the app labels the same quarter by
+// calendar. Verified live: James Hardie (JHX) closes its fiscal year on
+// March 31, so the quarter ending June 2026 -- real, already reported -- is
+// fiscal Q1 of FY2027, and its P/FCF and P/E trends read "Q1 '27" while
+// trendsQuarterly called the very same quarter "Q2 '26". A label a year
+// ahead of the calendar reads as data for a quarter that hasn't happened.
+//
+// The same calendar-label mechanism already exists in
+// generateSectorMetrics.js (buildCalendarLabelsByFiscalKey /
+// calendarQuarterLabel); this is the counterpart for this file, computed
+// from the period's own real end date, which buildEndDateByQuarterKey
+// already collects. Falls back to the fiscal-derived label when no end date
+// is available, so a point is never dropped for want of one.
+function quarterLabelFromEndDate(endDate) {
+  if (!endDate) return null;
+  const d = new Date(endDate);
+  if (Number.isNaN(d.getTime())) return null;
+  return `Q${Math.floor(d.getUTCMonth() / 3) + 1} '${String(d.getUTCFullYear()).slice(-2)}`;
+}
+
+function calendarQuarterLabelFor(endDateByKey, year, quarter) {
+  return quarterLabelFromEndDate(endDateByKey?.[`${year}-${quarter}`]) || `Q${quarter} '${String(year).slice(-2)}`;
+}
+
+// A fiscal YEAR ending in a future calendar year is just as misleading, so
+// the annual label comes from that period's own end date where it is known.
+function calendarYearlyLabelFromEndDate(endDate, year) {
+  const label = quarterLabelFromEndDate(endDate);
+  const m = label && label.match(/'(\d{2})$/);
+  return m ? `FY '${m[1]}` : `FY '${String(year).slice(-2)}`;
 }
 
 function yearlyLabel(year) {
@@ -1193,7 +1227,7 @@ function buildPfcfQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports,
     const endDate = endDateByKey[key];
     const price = findClosestMonthlyPrice(monthlyPrices, endDate ? new Date(endDate) : quarterEndDate(year, quarter));
     const value = price != null && annualizedFcfPerShare !== 0 ? price / annualizedFcfPerShare : null;
-    if (value != null) points.push({ year, quarter, label: `Q${quarter} '${String(year).slice(-2)}`, value });
+    if (value != null) points.push({ year, quarter, label: calendarQuarterLabelFor(endDateByKey, year, quarter), value });
   }
   return points
     .sort((a, b) => a.year - b.year || a.quarter - b.quarter)
@@ -1254,7 +1288,7 @@ function buildPfcfYearlyFromFilingsAndPrices(annualReports, monthlyPrices, isBan
     const periodEndDate = a.endDate ? new Date(a.endDate) : quarterEndDate(a.year, 4);
     const price = findClosestMonthlyPrice(monthlyPrices, periodEndDate);
     const value = price != null && fcfPerShare !== 0 ? price / fcfPerShare : null;
-    if (value != null) points.push({ year: a.year, label: yearlyLabel(a.year), value });
+    if (value != null) points.push({ year: a.year, label: calendarYearlyLabelFromEndDate(a.endDate, a.year), value });
   }
   return points
     .sort((a, b) => a.year - b.year)
@@ -1315,7 +1349,7 @@ function buildPeTrendFromFilingsAndPrices(quarterlyReports, annualReports, month
     const endDate = endDateByKey[`${year}-${quarter}`];
     const price = findClosestMonthlyPrice(monthlyPrices, endDate ? new Date(endDate) : quarterEndDate(year, quarter));
     const value = price != null && ttmEps !== 0 ? price / ttmEps : null;
-    return { label: `Q${quarter} '${String(year).slice(-2)}`, value, partial, quartersUsed: quarters.length };
+    return { label: calendarQuarterLabelFor(endDateByKey, year, quarter), value, partial, quartersUsed: quarters.length };
   });
 
   return points.slice(-QUARTERS_OF_HISTORY);
@@ -1356,7 +1390,7 @@ function buildPeQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, m
     const endDate = endDateByKey[key];
     const price = findClosestMonthlyPrice(monthlyPrices, endDate ? new Date(endDate) : quarterEndDate(year, quarter));
     const value = price != null && annualizedEps !== 0 ? price / annualizedEps : null;
-    if (value != null) points.push({ year, quarter, label: `Q${quarter} '${String(year).slice(-2)}`, value });
+    if (value != null) points.push({ year, quarter, label: calendarQuarterLabelFor(endDateByKey, year, quarter), value });
   }
   return points
     .sort((a, b) => a.year - b.year || a.quarter - b.quarter)
@@ -1383,7 +1417,7 @@ function buildPeYearlyFromFilingsAndPrices(annualReports, monthlyPrices, quarter
     const periodEndDate = a.endDate ? new Date(a.endDate) : quarterEndDate(a.year, 4);
     const price = findClosestMonthlyPrice(monthlyPrices, periodEndDate);
     const value = price != null && eps !== 0 ? price / eps : null;
-    if (value != null) points.push({ year: a.year, label: yearlyLabel(a.year), value });
+    if (value != null) points.push({ year: a.year, label: calendarYearlyLabelFromEndDate(a.endDate, a.year), value });
   }
   return points
     .sort((a, b) => a.year - b.year)
