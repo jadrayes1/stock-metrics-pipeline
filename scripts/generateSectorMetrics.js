@@ -232,8 +232,34 @@ async function fetchUniverse(apiKey) {
 // deliberately built from the FULL, unfiltered universeEntries (before any
 // TARGET_SYMBOL debug filtering is applied to `symbols` below), so a
 // single-symbol debug run never publishes a truncated index.
+// A few companies trade under a brand that shares NO words with the legal
+// name their filings and Finnhub's description use, so a search for the
+// only name anyone knows them by returns nothing at all. Verified live:
+// Instacart files as "Maplebear Inc." (SEC's own registered name for CART,
+// no former names), and not one row in the published index mentioned
+// "Instacart" -- typing it found nothing. Appending the trade name to the
+// index's `name` is enough on its own: searchTickerIndex already matches
+// `name` with startsWith/includes, so no app change is needed, and the
+// result row then reads "MAPLEBEAR INC (INSTACART)", which also explains
+// the unfamiliar name rather than just making it reachable.
+//
+// Deliberately kept to cases where the legal name shares no word with the
+// brand. Alphabet/Meta Platforms/DoorDash/Airbnb/Block and the rest all
+// already contain what someone would type, and guessing at product-level
+// aliases ("Square" for Block, "Tinder" for Match) would be editorialising
+// rather than fixing an unreachable row.
+const TRADE_NAME_ALIASES = {
+  CART: 'Instacart',
+  GOOGL: 'Google',
+  GOOG: 'Google',
+};
+
 function buildTickerSearchIndex(universeEntries) {
-  return universeEntries.map((e) => ({ symbol: e.symbol, name: e.name, type: e.type }));
+  return universeEntries.map((e) => {
+    const alias = TRADE_NAME_ALIASES[e.symbol];
+    const name = alias && e.name && !e.name.toUpperCase().includes(alias.toUpperCase()) ? `${e.name} (${alias.toUpperCase()})` : e.name;
+    return { symbol: e.symbol, name, type: e.type };
+  });
 }
 
 function sleep(ms) {
