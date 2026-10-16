@@ -1458,8 +1458,29 @@ function parseLabelToOrdinal(label) {
 function pickTrendToPublish(existingPoints, freshPoints) {
   if (!existingPoints || existingPoints.length === 0) return freshPoints || [];
   if (!freshPoints || freshPoints.length === 0) return existingPoints;
+  // A point whose LABEL changed is invisible to the label-keyed merge below:
+  // the corrected point looks brand new, the stale one still looks current,
+  // and the same period ends up published twice under two names. Verified
+  // live after the fiscal-to-calendar label fix: JHX's quarterly P/FCF came
+  // out as "Q2 '26" AND "Q1 '27", both holding exactly
+  // 15.107441974822974 -- one period, two labels.
+  //
+  // Detected by exact value equality, which is a dependable signal for a
+  // relabelled point (identical inputs through identical arithmetic) and
+  // essentially impossible for two genuinely different quarters to hit to
+  // full float precision. Only an EXISTING point is dropped, and only when
+  // a fresh point carries that same value under a different label, so a
+  // real repeated value that the fresh series also reports under the same
+  // label is untouched.
+  const freshLabelByValue = new Map();
+  for (const p of freshPoints) if (p.value != null && !freshLabelByValue.has(p.value)) freshLabelByValue.set(p.value, p.label);
+  const survivingExisting = existingPoints.filter((p) => {
+    if (p.value == null) return true;
+    const freshLabel = freshLabelByValue.get(p.value);
+    return freshLabel === undefined || freshLabel === p.label;
+  });
   const merged = new Map();
-  for (const p of existingPoints) merged.set(p.label, p);
+  for (const p of survivingExisting) merged.set(p.label, p);
   for (const p of freshPoints) if (!merged.has(p.label)) merged.set(p.label, p);
   return [...merged.values()]
     .sort((a, b) => {
