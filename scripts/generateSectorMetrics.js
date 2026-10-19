@@ -5433,7 +5433,10 @@ async function main() {
       // capex gap can be caused either by a concept we do not recognise OR
       // by the line being absent from the upstream feed entirely, and those
       // two look identical from the published trends alone.
-      if (process.env.DEBUG_CF_ITEMS) {
+      // Always dumped on a trace run: DEBUG_TRACE_SYMBOL already returns
+      // before any publish, so there is nothing to protect with a second flag
+      // (and a flag with no workflow input wired to it never fires at all).
+      {
         try {
           const annualReports = await fetchReportedFinancialsFor(target, apiKeys[0]);
           const quarterlyReports = await fetchReportedFinancialsQuarterlyFor(target, apiKeys[0]);
