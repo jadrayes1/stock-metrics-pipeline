@@ -3391,14 +3391,23 @@ function buildAnnualFlowPoints(annualReports, fieldSpecs) {
     return false;
   });
 
-  return filtered
-    .map((a) => {
-      const record = { year: a.year };
-      for (const [name, { fn, section }] of Object.entries(fieldSpecs)) {
-        record[name] = fn(a.report?.[section] || []);
-      }
-      return record;
-    })
+  const mapped = filtered.map((a) => {
+    const record = { year: a.year };
+    for (const [name, { fn, section }] of Object.entries(fieldSpecs)) {
+      record[name] = fn(a.report?.[section] || []);
+    }
+    return record;
+  });
+  if (process.env.DEBUG_ANNUAL_FLOW) {
+    const fields = Object.keys(fieldSpecs).join('/');
+    console.error(
+      `DEBUG annual-flow [${fields}] cik=${currentCik} reports=${(annualReports || []).length} afterCikAndPeriod=${filtered.length} kept=${mapped.filter((r) => Object.keys(fieldSpecs).every((n) => r[n] != null)).length}`
+    );
+    for (const r of mapped.slice(0, 6)) {
+      console.error(`DEBUG annual-flow   year=${r.year} ` + Object.keys(fieldSpecs).map((n) => `${n}=${r[n]}`).join(' '));
+    }
+  }
+  return mapped
     .filter((record) => Object.keys(fieldSpecs).every((name) => record[name] != null))
     .sort((a, b) => a.year - b.year);
 }
@@ -5433,6 +5442,7 @@ async function main() {
       // capex gap can be caused either by a concept we do not recognise OR
       // by the line being absent from the upstream feed entirely, and those
       // two look identical from the published trends alone.
+      process.env.DEBUG_ANNUAL_FLOW = '1';
       // Always dumped on a trace run: DEBUG_TRACE_SYMBOL already returns
       // before any publish, so there is nothing to protect with a second flag
       // (and a flag with no workflow input wired to it never fires at all).
