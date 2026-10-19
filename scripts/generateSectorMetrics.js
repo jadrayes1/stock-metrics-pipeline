@@ -2509,6 +2509,36 @@ const REPORTED_CAPEX_LABEL =
 // bank and wrong for a non-depository "Financial Services" filer.
 const MIN_PERIODS_TO_CONCLUDE_NO_CAPEX = 8; // ~2 years of filings -- a sparse filer with one or two reports hasn't demonstrated anything
 
+// Weaker sibling of filerNeverDisclosesCapex below, WITHOUT the period
+// floor: true when no period anywhere carries a capex concept or a
+// capex-like label, regardless of how many periods there are. Used only to
+// decide whether a resulting FCF margin needs the plausibility bound, never
+// to substitute a zero.
+//
+// The distinction matters because findReportedCapexQ has TWO ways of
+// treating capex as zero, and the bound has to cover both. The second one
+// predates this work: a filer whose cash-flow items carry no
+// "investing activities" label at all already returned a real 0 (the SPRO
+// fix). Verified live that this is what AGNC, APA and BAC go through --
+// with fresh authoritative under a targeted recompute their values
+// persisted unchanged, which is only possible if filerNeverDisclosesCapex
+// returned FALSE for them and the bound never ran. So their wild margins
+// (AGNC FY '14 = -17.63, APA Q2 '23 = 6.94, BAC Q3 '24 = -1.47) were NOT
+// introduced here; they are pre-existing behaviour that a targeted
+// republish merely surfaced, since those series had never been
+// recomputed. Bounding on this weaker test covers them too.
+function filerCapexNeverFound(...reportSets) {
+  for (const reports of reportSets) {
+    for (const r of reports || []) {
+      const cfItems = r?.report?.cf || [];
+      if (!cfItems.length) continue;
+      if (cfItems.some((item) => REPORTED_CAPEX_CONCEPTS.includes(item.concept))) return false;
+      if (cfItems.some((item) => REPORTED_CAPEX_LABEL.test(item.label || ''))) return false;
+    }
+  }
+  return true;
+}
+
 function filerNeverDisclosesCapex(...reportSets) {
   let periodsWithInvestingSection = 0;
   for (const reports of reportSets) {
@@ -2922,6 +2952,9 @@ function buildFcfMarginTrendFromFilings(quarterlyReports, annualReports) {
   // See filerNeverDisclosesCapex -- only ever true for a filer that reports
   // an investing section repeatedly and never a capex line in any of them.
   const noCapex = filerNeverDisclosesCapex(quarterlyReports, annualReports);
+  // Bound on the WEAKER test -- capex was never actually found, however the
+  // zero got there. See filerCapexNeverFound.
+  const capexAssumed = filerCapexNeverFound(quarterlyReports, annualReports);
   const findCapex = (cfItems) => findReportedCapexQ(cfItems, noCapex);
   const ocf = decumulateYtdByYear(quarterlyReports, annualReports, findReportedOperatingCashFlowQ, 'cf');
   const capex = decumulateYtdByYear(quarterlyReports, annualReports, findCapex, 'cf');
@@ -2945,7 +2978,7 @@ function buildFcfMarginTrendFromFilings(quarterlyReports, annualReports) {
     const { year, quarter } = anchor;
     return {
       label: calendarQuarterLabel(calendarLabels, year, quarter),
-      value: plausibleOnAssumedZeroCapex(ttmRevenue ? ttmFcf / ttmRevenue : null, noCapex),
+      value: plausibleOnAssumedZeroCapex(ttmRevenue ? ttmFcf / ttmRevenue : null, capexAssumed),
       partial,
       quartersUsed: quarters.length,
     };
@@ -3318,6 +3351,7 @@ function yearlyLabel(year) {
 function buildFcfMarginQuarterlyFromFilings(quarterlyReports, annualReports) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
   const noCapex = filerNeverDisclosesCapex(quarterlyReports, annualReports);
+  const capexAssumed = filerCapexNeverFound(quarterlyReports, annualReports);
   const records = buildStandaloneFlowQuarters(quarterlyReports, annualReports, {
     ocf: { fn: findReportedOperatingCashFlowQ, section: 'cf' },
     capex: { fn: (cfItems) => findReportedCapexQ(cfItems, noCapex), section: 'cf' },
@@ -3326,7 +3360,7 @@ function buildFcfMarginQuarterlyFromFilings(quarterlyReports, annualReports) {
   return records
     .map((r) => ({
       label: calendarQuarterLabel(calendarLabels, r.year, r.quarter),
-      value: plausibleOnAssumedZeroCapex(clampImplausible(r.revenue ? (r.ocf - r.capex) / r.revenue : null), noCapex),
+      value: plausibleOnAssumedZeroCapex(clampImplausible(r.revenue ? (r.ocf - r.capex) / r.revenue : null), capexAssumed),
     }))
     .filter((p) => p.value != null)
     .slice(-QUARTERS_OF_HISTORY);
@@ -3338,6 +3372,7 @@ function buildFcfMarginYearlyFromFilings(annualReports, quarterlyReports = null)
   // never-discloses probe (annual reports alone rarely reach the 8-period
   // floor); they are NOT used to build any yearly point.
   const noCapex = filerNeverDisclosesCapex(annualReports, quarterlyReports);
+  const capexAssumed = filerCapexNeverFound(annualReports, quarterlyReports);
   const records = buildAnnualFlowPoints(annualReports, {
     ocf: { fn: findReportedOperatingCashFlowQ, section: 'cf' },
     capex: { fn: (cfItems) => findReportedCapexQ(cfItems, noCapex), section: 'cf' },
@@ -3346,7 +3381,7 @@ function buildFcfMarginYearlyFromFilings(annualReports, quarterlyReports = null)
   return records
     .map((r) => ({
       label: calendarYearlyLabel(calendarLabels, r.year),
-      value: plausibleOnAssumedZeroCapex(clampImplausible(r.revenue ? (r.ocf - r.capex) / r.revenue : null), noCapex),
+      value: plausibleOnAssumedZeroCapex(clampImplausible(r.revenue ? (r.ocf - r.capex) / r.revenue : null), capexAssumed),
     }))
     .filter((p) => p.value != null)
     .slice(-QUARTERS_OF_HISTORY);
