@@ -3402,9 +3402,52 @@ function buildProfitMarginTTMFromFilings(quarterlyReports, annualReports) {
 // denominator flipping it (a lossmaking company reads as negative ROIC,
 // not a flattering positive one). Only null on a genuine division-by-zero
 // (debt + equity - cash landing on exactly 0), vanishingly rare.
+// How much of a non-bank filer's cash balance is treated as EXCESS (idle)
+// and therefore netted out of invested capital. 1 = net all of it (the
+// original behaviour), 0 = treat the whole balance as operating cash and
+// net none of it. Set to 0 per explicit product decision 2026-10-18.
+//
+// Netting the full balance made ROIC meaningless for a cash-rich filer: it
+// collapses the denominator while NOPAT stays whole. Verified live on real,
+// filing-confirmed inputs -- ASML at 2026-09-27 had equity 22.06B, debt
+// 1.96B and cash 8.03B (the 8,030.9 in its own EX-99.3), so invested
+// capital came out 15.99B against 16.35B of annualized NOPAT: ROIC 102% for
+// a semiconductor-equipment maker whose real return is well under half
+// that. Un-netted it reads 0.68.
+//
+// A revenue-proportional "operating cash" reserve (the usual 2%-of-revenue
+// rule) was measured first and rejected as a near no-op for exactly these
+// filers: ASML holds cash worth ~43% of annual revenue, so a 2% reserve
+// moved invested capital 9.4B -> 10.0B and ROIC 1.15 -> 1.08. The problem
+// is not cash slightly above operating needs, it's cash comparable to the
+// entire equity base, which a revenue-scaled reserve cannot reach.
+//
+// Netting nothing also removes a DISCONTINUITY that was its own bug source.
+// The old code kept `debt + equity - cash` whenever it landed above zero and
+// only fell back to `debt + equity` at <= 0, so a denominator that was
+// merely ACCIDENTALLY positive survived. Verified live: PLTR at 2021-12-31
+// reported equity 2,291,030,000 against cash 2,290,674,000 -- within 0.016%
+// -- leaving a 356,000 denominator on a 2.3B balance sheet and a published
+// ROIC of -912. There is no such cliff when no cash is netted.
+//
+// This already matches what the pipeline does elsewhere: banks are exempt
+// from cash-netting at every call site (a bank's balance includes
+// central-bank reserves and interbank deposits, core operating assets --
+// netting them computed BMO at 34-57% against a real ~3%), and the <= 0
+// fallback below was itself an un-netted figure. Direction is safe by
+// construction: invested capital can only grow, so ROIC moves toward zero,
+// no point can newly breach clampImplausible, and some previously clamped
+// points return as real data.
+const EXCESS_CASH_NETTING_FRACTION = 0;
+
 function computeInvestedCapital(debt, equity, cash) {
-  const netOfCash = debt + equity - cash;
+  const netOfCash = debt + equity - cash * EXCESS_CASH_NETTING_FRACTION;
   if (netOfCash > 0) return netOfCash;
+  // Unchanged shape: a filer whose netted figure is non-positive still falls
+  // back to the un-netted one, and a genuinely negative book equity is still
+  // published (every call site divides by Math.abs, so EBIT's sign drives
+  // ROIC's sign). With the fraction at 0 these two are the same number, so
+  // this only matters if the fraction is ever tuned back up.
   const withoutCash = debt + equity;
   return withoutCash !== 0 ? withoutCash : null;
 }
@@ -3709,12 +3752,47 @@ function parseLabelToOrdinal(label) {
 // routinely recover previously-missing older quarters, not just newer
 // ones) and re-capped at the same QUARTERS_OF_HISTORY rolling window the
 // builders already use.
-function pickTrendToPublish(existingPoints, freshPoints) {
+// Metrics this run may REPLACE rather than union-protect, comma-separated
+// (RECOMPUTE_METRICS=roic). Mirrors the identically-named mechanism in
+// foreign-filings-pipeline's generateForeignFilingsCache.js, which carries
+// the full rationale.
+//
+// The union below keeps every published point forever and never overwrites
+// one. That guards against a transiently-wrong fresh run, but makes a
+// deliberate FORMULA change impossible to land, because the corrected value
+// carries the SAME label as the published one and is dropped every time.
+// Verified live 2026-10-18: setting EXCESS_CASH_NETTING_FRACTION to 0 moved
+// ASML's invested capital 15.99B -> 24.02B, yet a 14-ticker run over 168
+// series reported ZERO roic changes. This affected every value-level
+// correction in both pipelines, not just that one.
+//
+// An explicit per-run opt-in rather than a change to the merge itself: the
+// protection is load-bearing, so it is lifted only for the named metrics and
+// only when asked for.
+const RECOMPUTE_METRICS = new Set(
+  (process.env.RECOMPUTE_METRICS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
+
+function pickTrendToPublish(existingPoints, freshPoints, metricKey = null) {
   if (!existingPoints || existingPoints.length === 0) return freshPoints || [];
   if (!freshPoints || freshPoints.length === 0) return existingPoints;
+  // A recomputed metric is STILL a union -- only the precedence flips, so
+  // fresh overwrites a label it recomputed while every published label fresh
+  // does NOT cover survives untouched.
+  //
+  // Returning freshPoints outright instead was tried first and lost real
+  // data: fresh is often narrower than the accumulated published series, and
+  // once the newest labels went missing the isRecentEnough gate in
+  // pickCadenceMetric discarded the whole series. Verified live on the
+  // sibling pipeline -- PAC's and TSM's yearly roic (11 and 9 real points)
+  // both emptied completely.
+  const recomputing = metricKey && RECOMPUTE_METRICS.has(metricKey);
   const merged = new Map();
   for (const p of existingPoints) merged.set(p.label, p);
-  for (const p of freshPoints) if (!merged.has(p.label)) merged.set(p.label, p);
+  for (const p of freshPoints) if (recomputing || !merged.has(p.label)) merged.set(p.label, p);
   return [...merged.values()]
     .sort((a, b) => {
       const oa = parseLabelToOrdinal(a.label);
@@ -3796,9 +3874,9 @@ function isRecentEnough(points, cutoffMonths = RECENCY_CUTOFF_MONTHS) {
 // future-report filter above now prevents this at the source going
 // forward; revisit an "existing" sanitizer here only with concrete
 // evidence of already-published bad data, not preemptively.
-function pickCadenceMetric(existingPoints, freshPoints) {
+function pickCadenceMetric(existingPoints, freshPoints, metricKey = null) {
   const recentExisting = isRecentEnough(existingPoints) ? existingPoints : [];
-  const picked = pickTrendToPublish(recentExisting, freshPoints);
+  const picked = pickTrendToPublish(recentExisting, freshPoints, metricKey);
   return isRecentEnough(picked) ? picked : [];
 }
 
@@ -4353,7 +4431,7 @@ async function processSymbol(symbol, apiKey, ctx) {
   const previousNativeForSymbol = previouslyPublishedNativeTrends[symbol] || {};
   const mergedNativeForSymbol = {};
   for (const key of ['roic', 'revenueGrowth', 'profitMargin', 'fcfMargin', 'peRatio', 'pfcfRatio']) {
-    const published = pickCadenceMetric(previousNativeForSymbol[key], freshNativeTrends[key]);
+    const published = pickCadenceMetric(previousNativeForSymbol[key], freshNativeTrends[key], key);
     if (published.length) mergedNativeForSymbol[key] = published;
   }
 
@@ -4680,7 +4758,7 @@ async function processSymbol(symbol, apiKey, ctx) {
       // A single metric's oddly-shaped filing shouldn't take down the
       // others — pickTrendToPublish falls back to the previous run.
     }
-    let published = pickCadenceMetric(previousYearlyForSymbol[key], fresh);
+    let published = pickCadenceMetric(previousYearlyForSymbol[key], fresh, key);
     if (!published.length) {
       const foreignPoints = foreignFilingsTrendsForSymbol?.yearly?.[key];
       if (foreignPoints?.length) published = foreignPoints;
@@ -4695,7 +4773,7 @@ async function processSymbol(symbol, apiKey, ctx) {
       if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG quarterly builder threw', symbol, key, e.message, e.stack);
       // Same graceful-degradation philosophy as above.
     }
-    let published = pickCadenceMetric(previousQuarterlyForSymbol[key], fresh);
+    let published = pickCadenceMetric(previousQuarterlyForSymbol[key], fresh, key);
     if (!published.length) {
       const foreignPoints = foreignFilingsTrendsForSymbol?.quarterly?.[key];
       if (foreignPoints?.length) published = foreignPoints;
@@ -4710,7 +4788,7 @@ async function processSymbol(symbol, apiKey, ctx) {
       if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG ttm builder threw', symbol, key, e.message, e.stack);
       // Same graceful-degradation philosophy as above.
     }
-    let published = pickCadenceMetric(previousTtmForSymbol[key], fresh);
+    let published = pickCadenceMetric(previousTtmForSymbol[key], fresh, key);
     if (!published.length) {
       const foreignPoints = foreignFilingsTrendsForSymbol?.ttm?.[key];
       if (foreignPoints?.length) published = foreignPoints;
