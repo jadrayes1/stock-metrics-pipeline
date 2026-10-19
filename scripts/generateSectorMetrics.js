@@ -5440,12 +5440,26 @@ async function main() {
         try {
           const annualReports = await fetchReportedFinancialsFor(target, apiKeys[0]);
           const quarterlyReports = await fetchReportedFinancialsQuarterlyFor(target, apiKeys[0]);
-          for (const r of (annualReports || []).slice(-2)) {
-            console.error(`DEBUG [${target}] ANNUAL ${r.year} cf items:`, JSON.stringify((r.report?.cf || []).map((i) => `${i.concept}|${i.label}`)));
+          // Sorted by YEAR, not array position -- financials-reported comes
+          // back newest-first, so slice(-n) returns the OLDEST reports.
+          const newest = [...(annualReports || [])].sort((a, b) => b.year - a.year).slice(0, 4);
+          console.error(
+            `DEBUG [${target}] annual years available:`,
+            JSON.stringify([...(annualReports || [])].map((r) => r.year).sort((a, b) => b - a))
+          );
+          for (const r of newest) {
+            const cf = r.report?.cf || [];
+            const ic = r.report?.ic || [];
+            // Exactly the three inputs buildFcfMarginYearlyFromFilings needs.
+            console.error(
+              `DEBUG [${target}] ANNUAL ${r.year} inputs: ocf=${findReportedOperatingCashFlowQ(cf)} capex=${findReportedCapexQ(cf)} revenue=${findReportedRevenue(ic)}`
+            );
+            console.error(
+              `DEBUG [${target}] ANNUAL ${r.year} capex-ish cf lines:`,
+              JSON.stringify(cf.filter((i) => /propert|real ?estate|capital|construct|develop|acquisit/i.test(`${i.concept} ${i.label}`)).map((i) => `${i.concept}|${i.label}`))
+            );
           }
-          for (const r of (quarterlyReports || []).slice(-1)) {
-            console.error(`DEBUG [${target}] QUARTERLY ${r.year}-${r.quarter} cf items:`, JSON.stringify((r.report?.cf || []).map((i) => `${i.concept}|${i.label}`)));
-          }
+          console.error(`DEBUG [${target}] neverDiscloses=${filerNeverDisclosesCapex(quarterlyReports, annualReports)} stoppedImmaterial=${filerStoppedDisclosingImmaterialCapex(quarterlyReports, annualReports)} intensity=${knownCapexIntensity([quarterlyReports, annualReports])}`);
         } catch (e) {
           console.error(`DEBUG [${target}] cf-items dump failed:`, e.message);
         }
