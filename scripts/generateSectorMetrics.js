@@ -2509,6 +2509,72 @@ const REPORTED_CAPEX_LABEL =
 // bank and wrong for a non-depository "Financial Services" filer.
 const MIN_PERIODS_TO_CONCLUDE_NO_CAPEX = 8; // ~2 years of filings -- a sparse filer with one or two reports hasn't demonstrated anything
 
+// A filer that USED to disclose capex and stopped is the other half of the
+// native-but-no-cadence gap, and filerNeverDisclosesCapex refuses it by
+// design: it looks across the whole history, finds the old capex line, and
+// returns false, so the gap never closes. Verified live: ABNB tagged
+// PaymentsToAcquirePropertyPlantAndEquipment through 2023Q3 and nothing
+// since -- its 2025 filings carry no capex concept at all, only securities
+// purchases, buybacks and debt. Cigna (CI, last capex FY2019) and CTRE
+// (FY2019) are the same shape.
+//
+// Treating those recent periods as zero capex is safe ONLY when the capex
+// being missed is immaterial, and the filer's own history says how much
+// that is. Measured against real SEC annual data, capex intensity separates
+// the two populations cleanly with two orders of magnitude to spare:
+//
+//   ABNB 0.20%   CI 0.38%   CTRE 0.62%   SMXT 0.00%   <- safe to assume 0
+//   AMH 3.44%    DXR 8.51%  CRGY 22.9%   INO 437%     <- must not
+//
+// So a stale capex line permits the zero substitution only below
+// MAX_IMMATERIAL_CAPEX_INTENSITY. This is the materiality question the
+// blanket refusal was standing in for -- Avis tagging ~$7.8B of fleet
+// purchases under car_InvestmentInVehicles (~65% of revenue) is exactly
+// what must keep being refused, and an intensity test refuses it on the
+// numbers rather than on the mere presence of an old line.
+const MAX_IMMATERIAL_CAPEX_INTENSITY = 0.02; // 2% of revenue -- an order of magnitude above the ABNB/CI/CTRE cluster, an order below the lowest filer we must refuse
+const STALE_CAPEX_PERIODS = 4; // no capex line in the last ~year of reports while older ones have it
+
+// Last known capex-to-revenue ratio from the filer's own reports, or null
+// when either side is unavailable. Used only as a materiality gate.
+function knownCapexIntensity(reportSets) {
+  let latest = null;
+  for (const reports of reportSets) {
+    for (const r of reports || []) {
+      const cf = r?.report?.cf || [];
+      const ic = r?.report?.ic || [];
+      if (!cf.length || !ic.length) continue;
+      const capex = findReportedCapexQ(cf);
+      const revenue = findReportedRevenue(ic);
+      if (capex == null || !revenue) continue;
+      const key = `${r.year}-${r.quarter ?? 4}`;
+      if (!latest || key > latest.key) latest = { key, intensity: Math.abs(capex) / Math.abs(revenue) };
+    }
+  }
+  return latest ? latest.intensity : null;
+}
+
+// True for an ABNB-shaped filer: the most recent STALE_CAPEX_PERIODS reports
+// carry no capex line, older ones do, and the filer's own historical capex
+// was immaterial relative to revenue.
+function filerStoppedDisclosingImmaterialCapex(...reportSets) {
+  const reports = reportSets
+    .flatMap((r) => r || [])
+    .filter((r) => (r?.report?.cf || []).length)
+    .sort((a, b) => (a.year - b.year) || ((a.quarter ?? 4) - (b.quarter ?? 4)));
+  if (reports.length <= STALE_CAPEX_PERIODS) return false;
+  const hasCapexLine = (r) => {
+    const cf = r.report.cf;
+    return cf.some((i) => REPORTED_CAPEX_CONCEPTS.includes(i.concept)) || cf.some((i) => REPORTED_CAPEX_LABEL.test(i.label || ''));
+  };
+  const recent = reports.slice(-STALE_CAPEX_PERIODS);
+  const older = reports.slice(0, -STALE_CAPEX_PERIODS);
+  if (recent.some(hasCapexLine)) return false;   // still reporting it -- nothing stale
+  if (!older.some(hasCapexLine)) return false;   // never reported it -- that is filerNeverDisclosesCapex's case
+  const intensity = knownCapexIntensity(reportSets);
+  return intensity != null && intensity < MAX_IMMATERIAL_CAPEX_INTENSITY;
+}
+
 function filerNeverDisclosesCapex(...reportSets) {
   let periodsWithInvestingSection = 0;
   for (const reports of reportSets) {
@@ -2921,7 +2987,11 @@ function buildFcfMarginTrendFromFilings(quarterlyReports, annualReports) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
   // See filerNeverDisclosesCapex -- only ever true for a filer that reports
   // an investing section repeatedly and never a capex line in any of them.
-  const noCapex = filerNeverDisclosesCapex(quarterlyReports, annualReports);
+  // Either shape qualifies: never disclosed at all (TRV), or disclosed once
+  // and stopped while immaterial (ABNB). Both are bounded below.
+  const noCapex =
+    filerNeverDisclosesCapex(quarterlyReports, annualReports) ||
+    filerStoppedDisclosingImmaterialCapex(quarterlyReports, annualReports);
   const findCapex = (cfItems) => findReportedCapexQ(cfItems, noCapex);
   const ocf = decumulateYtdByYear(quarterlyReports, annualReports, findReportedOperatingCashFlowQ, 'cf');
   const capex = decumulateYtdByYear(quarterlyReports, annualReports, findCapex, 'cf');
@@ -3317,7 +3387,9 @@ function yearlyLabel(year) {
 
 function buildFcfMarginQuarterlyFromFilings(quarterlyReports, annualReports) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
-  const noCapex = filerNeverDisclosesCapex(quarterlyReports, annualReports);
+  const noCapex =
+    filerNeverDisclosesCapex(quarterlyReports, annualReports) ||
+    filerStoppedDisclosingImmaterialCapex(quarterlyReports, annualReports);
   const records = buildStandaloneFlowQuarters(quarterlyReports, annualReports, {
     ocf: { fn: findReportedOperatingCashFlowQ, section: 'cf' },
     capex: { fn: (cfItems) => findReportedCapexQ(cfItems, noCapex), section: 'cf' },
@@ -3337,7 +3409,9 @@ function buildFcfMarginYearlyFromFilings(annualReports, quarterlyReports = null)
   // Quarterly reports are passed purely to widen the evidence base for the
   // never-discloses probe (annual reports alone rarely reach the 8-period
   // floor); they are NOT used to build any yearly point.
-  const noCapex = filerNeverDisclosesCapex(annualReports, quarterlyReports);
+  const noCapex =
+    filerNeverDisclosesCapex(annualReports, quarterlyReports) ||
+    filerStoppedDisclosingImmaterialCapex(annualReports, quarterlyReports);
   const records = buildAnnualFlowPoints(annualReports, {
     ocf: { fn: findReportedOperatingCashFlowQ, section: 'cf' },
     capex: { fn: (cfItems) => findReportedCapexQ(cfItems, noCapex), section: 'cf' },
