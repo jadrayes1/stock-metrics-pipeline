@@ -2893,6 +2893,30 @@ function buildNativeTrendsForTicker(quarterly) {
 // not just the latest point. Reuses findReportedOperatingCashFlowQ/
 // findReportedCapexQ/findReportedRevenue/decumulateYtdByYear/
 // isConsecutiveQuarterWindow already defined above for the latest-value case.
+// A point built on ASSUMED-zero capex is FCF margin reduced to OCF/revenue,
+// which is only meaningful where the two are commensurable. For a bank or a
+// mortgage REIT they are not: operating cash flow dwarfs Finnhub's revenue
+// figure, so the ratio explodes. Verified live on the first run of the
+// zero-capex fix -- AGNC published FY '14 = -17.63 and FY '18 = 4.86, APA
+// Q2 '23 = 6.94, and BAC swung to Q3 '24 = -1.47, all of them new, all of
+// them nonsense, from tickers that had correctly shown nothing before.
+//
+// So a point from that path has to clear a plausibility bound that real
+// capex-reporting filers are NOT subjected to: an assumed-zero-capex point
+// outside +/-100% of revenue is dropped, leaving the ticker exactly as
+// empty as it was. TRV's real range (0.12-0.33) clears this comfortably,
+// which is the case the fix exists for. The bound is deliberately NOT
+// applied to points built on a real, found capex figure -- ASML legitimately
+// reports a quarterly fcfMargin of 1.128 off a large working-capital inflow,
+// and clamping that would destroy real data.
+const FCF_MARGIN_MAX_ON_ASSUMED_ZERO_CAPEX = 1;
+
+function plausibleOnAssumedZeroCapex(value, assumedZeroCapex) {
+  if (value == null) return null;
+  if (!assumedZeroCapex) return value;
+  return Math.abs(value) <= FCF_MARGIN_MAX_ON_ASSUMED_ZERO_CAPEX ? value : null;
+}
+
 function buildFcfMarginTrendFromFilings(quarterlyReports, annualReports) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
   // See filerNeverDisclosesCapex -- only ever true for a filer that reports
@@ -2919,9 +2943,14 @@ function buildFcfMarginTrendFromFilings(quarterlyReports, annualReports) {
     const ttmFcf = quarters.reduce((sum, q) => sum + q.fcf, 0);
     const ttmRevenue = quarters.reduce((sum, q) => sum + q.revenue, 0);
     const { year, quarter } = anchor;
-    return { label: calendarQuarterLabel(calendarLabels, year, quarter), value: ttmRevenue ? ttmFcf / ttmRevenue : null, partial, quartersUsed: quarters.length };
+    return {
+      label: calendarQuarterLabel(calendarLabels, year, quarter),
+      value: plausibleOnAssumedZeroCapex(ttmRevenue ? ttmFcf / ttmRevenue : null, noCapex),
+      partial,
+      quartersUsed: quarters.length,
+    };
   });
-  return points.slice(-QUARTERS_OF_HISTORY);
+  return points.filter((p) => p.value != null).slice(-QUARTERS_OF_HISTORY);
 }
 
 // ---------------------------------------------------------------------------
@@ -3295,7 +3324,10 @@ function buildFcfMarginQuarterlyFromFilings(quarterlyReports, annualReports) {
     revenue: { fn: findReportedRevenue, section: 'ic', disallowNegative: true },
   });
   return records
-    .map((r) => ({ label: calendarQuarterLabel(calendarLabels, r.year, r.quarter), value: clampImplausible(r.revenue ? (r.ocf - r.capex) / r.revenue : null) }))
+    .map((r) => ({
+      label: calendarQuarterLabel(calendarLabels, r.year, r.quarter),
+      value: plausibleOnAssumedZeroCapex(clampImplausible(r.revenue ? (r.ocf - r.capex) / r.revenue : null), noCapex),
+    }))
     .filter((p) => p.value != null)
     .slice(-QUARTERS_OF_HISTORY);
 }
@@ -3312,7 +3344,10 @@ function buildFcfMarginYearlyFromFilings(annualReports, quarterlyReports = null)
     revenue: { fn: findReportedRevenue, section: 'ic', disallowNegative: true },
   });
   return records
-    .map((r) => ({ label: calendarYearlyLabel(calendarLabels, r.year), value: clampImplausible(r.revenue ? (r.ocf - r.capex) / r.revenue : null) }))
+    .map((r) => ({
+      label: calendarYearlyLabel(calendarLabels, r.year),
+      value: plausibleOnAssumedZeroCapex(clampImplausible(r.revenue ? (r.ocf - r.capex) / r.revenue : null), noCapex),
+    }))
     .filter((p) => p.value != null)
     .slice(-QUARTERS_OF_HISTORY);
 }
