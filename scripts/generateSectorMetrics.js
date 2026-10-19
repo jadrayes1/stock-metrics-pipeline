@@ -3876,6 +3876,26 @@ const RECOMPUTE_METRICS = new Set(
 
 function pickTrendToPublish(existingPoints, freshPoints, metricKey = null) {
   if (!existingPoints || existingPoints.length === 0) return freshPoints || [];
+  // A TARGET_SYMBOL run that ALSO names this metric in RECOMPUTE_METRICS is
+  // the one case where fresh is authoritative including its EMPTINESS, so a
+  // published point can actually be RETRACTED. Everywhere else an empty
+  // fresh result returns existing untouched, so a transient failure can
+  // never blank a series.
+  //
+  // Without this the recompute path could overwrite a wrong value but never
+  // withdraw one, which made a bad publish permanent. Verified live: the
+  // first zero-capex fcfMargin run published AGNC FY '14 = -17.63, APA
+  // Q2 '23 = 6.94 and BAC Q3 '24 = -1.47; the follow-up commit correctly
+  // computed all of them as implausible and dropped them, so fresh came
+  // back EMPTY -- and the empty-fresh guard below then handed the bad
+  // published points straight back, every run, with no way to clear them.
+  // Reverting the feature would not have cleared them either.
+  //
+  // Narrow on purpose: a human has named both the exact tickers and the
+  // exact metric, and sees the result immediately. Scheduled full-universe
+  // runs never set TARGET_SYMBOL and so can never reach this.
+  const retractionAllowed = metricKey && RECOMPUTE_METRICS.has(metricKey) && !!process.env.TARGET_SYMBOL;
+  if (retractionAllowed && (!freshPoints || freshPoints.length === 0)) return [];
   if (!freshPoints || freshPoints.length === 0) return existingPoints;
   // A recomputed metric is STILL a union -- only the precedence flips, so
   // fresh overwrites a label it recomputed while every published label fresh
