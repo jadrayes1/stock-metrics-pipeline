@@ -1227,6 +1227,22 @@ const REVENUE_CONCEPT_CANDIDATES = [
   // findSecValueForFyFp regardless of its true taxonomy -- see
   // SEC_REVENUE_CONCEPTS' own comment (verified live for TSM).
   'us-gaap_Revenue',
+  // A REIT's top line is lease income, and some file NOTHING else. Verified
+  // live: EQR's only revenue-side line is us-gaap_OperatingLeaseLeaseIncome
+  // ("Rental income", $3,093,959,000 for FY2025) and OLP's is the same
+  // concept at $97,227,000 -- neither carries us-gaap_Revenues in Finnhub's
+  // income statement at all, so revenue came back null and emptied ALL FOUR
+  // yearly metrics for them, not just fcfMargin. (Both DO carry
+  // us-gaap_Revenues in SEC companyfacts, which is why probing there looked
+  // fine -- the gap is in what financials-reported returns, a distinction
+  // worth remembering before probing the wrong source.)
+  //
+  // LAST in the list on purpose: candidates are tried in order, so a filer
+  // reporting a real total is unaffected -- AVB carries BOTH
+  // OperatingLeaseLeaseIncome ($3,033,683,000) and us-gaap_Revenues
+  // ($3,040,725,000), the latter being the true total including management
+  // fees, and still matches the total first.
+  'us-gaap_OperatingLeaseLeaseIncome',
 ];
 
 // ---------------------------------------------------------------------------
@@ -2500,7 +2516,7 @@ function findReportedCapexQ(cfItems, treatMissingAsZero = false) {
 }
 
 const REPORTED_CAPEX_LABEL =
-  /purchases? of property|payments? (for|to) acquire (other )?property|capital expenditures|capital spending|capital improvements|flight equipment|deposits? (on|for) aircraft|investment in vehicles/i;
+  /purchases? of property|payments? (for|to) acquire (other )?property|capital expenditures|capital spending|capital improvements|flight equipment|deposits? (on|for) aircraft|investment in vehicles|additions to real estate/i;
 
 // A filer that reports an investing-activities section in period after
 // period and NEVER a capex line in any of them is not hiding a capex line
