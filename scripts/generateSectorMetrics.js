@@ -2400,8 +2400,11 @@ function findReportedOperatingCashFlowQ(cfItems) {
 // us-gaap_PaymentsToAcquireOtherPropertyPlantAndEquipment ("Payments to
 // Acquire OTHER Property, Plant, and Equipment") — the inserted "Other"
 // also broke the label-keyword fallback below.
-function findReportedCapexQ(cfItems) {
-  const concepts = [
+// Shared by findReportedCapexQ and filerNeverDisclosesCapex below -- the
+// two MUST agree on what counts as a capex line, or the probe could
+// conclude "this filer never discloses capex" about a line the finder
+// would happily have matched.
+const REPORTED_CAPEX_CONCEPTS = [
     'us-gaap_PaymentsToAcquirePropertyPlantAndEquipment',
     'us-gaap_PaymentsToAcquireProductiveAssets',
     'us-gaap_PaymentsForCapitalImprovements',
@@ -2422,7 +2425,10 @@ function findReportedCapexQ(cfItems) {
     // findSecValueForFyFp -- see SEC_CAPEX_CONCEPTS' own comment (verified
     // live for TSM).
     'us-gaap_PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities',
-  ];
+];
+
+function findReportedCapexQ(cfItems, treatMissingAsZero = false) {
+  const concepts = REPORTED_CAPEX_CONCEPTS;
   // Summed rather than first-match — verified live: DAL splits its real
   // capex across TWO simultaneous lines ("Flight equipment, including
   // advance payments" + "Ground property and equipment, including
@@ -2447,11 +2453,7 @@ function findReportedCapexQ(cfItems) {
   // rental-car business, not a minor one -- fcfMargin/P-FCF were
   // completely null without it despite Finnhub's own native fcfMargin
   // metric (a different calculation) showing real data.
-  const labelMatch = cfItems.find((item) =>
-    /purchases? of property|payments? (for|to) acquire (other )?property|capital expenditures|capital spending|capital improvements|flight equipment|deposits? (on|for) aircraft|investment in vehicles/i.test(
-      item.label || ''
-    )
-  );
+  const labelMatch = cfItems.find((item) => REPORTED_CAPEX_LABEL.test(item.label || ''));
   if (labelMatch) return labelMatch.value;
   // No capex line found -- treat as a real $0 (not missing data) ONLY when
   // this filer's cash-flow statement has no "Investing Activities" section
@@ -2466,7 +2468,59 @@ function findReportedCapexQ(cfItems) {
   // this only fires when there's no investing section to have missed a
   // line in.
   const hasInvestingSection = cfItems.some((item) => /investing activities/i.test(item.label || ''));
-  return hasInvestingSection ? null : 0;
+  if (!hasInvestingSection) return 0;
+  // treatMissingAsZero is set ONLY by filerNeverDisclosesCapex below, which
+  // has looked at this filer's ENTIRE reported history rather than this one
+  // period. See that function for why a per-period guess would be unsafe.
+  return treatMissingAsZero ? 0 : null;
+}
+
+const REPORTED_CAPEX_LABEL =
+  /purchases? of property|payments? (for|to) acquire (other )?property|capital expenditures|capital spending|capital improvements|flight equipment|deposits? (on|for) aircraft|investment in vehicles/i;
+
+// A filer that reports an investing-activities section in period after
+// period and NEVER a capex line in any of them is not hiding a capex line
+// we failed to parse -- it genuinely does not disclose one. Verified live:
+// TRV (Travelers, P&C insurance) has no PP&E capex concept anywhere in its
+// XBRL, and its whole investing section is investment-portfolio activity
+// (PaymentsToAcquireAvailableForSaleSecuritiesDebt $18.8B, maturities,
+// equity securities); its only real-estate line,
+// PaymentsToAcquireRealEstateHeldForInvestment at $48M, is an investment
+// asset, not operating PP&E. Capex really is ~0 for such a filer, which is
+// why Finnhub's own native fcfMargin shows 12 real points for TRV while
+// this pipeline's yearly/quarterly reconstruction showed none at all.
+//
+// Deliberately a WHOLE-FILER test, never per-period. A per-period "no capex
+// line found -> 0" would fabricate zero capex for a filer whose capex line
+// simply isn't recognised in that period, which is exactly the failure the
+// null return above exists to prevent -- verified live on three separate
+// filers: CAR (Avis) tags ~$7.8B/half-year of fleet purchases under
+// car_InvestmentInVehicles, JTAI under its own aircraft-deposit extension,
+// and CHCI stopped tagging PaymentsToAcquirePropertyPlantAndEquipment
+// in 2019 while real PP&E growth continued. ABNB is the live proof that
+// this test discriminates correctly: it has no capex facts since FY2024
+// (so a naive recent-periods check would call it zero-capex and overstate
+// its FCF) but its earlier filings DO carry a capex line, so this returns
+// false and ABNB correctly stays gapped rather than gaining a wrong value.
+//
+// Also deliberately NOT gated on industry: the identical temptation was
+// rejected for this metric already (see yearlyBuilders.fcfMargin's comment
+// on HOOD) because a blanket isBankLike gate is both redundant for a true
+// bank and wrong for a non-depository "Financial Services" filer.
+const MIN_PERIODS_TO_CONCLUDE_NO_CAPEX = 8; // ~2 years of filings -- a sparse filer with one or two reports hasn't demonstrated anything
+
+function filerNeverDisclosesCapex(...reportSets) {
+  let periodsWithInvestingSection = 0;
+  for (const reports of reportSets) {
+    for (const r of reports || []) {
+      const cfItems = r?.report?.cf || [];
+      if (!cfItems.length) continue;
+      if (cfItems.some((item) => REPORTED_CAPEX_CONCEPTS.includes(item.concept))) return false;
+      if (cfItems.some((item) => REPORTED_CAPEX_LABEL.test(item.label || ''))) return false;
+      if (cfItems.some((item) => /investing activities/i.test(item.label || ''))) periodsWithInvestingSection++;
+    }
+  }
+  return periodsWithInvestingSection >= MIN_PERIODS_TO_CONCLUDE_NO_CAPEX;
 }
 
 // A real quarter is ~90-92 days; a YTD-cumulative Q2/Q3 report spans ~181/272
@@ -2841,8 +2895,12 @@ function buildNativeTrendsForTicker(quarterly) {
 // isConsecutiveQuarterWindow already defined above for the latest-value case.
 function buildFcfMarginTrendFromFilings(quarterlyReports, annualReports) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
+  // See filerNeverDisclosesCapex -- only ever true for a filer that reports
+  // an investing section repeatedly and never a capex line in any of them.
+  const noCapex = filerNeverDisclosesCapex(quarterlyReports, annualReports);
+  const findCapex = (cfItems) => findReportedCapexQ(cfItems, noCapex);
   const ocf = decumulateYtdByYear(quarterlyReports, annualReports, findReportedOperatingCashFlowQ, 'cf');
-  const capex = decumulateYtdByYear(quarterlyReports, annualReports, findReportedCapexQ, 'cf');
+  const capex = decumulateYtdByYear(quarterlyReports, annualReports, findCapex, 'cf');
   const revenue = decumulateYtdByYear(quarterlyReports, annualReports, findReportedRevenue, 'ic');
 
   // `revenue[key] != null`, not a truthy check — mirrors buildFcfMarginFromFilings
@@ -3230,9 +3288,10 @@ function yearlyLabel(year) {
 
 function buildFcfMarginQuarterlyFromFilings(quarterlyReports, annualReports) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
+  const noCapex = filerNeverDisclosesCapex(quarterlyReports, annualReports);
   const records = buildStandaloneFlowQuarters(quarterlyReports, annualReports, {
     ocf: { fn: findReportedOperatingCashFlowQ, section: 'cf' },
-    capex: { fn: findReportedCapexQ, section: 'cf' },
+    capex: { fn: (cfItems) => findReportedCapexQ(cfItems, noCapex), section: 'cf' },
     revenue: { fn: findReportedRevenue, section: 'ic', disallowNegative: true },
   });
   return records
@@ -3241,11 +3300,15 @@ function buildFcfMarginQuarterlyFromFilings(quarterlyReports, annualReports) {
     .slice(-QUARTERS_OF_HISTORY);
 }
 
-function buildFcfMarginYearlyFromFilings(annualReports) {
+function buildFcfMarginYearlyFromFilings(annualReports, quarterlyReports = null) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(null, annualReports);
+  // Quarterly reports are passed purely to widen the evidence base for the
+  // never-discloses probe (annual reports alone rarely reach the 8-period
+  // floor); they are NOT used to build any yearly point.
+  const noCapex = filerNeverDisclosesCapex(annualReports, quarterlyReports);
   const records = buildAnnualFlowPoints(annualReports, {
     ocf: { fn: findReportedOperatingCashFlowQ, section: 'cf' },
-    capex: { fn: findReportedCapexQ, section: 'cf' },
+    capex: { fn: (cfItems) => findReportedCapexQ(cfItems, noCapex), section: 'cf' },
     revenue: { fn: findReportedRevenue, section: 'ic', disallowNegative: true },
   });
   return records
@@ -4701,7 +4764,7 @@ async function processSymbol(symbol, apiKey, ctx) {
     // produce no records) -- a blanket industry-based gate on top of that
     // was redundant for a true bank and wrong for a non-depository
     // "Financial Services" filer like HOOD.
-    fcfMargin: () => buildFcfMarginYearlyFromFilings(annualReportedFinancials),
+    fcfMargin: () => buildFcfMarginYearlyFromFilings(annualReportedFinancials, quarterlyFinancials),
     roic: () => fdicTrends?.yearly.roic || buildRoicYearlyFromFilings(annualReportedFinancials, isBankLike),
   };
   const quarterlyBuilders = {
