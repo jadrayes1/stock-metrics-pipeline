@@ -2421,6 +2421,30 @@ const REPORTED_CAPEX_CONCEPTS = [
     // tags its actual, current, much larger capex-equivalent spend here
     // instead -- e.g. $3.37M (Q1 '26), $11.86M (Q2 '26), real and current.
     'us-gaap_PaymentsToAcquireRealEstateAndRealEstateJointVentures',
+    // The real-estate capex family a REIT actually uses. Verified live:
+    // 46 Real Estate tickers with 20+ quarters of filing history had NO
+    // yearly fcfMargin, 33 of them with a Finnhub value proving a number is
+    // computable -- EQR, AVB, EXR, DLR, ADC, SUI, SLG, JLL among them. None
+    // tags any PP&E concept; property spend goes here instead. Probed
+    // directly: DLR and MPT use PaymentsToAcquireRealEstate, OLP uses
+    // PaymentsToAcquireAndDevelopRealEstate and PaymentsToDevelopRealEstate
+    // Assets, ARI uses PaymentsToDevelopRealEstateAssets, MPT also uses
+    // PaymentsForConstructionInProcess. Only RealEstateAndRealEstateJoint
+    // Ventures was covered (added for CHCI), which no REIT in the sample
+    // used.
+    //
+    // PaymentsToAcquireRealEstateHeldForInvestment is DELIBERATELY NOT here
+    // even though DLR uses it: the identical concept means operating
+    // property for a REIT but a portfolio asset for an insurer, and TRV
+    // carries it at $48M. Adding it would make TRV "disclose capex", flip
+    // filerNeverDisclosesCapex to false, and undo the 58-ticker fcfMargin
+    // gain that just landed. Same reason PaymentsToAcquireOtherRealEstate
+    // (also TRV's) stays out. Verified against every TRV-class winner
+    // (TRV/HMN/GNW/HG/JXN/RPRX/CI): none uses any of the four below.
+    'us-gaap_PaymentsToAcquireRealEstate',
+    'us-gaap_PaymentsToAcquireAndDevelopRealEstate',
+    'us-gaap_PaymentsToDevelopRealEstateAssets',
+    'us-gaap_PaymentsForConstructionInProcess',
     // ifrs-full's own capex concept, always re-prefixed "us-gaap_" by
     // findSecValueForFyFp -- see SEC_CAPEX_CONCEPTS' own comment (verified
     // live for TSM).
