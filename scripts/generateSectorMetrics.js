@@ -5428,6 +5428,25 @@ async function main() {
   if (process.env.DEBUG_TRACE_SYMBOL) {
     const targets = process.env.DEBUG_TRACE_SYMBOL.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
     for (const target of targets) {
+      // DEBUG_CF_ITEMS: dumps the raw cash-flow line items this pipeline
+      // actually receives for a ticker, concept and label. Added because a
+      // capex gap can be caused either by a concept we do not recognise OR
+      // by the line being absent from the upstream feed entirely, and those
+      // two look identical from the published trends alone.
+      if (process.env.DEBUG_CF_ITEMS) {
+        try {
+          const annualReports = await fetchReportedFinancialsFor(target, apiKeys[0]);
+          const quarterlyReports = await fetchReportedFinancialsQuarterlyFor(target, apiKeys[0]);
+          for (const r of (annualReports || []).slice(-2)) {
+            console.error(`DEBUG [${target}] ANNUAL ${r.year} cf items:`, JSON.stringify((r.report?.cf || []).map((i) => `${i.concept}|${i.label}`)));
+          }
+          for (const r of (quarterlyReports || []).slice(-1)) {
+            console.error(`DEBUG [${target}] QUARTERLY ${r.year}-${r.quarter} cf items:`, JSON.stringify((r.report?.cf || []).map((i) => `${i.concept}|${i.label}`)));
+          }
+        } catch (e) {
+          console.error(`DEBUG [${target}] cf-items dump failed:`, e.message);
+        }
+      }
       try {
         const r = await processSymbol(target, apiKeys[0], ctx);
         console.error(`DEBUG [${target}] trace result status=`, r.status, 'metrics=', JSON.stringify(r.metrics));
