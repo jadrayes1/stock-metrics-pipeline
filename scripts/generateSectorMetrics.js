@@ -5468,6 +5468,14 @@ async function main() {
               `DEBUG [${target}] ANNUAL ${r.year} capex-ish cf lines:`,
               JSON.stringify(cf.filter((i) => /propert|real ?estate|capital|construct|develop|acquisit/i.test(`${i.concept} ${i.label}`)).map((i) => `${i.concept}|${i.label}`))
             );
+            // Revenue-side lines too: a null revenue is just as capable of
+            // emptying fcfMargin as a null capex, and SEC companyfacts
+            // having us-gaap_Revenues says nothing about whether Finnhub's
+            // income statement carries it.
+            console.error(
+              `DEBUG [${target}] ANNUAL ${r.year} revenue-ish ic lines:`,
+              JSON.stringify(ic.filter((i) => /revenue|sales|income/i.test(`${i.concept} ${i.label}`)).map((i) => `${i.concept}|${i.label}|${i.value}`).slice(0, 10))
+            );
           }
           console.error(`DEBUG [${target}] neverDiscloses=${filerNeverDisclosesCapex(quarterlyReports, annualReports)} stoppedImmaterial=${filerStoppedDisclosingImmaterialCapex(quarterlyReports, annualReports)} intensity=${knownCapexIntensity([quarterlyReports, annualReports])}`);
         } catch (e) {
