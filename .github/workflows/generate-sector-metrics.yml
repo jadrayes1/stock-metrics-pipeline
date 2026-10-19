@@ -110,6 +110,10 @@ on:
         description: 'Optional: restrict this run to one ticker (debug/backfill only -- see TARGET_SYMBOL in generateSectorMetrics.js). Leave blank for a normal full-universe run.'
         required: false
         type: string
+      recomputeMetrics:
+        description: 'Optional: comma-separated metrics whose PUBLISHED points this run may overwrite instead of union-protecting (RECOMPUTE_METRICS), e.g. roic. Needed after a deliberate formula change -- without it a corrected value is dropped because its label is already published. Leave blank for normal runs.'
+        required: false
+        type: string
       debug:
         description: 'Optional: set to 1 for verbose SEC-enrichment tracing (DEBUG_SEC_ENRICHMENT)'
         required: false
@@ -181,6 +185,7 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           FINNHUB_API_KEY_2: ${{ secrets.FINNHUB_API_KEY_2 }}
           TARGET_SYMBOL: ${{ inputs.symbol }}
+          RECOMPUTE_METRICS: ${{ inputs.recomputeMetrics }}
           DEBUG_SEC_ENRICHMENT: ${{ inputs.debug }}
           DEBUG_REVENUE_ITEMS: ${{ inputs.debug }}
           DEBUG_TRACE_SYMBOL: ${{ inputs.debugTraceSymbol }}
