@@ -1131,7 +1131,21 @@ function buildPfcfTrendFromFilingsAndPrices(quarterlyReports, annualReports, mon
 
   const endDateByKey = buildEndDateByQuarterKey(quarterlyReports, annualReports);
   const points = buildTrailingWindows(standaloneQuarters, 4).map(({ quarters, anchor, partial }) => {
-    const ttmFcf = quarters.reduce((sum, q) => sum + q.fcf, 0);
+    // Annualized to a full-year equivalent when the window is PARTIAL. A
+    // valuation ratio divides a whole share price by a period's flow, so a
+    // window holding only 1-3 real quarters inflates the ratio by ~4x/2x/
+    // 1.33x. Verified live on the published flags: ASML read
+    // Q4'23=130.9(q1,partial), Q1'24=176.5(q2,partial), Q2'24=157.7(q3,
+    // partial), then 92.1 and 32.0 once the window filled -- and its FY'23
+    // yearly P/FCF is 104.2, so the partial points were the outliers.
+    // Affected 693 of 1497 foreign P/FCF TTM points (175 tickers) and
+    // 10,687 of 46,153 P/E TTM points (3,001 tickers).
+    //
+    // NOT a bug in the margin builders, which deliberately keep partial
+    // windows unscaled: fcfMargin is ttmFcf/ttmRevenue, where both halves
+    // cover the same quarters, so a 2-quarter margin is already correct.
+    // Only a ratio against a full-value PRICE needs the flow annualized.
+    const ttmFcf = quarters.reduce((sum, q) => sum + q.fcf, 0) * (4 / quarters.length);
     const { year, quarter, shares } = anchor;
     const ttmFcfPerShare = ttmFcf / shares;
     const endDate = endDateByKey[`${year}-${quarter}`];
@@ -1343,7 +1357,21 @@ function buildPeTrendFromFilingsAndPrices(quarterlyReports, annualReports, month
 
   const endDateByKey = buildEndDateByQuarterKey(quarterlyReports, annualReports);
   const points = buildTrailingWindows(standaloneQuarters, 4).map(({ quarters, anchor, partial }) => {
-    const ttmNetIncome = quarters.reduce((sum, q) => sum + q.netIncome, 0);
+    // Annualized to a full-year equivalent when the window is PARTIAL. A
+    // valuation ratio divides a whole share price by a period's flow, so a
+    // window holding only 1-3 real quarters inflates the ratio by ~4x/2x/
+    // 1.33x. Verified live on the published flags: ASML read
+    // Q4'23=130.9(q1,partial), Q1'24=176.5(q2,partial), Q2'24=157.7(q3,
+    // partial), then 92.1 and 32.0 once the window filled -- and its FY'23
+    // yearly P/FCF is 104.2, so the partial points were the outliers.
+    // Affected 693 of 1497 foreign P/FCF TTM points (175 tickers) and
+    // 10,687 of 46,153 P/E TTM points (3,001 tickers).
+    //
+    // NOT a bug in the margin builders, which deliberately keep partial
+    // windows unscaled: fcfMargin is ttmFcf/ttmRevenue, where both halves
+    // cover the same quarters, so a 2-quarter margin is already correct.
+    // Only a ratio against a full-value PRICE needs the flow annualized.
+    const ttmNetIncome = quarters.reduce((sum, q) => sum + q.netIncome, 0) * (4 / quarters.length);
     const { year, quarter, shares } = anchor;
     const ttmEps = ttmNetIncome / shares;
     const endDate = endDateByKey[`${year}-${quarter}`];
