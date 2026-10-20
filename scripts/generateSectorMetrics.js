@@ -2009,6 +2009,7 @@ const SEC_CAPEX_CONCEPTS = [
   'PaymentsToAcquireAndDevelopRealEstate',
   'PaymentsToDevelopRealEstateAssets',
   'PaymentsForConstructionInProcess',
+  'PaymentsToAcquireCommercialRealEstate', // CTRE -- see REPORTED_CAPEX_CONCEPTS
 ];
 // Same "no Investing Activities section at all -> capex defaults to $0"
 // reasoning as findReportedCapexQ's own comment (the SPRO fix), applied at
@@ -2504,6 +2505,14 @@ const REPORTED_CAPEX_CONCEPTS = [
     'us-gaap_PaymentsToAcquireAndDevelopRealEstate',
     'us-gaap_PaymentsToDevelopRealEstateAssets',
     'us-gaap_PaymentsForConstructionInProcess',
+    // CareTrust REIT (CTRE) books its property purchases here -- verified in
+    // SEC companyfacts for every year 2022-2025, FY2025 $1,334M -- and under
+    // none of the concepts above, so its FCF margin was empty. Same economic
+    // category as PaymentsToAcquireRealEstate. Checked against the insurer
+    // cohort: TRV uses PaymentsToAcquireOtherRealEstate and ...HeldFor
+    // Investment, not this, and HMN/GNW/HG/JXN/CI carry no real-estate
+    // concepts at all.
+    'us-gaap_PaymentsToAcquireCommercialRealEstate',
     // ifrs-full's own capex concept, always re-prefixed "us-gaap_" by
     // findSecValueForFyFp -- see SEC_CAPEX_CONCEPTS' own comment (verified
     // live for TSM).
