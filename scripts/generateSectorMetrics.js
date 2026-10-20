@@ -280,10 +280,6 @@ function sleep(ms) {
 // are usually not transient in the same way) lets most of these self-heal
 // within the SAME run instead of depending on luck across runs.
 const FINNHUB_MAX_429_RETRIES = 3;
-// See processSymbol's empty-profile retry: profile2 can answer a throttled
-// request with HTTP 200 and an empty {} instead of a 429.
-const EMPTY_PROFILE_RETRIES = 2;
-const EMPTY_PROFILE_RETRY_BASE_MS = 3000; // 3s then 6s -- ~9s extra per genuinely-dead ticker, ~10 min across ~70
 const FINNHUB_RETRY_BASE_MS = 2000;
 async function fetchFinnhub(url) {
   for (let attempt = 0; ; attempt++) {
@@ -4519,27 +4515,7 @@ async function processSymbol(symbol, apiKey, ctx) {
   const { previouslyPublishedMetrics, previouslyPublishedNativeTrends, previouslyPublishedYearlyTrends, previouslyPublishedQuarterlyTrends, previouslyPublishedTtmTrends } =
     ctx;
 
-  let profile = await fetchProfileFor(symbol, apiKey);
-
-  // ...but an empty profile is NOT always a dead ticker: it is also what
-  // Finnhub returns transiently under load. profile2 does not reliably
-  // signal throttling with a 429 -- it can answer HTTP 200 with an empty {}
-  // body -- and fetchFinnhub only retries on 429, so a throttled response
-  // read as "this company does not exist". Verified live: AVB came back
-  // status=ok with all four yearly metrics at 12 points in an isolated
-  // trace, then counted among the 70 dead/no-data tickers in the full
-  // scheduled run the same night. EQR, QRVO, WBD, LEG, DDS and HLX are in
-  // the same state. A dead ticker falls back to its previously-published
-  // data, so one that never had trends stays empty indefinitely -- 28
-  // long-established companies (40+ quarters of history) were stuck there.
-  //
-  // Retrying settles both cases correctly: a genuinely dead ticker like the
-  // AACO case below stays dead, just a few seconds later; a throttled one
-  // recovers.
-  for (let attempt = 0; !profile.name && attempt < EMPTY_PROFILE_RETRIES; attempt++) {
-    await sleep(EMPTY_PROFILE_RETRY_BASE_MS * 2 ** attempt);
-    profile = await fetchProfileFor(symbol, apiKey);
-  }
+  const profile = await fetchProfileFor(symbol, apiKey);
 
   // Verified live: Finnhub returns a 200 OK with every profile field empty
   // (no name, no industry, nothing) for some symbols in the exchange=US
