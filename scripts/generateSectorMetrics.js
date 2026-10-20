@@ -1895,6 +1895,34 @@ function hasRecentQuarterlyGap(quarterlyFinancials, scanEntries = RECENT_GAP_SCA
 // already bridge) doesn't force every ticker with a single old gap through
 // the heavier broad-enrichment path.
 const RECENT_REVENUE_GAP_MIN_COUNT = 2;
+// SEC enrichment's triggers covered sparse history and a missing REVENUE
+// line, but never a missing CAPEX line -- so a filer with plenty of reports
+// whose Finnhub cash-flow statement dropped its capex line never had SEC
+// consulted, and its FCF margin stayed empty although SEC carried the value
+// all along. Verified live: SUI tagged capex as PaymentsForCapitalImprovements
+// through FY2022 ($921M); Finnhub's 2023-2025 cash flows carry no capex line
+// at all, while SEC companyfacts has all three years under
+// PaymentsToAcquireProductiveAssets (FY2025 $457M) -- a concept already in
+// SEC_CAPEX_CONCEPTS. fillEmptySections already adds a missing concept INTO
+// an existing period, so once enrichment runs the gap closes.
+//
+// Counts only reports that DO carry operating cash flow (so a period with no
+// cash-flow statement is not a capex gap) and only a null capex -- an
+// investing section with no capex line -- never a real $0 from a filer with
+// no investing section at all.
+const RECENT_CAPEX_GAP_MIN_COUNT = 2;
+function hasRecentCapexGap(quarterlyFinancials, scanEntries = RECENT_GAP_SCAN_ENTRIES) {
+  const dated = (quarterlyFinancials || [])
+    .filter((r) => r?.endDate && !isNaN(new Date(r.endDate)))
+    .sort((a, b) => new Date(b.endDate) - new Date(a.endDate))
+    .slice(0, scanEntries);
+  const missing = dated.filter((r) => {
+    const cf = r.report?.cf || [];
+    return findReportedOperatingCashFlowQ(cf) != null && findReportedCapexQ(cf) == null;
+  });
+  return missing.length >= RECENT_CAPEX_GAP_MIN_COUNT;
+}
+
 function hasRecentRevenueGap(quarterlyFinancials, scanEntries = RECENT_GAP_SCAN_ENTRIES) {
   const dated = (quarterlyFinancials || [])
     .filter((r) => r?.endDate && !isNaN(new Date(r.endDate)))
@@ -1966,6 +1994,14 @@ const SEC_CAPEX_CONCEPTS = [
   // this isn't a single-ticker guess. Also needs an exact-concept check
   // added to findReportedCapexQ's own concept list below.
   'PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities',
+  // Mirrors the real-estate additions to REPORTED_CAPEX_CONCEPTS, now that a
+  // capex gap can trigger SEC enrichment and these are what a REIT's SEC
+  // filings carry. PaymentsToAcquireRealEstateHeldForInvestment stays out
+  // here too, for the same TRV reason documented there.
+  'PaymentsToAcquireRealEstate',
+  'PaymentsToAcquireAndDevelopRealEstate',
+  'PaymentsToDevelopRealEstateAssets',
+  'PaymentsForConstructionInProcess',
 ];
 // Same "no Investing Activities section at all -> capex defaults to $0"
 // reasoning as findReportedCapexQ's own comment (the SPRO fix), applied at
@@ -4816,7 +4852,8 @@ async function processSymbol(symbol, apiKey, ctx) {
     annualReportedFinancials.length < SEC_ENRICHMENT_SPARSE_ANNUAL_THRESHOLD ||
     hasRecentQuarterlyGap(quarterlyFinancials) ||
     hasMidSequenceQuarterGap(quarterlyFinancials) ||
-    hasRecentRevenueGap(quarterlyFinancials)
+    hasRecentRevenueGap(quarterlyFinancials) ||
+    hasRecentCapexGap(quarterlyFinancials)
   ) {
     if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG enrichment triggered for', symbol, 'q=', quarterlyFinancials.length, 'a=', annualReportedFinancials.length);
     try {
