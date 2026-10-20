@@ -422,6 +422,13 @@ const RENAMED_TICKER_FINANCIALS_ALIASES = {
   // BNY/AD/IA, verified live: "DFTX" showed historyQuarters: 0 in
   // published output despite the real, current SEC filing history.
   DFTX: 'MNMD',
+  // Vivmark Residential, formerly Equity Residential -- SEC formerNames
+  // shows "EQUITY RESIDENTIAL" through 2026-08-12 on the same CIK 906107,
+  // with real 10-Qs through 2026-06-30 on record. Verified live: VMRK had no
+  // annual financials-reported entries at all under the new symbol, so only
+  // ROIC (from the ratio engine) published while revenueGrowth, profitMargin
+  // and fcfMargin stayed empty. Same pattern as BNY/AD/IA/DFTX.
+  VMRK: 'EQR',
 };
 
 // financials-reported also needs the dual-class redirect (DUAL_CLASS_ALIASES
