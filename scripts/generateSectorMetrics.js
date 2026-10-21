@@ -1912,6 +1912,31 @@ const EXPECTED_QUARTERLY_GAP_DAYS = 200;
 // than trying to infer it from fiscal quarter numbers (which aren't
 // calendar-aligned the same way across filers with different fiscal
 // year-ends).
+// The annual counterpart of hasRecentQuarterlyGap: a whole 10-K missing
+// from Finnhub's annual feed. Verified live for Dillard's (DDS): its annual
+// reports run through the fiscal year ending 2024-02-03 and resume at the
+// one ending 2026-01-31, with the year ending 2025-02-01 simply absent
+// (SEC has that 10-K). Every yearly metric survives the hole except
+// revenue growth, which needs the prior year: the newest growth point fell
+// back to FY '24, the recency gate then discarded the whole series, and
+// DDS showed no yearly revenue growth at all despite 15 years of reports.
+// Only the newest few reports matter -- older holes sit outside the
+// published QUARTERS_OF_HISTORY window. 450 days clears a 53-week fiscal
+// year and a shifted year-end; a skipped year is ~730.
+const RECENT_ANNUAL_GAP_SCAN_ENTRIES = 4;
+const EXPECTED_ANNUAL_GAP_DAYS = 450;
+function hasRecentAnnualGap(annualFinancials) {
+  const endDates = (annualFinancials || [])
+    .map((r) => (r?.endDate ? new Date(r.endDate) : null))
+    .filter((d) => d instanceof Date && !isNaN(d))
+    .sort((a, b) => b - a)
+    .slice(0, RECENT_ANNUAL_GAP_SCAN_ENTRIES);
+  for (let i = 0; i < endDates.length - 1; i++) {
+    if ((endDates[i] - endDates[i + 1]) / (1000 * 60 * 60 * 24) > EXPECTED_ANNUAL_GAP_DAYS) return true;
+  }
+  return false;
+}
+
 function hasRecentQuarterlyGap(quarterlyFinancials, scanEntries = RECENT_GAP_SCAN_ENTRIES) {
   const endDates = (quarterlyFinancials || [])
     .map((r) => (r?.endDate ? new Date(r.endDate) : null))
@@ -4965,7 +4990,8 @@ async function processSymbol(symbol, apiKey, ctx) {
     hasRecentQuarterlyGap(quarterlyFinancials) ||
     hasMidSequenceQuarterGap(quarterlyFinancials) ||
     hasRecentRevenueGap(quarterlyFinancials) ||
-    hasRecentCapexGap(quarterlyFinancials)
+    hasRecentCapexGap(quarterlyFinancials) ||
+    hasRecentAnnualGap(annualReportedFinancials)
   ) {
     if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG enrichment triggered for', symbol, 'q=', quarterlyFinancials.length, 'a=', annualReportedFinancials.length);
     try {
