@@ -87,7 +87,9 @@ jobs:
     # a marketMetrics.json from a failed or cancelled generate-sector-metrics
     # run. Always runs for a manual workflow_dispatch (github.event.workflow_run
     # is unset there, so the workflow_run-specific check is skipped).
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    # Also skips a debug-trace upstream run: it published nothing, so there
+    # is nothing new to cap (see generate-sector-metrics.yml's run-name).
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && !contains(github.event.workflow_run.display_title, 'no publish'))
     steps:
       - uses: actions/checkout@v4
 

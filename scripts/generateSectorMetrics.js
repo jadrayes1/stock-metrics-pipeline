@@ -2088,6 +2088,7 @@ const SEC_CAPEX_CONCEPTS = [
   'PaymentsToDevelopRealEstateAssets',
   'PaymentsForConstructionInProcess',
   'PaymentsToAcquireCommercialRealEstate', // CTRE -- see REPORTED_CAPEX_CONCEPTS
+  'PaymentsToAcquireWaterSystems', // SJW/HTO through FY2020 -- see REPORTED_CAPEX_CONCEPTS
 ];
 // Same "no Investing Activities section at all -> capex defaults to $0"
 // reasoning as findReportedCapexQ's own comment (the SPRO fix), applied at
@@ -2595,10 +2596,27 @@ const REPORTED_CAPEX_CONCEPTS = [
     // findSecValueForFyFp -- see SEC_CAPEX_CONCEPTS' own comment (verified
     // live for TSM).
     'us-gaap_PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities',
+    // A water utility's capex is "additions to utility plant". SJW Group
+    // filed it here through FY2020; see EXTENSION_CAPEX_CONCEPT for what the
+    // same company (now H2O America, HTO) files since.
+    'us-gaap_PaymentsToAcquireWaterSystems',
 ];
 
+// A filer's own extension of a standard capex concept. Verified live: H2O
+// America's (HTO) FY2025 10-K splits "Additions to utility plant" into
+// hto:PaymentsToAcquireWaterSystemsUsingCompanyFunds ($489.6M) and
+// hto:PaymentsToAcquireWaterSystemsUsingContributionsInAidOfConstruction
+// ($30.1M), and tags no standard capex concept at all -- so its FCF margin
+// was empty and its P/FCF read 5,806. Both lines are cash spent on plant
+// and are summed like DAL's two lines. Labels alone ("Company-funded")
+// are far too generic to match on, so this keys on the concept name.
+const EXTENSION_CAPEX_CONCEPT = /^(?!us-gaap_)[a-z0-9]+_PaymentsToAcquireWaterSystems/;
+
+function isReportedCapexConcept(concept) {
+  return REPORTED_CAPEX_CONCEPTS.includes(concept) || EXTENSION_CAPEX_CONCEPT.test(concept || '');
+}
+
 function findReportedCapexQ(cfItems, treatMissingAsZero = false) {
-  const concepts = REPORTED_CAPEX_CONCEPTS;
   // Summed rather than first-match — verified live: DAL splits its real
   // capex across TWO simultaneous lines ("Flight equipment, including
   // advance payments" + "Ground property and equipment, including
@@ -2606,7 +2624,7 @@ function findReportedCapexQ(cfItems, treatMissingAsZero = false) {
   // first match would understate real capex by ~15-20% for DAL
   // specifically; summing is a no-op for the common case where a filer
   // only ever tags one of these concepts.
-  const matches = cfItems.filter((item) => concepts.includes(item.concept));
+  const matches = cfItems.filter((item) => isReportedCapexConcept(item.concept));
   if (matches.length) return matches.reduce((sum, item) => sum + item.value, 0);
   // "deposits? (on|for) aircraft" added for JTAI (Jet.AI) -- verified live:
   // its 2025 10-Qs tag real cash paid toward acquiring aircraft under a
@@ -2735,7 +2753,7 @@ function filerStoppedDisclosingImmaterialCapex(...reportSets) {
   if (reports.length <= STALE_CAPEX_PERIODS) return false;
   const hasCapexLine = (r) => {
     const cf = r.report.cf;
-    return cf.some((i) => REPORTED_CAPEX_CONCEPTS.includes(i.concept)) || cf.some((i) => REPORTED_CAPEX_LABEL.test(i.label || ''));
+    return cf.some((i) => isReportedCapexConcept(i.concept)) || cf.some((i) => REPORTED_CAPEX_LABEL.test(i.label || ''));
   };
   const recent = reports.slice(-STALE_CAPEX_PERIODS);
   const older = reports.slice(0, -STALE_CAPEX_PERIODS);
@@ -2751,7 +2769,7 @@ function filerNeverDisclosesCapex(...reportSets) {
     for (const r of reports || []) {
       const cfItems = r?.report?.cf || [];
       if (!cfItems.length) continue;
-      if (cfItems.some((item) => REPORTED_CAPEX_CONCEPTS.includes(item.concept))) return false;
+      if (cfItems.some((item) => isReportedCapexConcept(item.concept))) return false;
       if (cfItems.some((item) => REPORTED_CAPEX_LABEL.test(item.label || ''))) return false;
       if (cfItems.some((item) => /investing activities/i.test(item.label || ''))) periodsWithInvestingSection++;
     }
@@ -5613,7 +5631,7 @@ async function main() {
             );
             console.error(
               `DEBUG [${target}] ANNUAL ${r.year} capex-ish cf lines:`,
-              JSON.stringify(cf.filter((i) => /propert|real ?estate|capital|construct|develop|acquisit/i.test(`${i.concept} ${i.label}`)).map((i) => `${i.concept}|${i.label}`))
+              JSON.stringify(cf.filter((i) => /propert|real ?estate|capital|construct|develop|acquisit|acquire|plant/i.test(`${i.concept} ${i.label}`)).map((i) => `${i.concept}|${i.label}`))
             );
             // Revenue-side lines too: a null revenue is just as capable of
             // emptying fcfMargin as a null capex, and SEC companyfacts

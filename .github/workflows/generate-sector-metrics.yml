@@ -87,6 +87,12 @@
 #      as an HTTP 404 on the write, not a clear permission error).
 
 name: Generate sector metrics
+# A debugTraceSymbol run exits before publishing anything, so it says so in
+# its run name -- apply-dcf-cap.yml reads that name (a workflow_run trigger
+# cannot see the upstream run's inputs) and skips re-capping data that this
+# run never changed. Without it every trace queued a ~1.5hr apply-dcf-cap
+# into the shared gist-publish group, where it could evict a pending real run.
+run-name: ${{ inputs.debugTraceSymbol && format('Generate sector metrics (debug trace {0}, no publish)', inputs.debugTraceSymbol) || 'Generate sector metrics' }}
 
 on:
   schedule:
