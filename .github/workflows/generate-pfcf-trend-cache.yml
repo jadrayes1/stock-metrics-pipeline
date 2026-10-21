@@ -43,6 +43,10 @@ on:
         description: 'Optional: process only this one ticker (debugging), ignoring the normal gap list/rotation'
         required: false
         type: string
+      recomputeMetrics:
+        description: 'Optional: pfcfRatio and/or peRatio (comma-separated) -- lets this run overwrite already-published points for those metrics (RECOMPUTE_METRICS). Needed after a deliberate calculation change. Leave blank for normal runs.'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -87,6 +91,7 @@ jobs:
           TWELVEDATA_PIPELINE_API_KEY: ${{ secrets.TWELVEDATA_PIPELINE_API_KEY }}
           TWELVEDATA_PIPELINE_API_KEY_2: ${{ secrets.TWELVEDATA_PIPELINE_API_KEY_2 }}
           TARGET_SYMBOL: ${{ inputs.symbol }}
+          RECOMPUTE_METRICS: ${{ inputs.recomputeMetrics }}
           DEBUG_PFCF_SYMBOLS: ${{ inputs.symbol }}
         run: node scripts/generatePfcfTrendCache.js
 

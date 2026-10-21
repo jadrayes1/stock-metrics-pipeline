@@ -1483,8 +1483,26 @@ function parseLabelToOrdinal(label) {
 // at the same QUARTERS_OF_HISTORY rolling window the builders already
 // use. existingPoints is expected to already be sanitized (see
 // stripTrailingNulls below) before reaching this function.
-function pickTrendToPublish(existingPoints, freshPoints) {
+// Metrics this run may REPLACE rather than union-protect, comma-separated:
+// pfcfRatio and/or peRatio. Same opt-in as RECOMPUTE_METRICS in
+// generateSectorMetrics.js, which carries the full rationale -- the union
+// below drops any corrected value whose label is already published, so a
+// deliberate calculation change can never land without it. Verified: the
+// partial-TTM-window annualization (commit 4524198) corrects P/FCF and P/E
+// points across ~3,000 tickers that every normal run then discards.
+const RECOMPUTE_METRICS = new Set(
+  (process.env.RECOMPUTE_METRICS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
+
+function pickTrendToPublish(existingPoints, freshPoints, metricKey = null) {
   if (!existingPoints || existingPoints.length === 0) return freshPoints || [];
+  // Retraction only on a TARGET_SYMBOL run that names this metric -- see
+  // generateSectorMetrics.js's pickTrendToPublish for why it is that narrow.
+  const recomputing = !!metricKey && RECOMPUTE_METRICS.has(metricKey);
+  if (recomputing && process.env.TARGET_SYMBOL && (!freshPoints || freshPoints.length === 0)) return [];
   if (!freshPoints || freshPoints.length === 0) return existingPoints;
   // A point whose LABEL changed is invisible to the label-keyed merge below:
   // the corrected point looks brand new, the stale one still looks current,
@@ -1509,7 +1527,9 @@ function pickTrendToPublish(existingPoints, freshPoints) {
   });
   const merged = new Map();
   for (const p of survivingExisting) merged.set(p.label, p);
-  for (const p of freshPoints) if (!merged.has(p.label)) merged.set(p.label, p);
+  // A recomputed metric is still a union: fresh wins a label it recomputed,
+  // and every published label it does not cover survives.
+  for (const p of freshPoints) if (recomputing || !merged.has(p.label)) merged.set(p.label, p);
   return [...merged.values()]
     .sort((a, b) => {
       const oa = parseLabelToOrdinal(a.label);
@@ -1548,11 +1568,11 @@ function stripTrailingNulls(points) {
   return points.slice(0, end);
 }
 
-function pickCadenceTrendsToPublish(existingEntry, fresh) {
+function pickCadenceTrendsToPublish(existingEntry, fresh, metricKey) {
   return {
-    ttm: pickTrendToPublish(stripTrailingNulls(existingEntry?.ttm), fresh.ttm),
-    quarterly: pickTrendToPublish(stripTrailingNulls(existingEntry?.quarterly), fresh.quarterly),
-    yearly: pickTrendToPublish(stripTrailingNulls(existingEntry?.yearly), fresh.yearly),
+    ttm: pickTrendToPublish(stripTrailingNulls(existingEntry?.ttm), fresh.ttm, metricKey),
+    quarterly: pickTrendToPublish(stripTrailingNulls(existingEntry?.quarterly), fresh.quarterly, metricKey),
+    yearly: pickTrendToPublish(stripTrailingNulls(existingEntry?.yearly), fresh.yearly, metricKey),
   };
 }
 
@@ -1614,6 +1634,7 @@ async function fetchMonthlyPrices(symbol, apiKey) {
 async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, secTickerToCikMap, existingCacheEntry) {
   let fresh = { ttm: [], quarterly: [], yearly: [] };
   let freshPe = { ttm: [], quarterly: [], yearly: [] };
+  let computed = false;
   let usedTwelveDataCall = false;
   try {
     // Fully sequential, each call followed by its own spacing — NOT
@@ -1820,14 +1841,17 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
       quarterly: buildPeQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices),
       yearly: buildPeYearlyFromFilingsAndPrices(annualReports, monthlyPrices, quarterlyReports),
     };
+    computed = true;
   } catch (err) {
     console.log(`  skip ${symbol}: ${err.message}`);
     // pickCadenceTrendsToPublish below falls back to whatever was already
     // cached for this symbol rather than losing it over one failed request.
   }
 
-  const cadences = pickCadenceTrendsToPublish(existingCacheEntry, fresh);
-  const peCadences = pickCadenceTrendsToPublish(existingCacheEntry?.pe, freshPe);
+  // A failed fetch leaves fresh empty, which a recompute would read as
+  // "retract" -- so only a computation that actually ran may recompute.
+  const cadences = pickCadenceTrendsToPublish(existingCacheEntry, fresh, computed ? 'pfcfRatio' : null);
+  const peCadences = pickCadenceTrendsToPublish(existingCacheEntry?.pe, freshPe, computed ? 'peRatio' : null);
   return { entry: { fetchedAt: new Date().toISOString(), ...cadences, pe: peCadences }, usedTwelveDataCall };
 }
 
