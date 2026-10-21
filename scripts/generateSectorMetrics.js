@@ -215,10 +215,88 @@ async function fetchUniverse(apiKey) {
       console.error(`DEBUG universe probe ${sym}:`, hits.length ? JSON.stringify(hits.map((h) => ({ mic: h.mic, type: h.type, desc: h.description }))) : 'NOT IN FINNHUB UNIVERSE');
     }
   }
-  return all
+  const entries = all
     .filter((s) => ALLOWED_MICS.has(s.mic) && ALLOWED_TYPES.has(s.type))
-    .map((s) => ({ symbol: s.symbol, name: s.description || null, type: s.type || null }))
-    .sort((a, b) => a.symbol.localeCompare(b.symbol));
+    .map((s) => ({ symbol: s.symbol, name: s.description || null, type: s.type || null }));
+  const supplement = await fetchSecListedMissingFromFinnhub(new Set(all.map((s) => (s.symbol || '').toUpperCase())), apiKey);
+  return [...entries, ...supplement].sort((a, b) => a.symbol.localeCompare(b.symbol));
+}
+
+// Finnhub's /stock/symbol list silently omits some listed companies even
+// though every per-symbol endpoint serves them in full. Verified live
+// 2026-10-21: Dillard's (DDS) and Texas Capital (TCBI), both moved to the
+// Texas Stock Exchange, plus WBD, CECO and UUU (Nasdaq/NYSE), are absent
+// from the list under ANY type or MIC -- yet a trace of each returned real
+// financials-reported history and a complete metrics row (DDS: roic 0.27,
+// P/E 15.3, 150 quarters). Finnhub has no TXSE MIC at all, so every
+// company that lists there drops out of the tracked universe.
+//
+// SEC's company_tickers_exchange.json names each ticker's listing exchange,
+// so it fills exactly that hole. Only a symbol Finnhub's list lacks
+// ENTIRELY is added: anything Finnhub knows under a type ALLOWED_TYPES
+// deliberately filters out (closed-end funds, MLPs, ETPs, warrants) stays
+// out. Nasdaq's fifth-letter W/U/R suffixes (warrants, units, rights) and
+// share-class/preferred tickers with punctuation are skipped too.
+//
+// SEC also lists an issuer's preferreds, baby bonds and ETNs under plain
+// letters (AT&T's TBB, Valley National's VLYPP, BMO's ETNs, Dillard's own
+// DDT debentures), so two more gates: a company whose CIK already has ANY
+// ticker in Finnhub's list is covered by that ticker, and only a company's
+// first SEC row is taken (SEC lists the common first -- DDS before DDT).
+// Last, a real Finnhub profile with market cap and shares outstanding is
+// required, which a subsidiary's debt (Entergy Arkansas, Georgia Power) or
+// a bank's ETN shelf does not have. A failed SEC fetch only skips the
+// supplement -- never the run.
+const SEC_TICKERS_EXCHANGE_URL = 'https://www.sec.gov/files/company_tickers_exchange.json';
+const SEC_LISTING_EXCHANGES = new Set(['NYSE', 'Nasdaq', 'TXSE']);
+// Funds and partnerships, by name -- the same classes ALLOWED_TYPES keeps
+// out, which Finnhub would have typed for us had it listed them. Energy
+// Transfer (ET), Sunoco LP (SUN) and USA Compression (USAC) all moved to
+// TXSE, so Finnhub may not list them at all; they are MLPs and stay out.
+const SEC_SUPPLEMENT_EXCLUDED_NAME = /\b(ETF|ETN|FUND|TRUST|L\.?P\.?|PARTNERS|PARTNERSHIP)\b|,\s*LP\b/i;
+async function fetchSecListedMissingFromFinnhub(finnhubSymbols, apiKey) {
+  try {
+    const res = await fetch(SEC_TICKERS_EXCHANGE_URL, { headers: { 'User-Agent': SEC_USER_AGENT }, signal: AbortSignal.timeout(SEC_FETCH_TIMEOUT_MS) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const { fields, data } = await res.json();
+    const col = Object.fromEntries(fields.map((f, i) => [f, i]));
+    const coveredCiks = new Set(data.filter((row) => finnhubSymbols.has(String(row[col.ticker] || '').toUpperCase())).map((row) => row[col.cik]));
+    const takenCiks = new Set();
+    const candidates = [];
+    for (const row of data) {
+      const symbol = String(row[col.ticker] || '').toUpperCase();
+      const name = row[col.name] || null;
+      const cik = row[col.cik];
+      if (!SEC_LISTING_EXCHANGES.has(row[col.exchange])) continue;
+      if (!/^[A-Z]{1,5}$/.test(symbol) || /^[A-Z]{4}[WUR]$/.test(symbol)) continue;
+      if (finnhubSymbols.has(symbol) || coveredCiks.has(cik) || takenCiks.has(cik)) continue;
+      if (name && SEC_SUPPLEMENT_EXCLUDED_NAME.test(name)) continue;
+      takenCiks.add(cik);
+      candidates.push({ symbol, name });
+    }
+    const added = [];
+    const rejected = [];
+    for (const c of candidates) {
+      let profile = null;
+      try {
+        profile = await fetchProfileFor(c.symbol, apiKey);
+      } catch {
+        // Treated as no profile: the ticker just stays out this run.
+      }
+      if (profile?.marketCapitalization > 0 && profile?.shareOutstanding > 0) {
+        added.push({ symbol: c.symbol, name: profile.name || c.name, type: 'Common Stock' });
+      } else {
+        rejected.push(c.symbol);
+      }
+      await sleep(REQUEST_SPACING_MS);
+    }
+    console.log(`Universe supplement: added ${added.length} SEC-listed tickers absent from Finnhub's symbol list: ${added.map((e) => e.symbol).join(', ')}`);
+    console.log(`Universe supplement: ${rejected.length} candidates had no Finnhub company profile, left out: ${rejected.join(', ')}`);
+    return added;
+  } catch (err) {
+    console.error(`Universe supplement skipped (SEC company_tickers_exchange.json: ${err.message})`);
+    return [];
+  }
 }
 
 // Small, static, client-searchable index — symbol/name/type for every
