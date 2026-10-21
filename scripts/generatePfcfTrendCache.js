@@ -1497,6 +1497,14 @@ const RECOMPUTE_METRICS = new Set(
     .filter(Boolean)
 );
 
+// Set by the workflow only for a scheduled recompute sweep (see its "Resolve
+// recompute sweep" step): the sweep's start. A ticker refreshed since then
+// has already been recomputed once and is merged normally from here on.
+const SWEEP_SINCE = process.env.SWEEP_SINCE ? Date.parse(process.env.SWEEP_SINCE) : null;
+function alreadySwept(fetchedAt) {
+  return SWEEP_SINCE != null && !!fetchedAt && Date.parse(fetchedAt) >= SWEEP_SINCE;
+}
+
 function pickTrendToPublish(existingPoints, freshPoints, metricKey = null) {
   if (!existingPoints || existingPoints.length === 0) return freshPoints || [];
   // Retraction only on a TARGET_SYMBOL run that names this metric -- see
@@ -1858,8 +1866,12 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
 
   // A failed fetch leaves fresh empty, which a recompute would read as
   // "retract" -- so only a computation that actually ran may recompute.
-  const cadences = pickCadenceTrendsToPublish(existingCacheEntry, fresh, computed ? 'pfcfRatio' : null);
-  const peCadences = pickCadenceTrendsToPublish(existingCacheEntry?.pe, freshPe, computed ? 'peRatio' : null);
+  // During a scheduled sweep, also only a ticker not yet refreshed since the
+  // sweep began: each ticker is recomputed exactly once, however many runs
+  // the rotation takes.
+  const mayRecompute = computed && !alreadySwept(existingCacheEntry?.fetchedAt);
+  const cadences = pickCadenceTrendsToPublish(existingCacheEntry, fresh, mayRecompute ? 'pfcfRatio' : null);
+  const peCadences = pickCadenceTrendsToPublish(existingCacheEntry?.pe, freshPe, mayRecompute ? 'peRatio' : null);
   return { entry: { fetchedAt: new Date().toISOString(), ...cadences, pe: peCadences }, usedTwelveDataCall };
 }
 
@@ -1985,6 +1997,22 @@ async function main() {
   // the gap filter too (a ticker can be force-tested even if it currently
   // has a real pfcfRatio/cached TTM point), since the whole point is to
   // isolate exactly what happens for THIS symbol.
+  // A scheduled recompute sweep has to reach EVERY ticker, not only the gap
+  // list above (which skips a healthy ticker for up to STALE_CACHE_DAYS).
+  // Tickers not yet refreshed since the sweep began go first, stalest
+  // first, then the normal gap list -- so the sweep finishes in about
+  // universe / daily budget runs and a missed run only delays it.
+  if (SWEEP_SINCE != null && RECOMPUTE_METRICS.size) {
+    const unswept = Object.keys(metricsDataset.metrics || {})
+      .filter((symbol) => !alreadySwept(cache[symbol]?.fetchedAt))
+      .map((symbol) => ({ symbol, attemptedAt: cache[symbol]?.fetchedAt ? new Date(cache[symbol].fetchedAt).getTime() : 0 }))
+      .sort((a, b) => a.attemptedAt - b.attemptedAt)
+      .map((x) => x.symbol);
+    const unsweptSet = new Set(unswept);
+    console.log(`Recompute sweep since ${process.env.SWEEP_SINCE}: ${unswept.length} tickers not yet swept go first.`);
+    priority = [...unswept, ...priority.filter((symbol) => !unsweptSet.has(symbol))];
+  }
+
   if (process.env.TARGET_SYMBOL) {
     priority = process.env.TARGET_SYMBOL.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
     console.log(`TARGET_SYMBOL set — processing only ${priority.join(', ')}, ignoring the normal gap list/rotation.`);
