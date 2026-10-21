@@ -75,14 +75,19 @@ permissions:
 # GitHub's own concurrency behavior -- collapsing multiple queued-but-not-
 # started runs down to just the most recent -- causes no lost work here,
 # unlike a TARGET_SYMBOL dispatch of the OTHER workflow in this group.
-concurrency:
-  group: gist-publish
-  cancel-in-progress: false
-
+#
+# Declared on the JOB, not the workflow: a workflow-level group admits the
+# run before the job's `if` is evaluated, so a run that is about to skip
+# (after a debug trace) still took the single pending slot -- and could
+# evict a real sector-metrics run queued behind it. A skipped job never
+# enters a job-level group.
 jobs:
   apply:
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    concurrency:
+      group: gist-publish
+      cancel-in-progress: false
     # Only run on a successful upstream completion -- never cap/fill against
     # a marketMetrics.json from a failed or cancelled generate-sector-metrics
     # run. Always runs for a manual workflow_dispatch (github.event.workflow_run
