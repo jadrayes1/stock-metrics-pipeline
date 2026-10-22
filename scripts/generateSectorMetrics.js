@@ -5762,6 +5762,13 @@ async function main() {
   // fresh results, EXCEPT symbols this run's own real Finnhub check
   // confirmed are genuinely dead (those should stop publishing, not keep
   // resurrecting stale data for a delisted/invalid ticker forever).
+  // Snapshot "actually processed this run" BEFORE the metrics restore below
+  // writes into `metrics` -- the trend restores key off this, and reading
+  // `metrics` itself after the restore made every hard-failed ticker look
+  // processed. Verified live 2026-10-22: VVV's fetch failed, its card
+  // values were restored, and all four of its trend caches (native, yearly,
+  // quarterly, ttm -- 12/8/12/12 points) were dropped from the publish.
+  const processedThisRun = new Set(Object.keys(metrics));
   let recoveredFromFailure = 0;
   for (const [symbol, prevMetrics] of Object.entries(previouslyPublishedMetrics)) {
     if (metrics[symbol] || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
@@ -5786,19 +5793,19 @@ async function main() {
   // publish dispatch still republished the original years-stale Q4 '21
   // point unchanged -- this fallback-restore loop is why.
   for (const [symbol, prevTrends] of Object.entries(previouslyPublished.nativeTrends)) {
-    if (nativeTrends[symbol] || metrics[symbol] || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
+    if (nativeTrends[symbol] || processedThisRun.has(symbol) || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
     nativeTrends[symbol] = prevTrends;
   }
   for (const [symbol, prevTrends] of Object.entries(previouslyPublished.yearlyTrends)) {
-    if (yearlyTrends[symbol] || metrics[symbol] || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
+    if (yearlyTrends[symbol] || processedThisRun.has(symbol) || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
     yearlyTrends[symbol] = prevTrends;
   }
   for (const [symbol, prevTrends] of Object.entries(previouslyPublished.quarterlyTrends)) {
-    if (quarterlyTrends[symbol] || metrics[symbol] || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
+    if (quarterlyTrends[symbol] || processedThisRun.has(symbol) || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
     quarterlyTrends[symbol] = prevTrends;
   }
   for (const [symbol, prevTrends] of Object.entries(previouslyPublished.ttmTrends)) {
-    if (ttmTrends[symbol] || metrics[symbol] || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
+    if (ttmTrends[symbol] || processedThisRun.has(symbol) || deadSymbols.has(symbol) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(symbol)) continue;
     ttmTrends[symbol] = prevTrends;
   }
   if (recoveredFromFailure) {
