@@ -1872,6 +1872,14 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
   const mayRecompute = computed && !alreadySwept(existingCacheEntry?.fetchedAt);
   const cadences = pickCadenceTrendsToPublish(existingCacheEntry, fresh, mayRecompute ? 'pfcfRatio' : null);
   const peCadences = pickCadenceTrendsToPublish(existingCacheEntry?.pe, freshPe, mayRecompute ? 'peRatio' : null);
+  if (process.env.DEBUG_PFCF_SYMBOLS?.split(',').map((s) => s.trim().toUpperCase()).includes(symbol)) {
+    const fmt = (a) => (a || []).map((p) => `${p.label}=${p.value}`).join(' ');
+    for (const c of ['ttm', 'quarterly', 'yearly']) {
+      console.error(`DEBUG_PFCF_MERGE ${symbol} pfcf.${c} existing: ${fmt(existingCacheEntry?.[c])}`);
+      console.error(`DEBUG_PFCF_MERGE ${symbol} pfcf.${c} fresh:    ${fmt(fresh[c])}`);
+      console.error(`DEBUG_PFCF_MERGE ${symbol} pfcf.${c} result:   ${fmt(cadences[c])}`);
+    }
+  }
   return { entry: { fetchedAt: new Date().toISOString(), ...cadences, pe: peCadences }, usedTwelveDataCall };
 }
 
