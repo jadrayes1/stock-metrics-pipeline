@@ -3014,12 +3014,25 @@ async function fetchReportedFinancialsQuarterlyFor(symbol, apiKey) {
 
 const QUARTERS_OF_HISTORY = 12; // mirrors src/utils/metrics.js
 
+// A 52/53-week filer's period closes on a fixed weekday, so it can end a
+// few days INTO the next month (TDY's FY2022 ended 2023-01-01; SWK's
+// quarters end Apr 4 / Jul 4 / Oct 3). Labelled straight from that date it
+// lands a whole quarter late and collides with the real next period under
+// the same label, one value overwriting the other -- verified live: TDY's
+// yearly ROIC skipped FY '13/'15/'20, SWK's skipped FY '20/'25 and Q4 '25,
+// and the 2026-10-23 P/FCF recompute dropped KELYA/TDY FY '22. Backdated
+// QUARTER_LABEL_BACKDATE_DAYS first, the same rule (and the same 5 days)
+// as foreign-filings-pipeline's quarterLabelFromPeriod, which found it on
+// ASML; every ordinary month-end stays in its own quarter.
+const QUARTER_LABEL_BACKDATE_DAYS = 5;
+const LABEL_BACKDATED_SYMBOLS = new Set();
 function quarterLabelFromPeriod(period) {
   if (!period) return null;
-  const d = new Date(period);
-  if (Number.isNaN(d.getTime())) return null;
-  const q = Math.floor(d.getMonth() / 3) + 1;
-  return `Q${q} '${String(d.getFullYear()).slice(-2)}`;
+  const raw = new Date(period);
+  if (Number.isNaN(raw.getTime())) return null;
+  const d = new Date(raw.getTime() - QUARTER_LABEL_BACKDATE_DAYS * 24 * 60 * 60 * 1000);
+  const q = Math.floor(d.getUTCMonth() / 3) + 1;
+  return `Q${q} '${String(d.getUTCFullYear()).slice(-2)}`;
 }
 
 // Finnhub's own `year`/`quarter` fields on a financials-reported entry
@@ -4992,6 +5005,12 @@ async function processSymbol(symbol, apiKey, ctx) {
   // mergeSyntheticReports). Only spends the extra fetch for tickers that
   // actually trip one of the two triggers — most of the ~4990 otherwise-
   // healthy tickers pay nothing extra.
+  // Tickers whose labels QUARTER_LABEL_BACKDATE_DAYS moves -- their already-
+  // published points still carry the old, shifted labels and need one
+  // targeted recompute to realign. Logged at the end of the run.
+  if ([...quarterlyFinancials, ...annualReportedFinancials].some((r) => r?.endDate && new Date(r.endDate).getUTCDate() <= QUARTER_LABEL_BACKDATE_DAYS)) {
+    LABEL_BACKDATED_SYMBOLS.add(symbol);
+  }
   if (
     quarterlyFinancials.length < SEC_ENRICHMENT_SPARSE_QUARTERLY_THRESHOLD ||
     annualReportedFinancials.length < SEC_ENRICHMENT_SPARSE_ANNUAL_THRESHOLD ||
@@ -5856,6 +5875,7 @@ async function main() {
       `${Object.keys(yearlyTrends).length} yearly, ${Object.keys(ttmTrends).length} ttm. ` +
       `${Object.keys(dcfCapCandidates).length} tickers need an analyst-target lookup (${capCandidateCount} to cap an outlier DCF estimate >= ${DCF_CAP_CANDIDATE_MULTIPLE}x price, ${fallbackCandidateCount} to fill a mid-range estimate where DCF wasn't available) — written to ${path.relative(process.cwd(), OUTPUT_DCF_CAP_CANDIDATES_FILE)}.`
   );
+  console.log(`Label backdate: ${LABEL_BACKDATED_SYMBOLS.size} tickers have a period ending in the first ${QUARTER_LABEL_BACKDATE_DAYS} days of a month: ${[...LABEL_BACKDATED_SYMBOLS].sort().join(',')}`);
 }
 
 if (require.main === module) {

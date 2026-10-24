@@ -1172,10 +1172,22 @@ function buildPfcfTrendFromFilingsAndPrices(quarterlyReports, annualReports, mon
 // from the period's own real end date, which buildEndDateByQuarterKey
 // already collects. Falls back to the fiscal-derived label when no end date
 // is available, so a point is never dropped for want of one.
+// A 52/53-week filer's period closes on a fixed weekday, so it can end a
+// few days INTO the next month (TDY's FY2022 ended 2023-01-01; SWK's
+// quarters end Apr 4 / Jul 4 / Oct 3). Labelled straight from that date it
+// lands a whole quarter late and collides with the real next period under
+// the same label, one value overwriting the other -- verified live: TDY's
+// yearly ROIC skipped FY '13/'15/'20, SWK's skipped FY '20/'25 and Q4 '25,
+// and the 2026-10-23 P/FCF recompute dropped KELYA/TDY FY '22. Backdated
+// QUARTER_LABEL_BACKDATE_DAYS first, the same rule (and the same 5 days)
+// as foreign-filings-pipeline's quarterLabelFromPeriod, which found it on
+// ASML; every ordinary month-end stays in its own quarter.
+const QUARTER_LABEL_BACKDATE_DAYS = 5;
 function quarterLabelFromEndDate(endDate) {
   if (!endDate) return null;
-  const d = new Date(endDate);
-  if (Number.isNaN(d.getTime())) return null;
+  const raw = new Date(endDate);
+  if (Number.isNaN(raw.getTime())) return null;
+  const d = new Date(raw.getTime() - QUARTER_LABEL_BACKDATE_DAYS * 24 * 60 * 60 * 1000);
   return `Q${Math.floor(d.getUTCMonth() / 3) + 1} '${String(d.getUTCFullYear()).slice(-2)}`;
 }
 
