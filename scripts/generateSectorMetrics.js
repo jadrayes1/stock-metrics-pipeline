@@ -4220,8 +4220,25 @@ function pickTrendToPublish(existingPoints, freshPoints, metricKey = null) {
   // sibling pipeline -- PAC's and TSM's yearly roic (11 and 9 real points)
   // both emptied completely.
   const recomputing = metricKey && RECOMPUTE_METRICS.has(metricKey);
+  // A point whose LABEL changed is invisible to a label-keyed merge: the
+  // corrected point looks new, the stale one still looks current, and one
+  // period is published twice. Same rule as generatePfcfTrendCache.js's
+  // pickTrendToPublish (found there on JHX): an EXISTING point is dropped
+  // only when fresh carries that exact value under a different label --
+  // identical inputs through identical arithmetic, which two genuinely
+  // different periods essentially never hit to full float precision (0 is
+  // excluded, since real zeros repeat). Verified live after the 5-day label
+  // backdate: 1,082 points across the 367 realigned tickers duplicated a
+  // neighbour exactly, e.g. SWK quarterly roic Q2 '26 = Q3 '26 = 0.0041.
+  // The period itself is kept, under its corrected label.
+  const freshLabelByValue = new Map();
+  for (const p of freshPoints) if (Number.isFinite(p.value) && p.value !== 0 && !freshLabelByValue.has(p.value)) freshLabelByValue.set(p.value, p.label);
   const merged = new Map();
-  for (const p of existingPoints) merged.set(p.label, p);
+  for (const p of existingPoints) {
+    const freshLabel = Number.isFinite(p.value) && p.value !== 0 ? freshLabelByValue.get(p.value) : undefined;
+    if (freshLabel !== undefined && freshLabel !== p.label) continue;
+    merged.set(p.label, p);
+  }
   // A recompute only ever REPLACES a published value with a real number.
   // A fresh null (or NaN) for a label that is already published is not
   // written -- a recompute must correct values, never blank them -- and
