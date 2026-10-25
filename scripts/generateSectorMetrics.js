@@ -4203,7 +4203,10 @@ function pickTrendToPublish(existingPoints, freshPoints, metricKey = null) {
   // Narrow on purpose: a human has named both the exact tickers and the
   // exact metric, and sees the result immediately. Scheduled full-universe
   // runs never set TARGET_SYMBOL and so can never reach this.
-  const retractionAllowed = metricKey && RECOMPUTE_METRICS.has(metricKey) && !!process.env.TARGET_SYMBOL;
+  // Retraction (a fresh empty result blanking a published series) is opt-in
+  // on top of a targeted recompute: RECOMPUTE_ALLOW_RETRACT=1. A recompute
+  // otherwise only adds points or replaces values -- never narrows a series.
+  const retractionAllowed = metricKey && RECOMPUTE_METRICS.has(metricKey) && !!process.env.TARGET_SYMBOL && process.env.RECOMPUTE_ALLOW_RETRACT === '1';
   if (retractionAllowed && (!freshPoints || freshPoints.length === 0)) return [];
   if (!freshPoints || freshPoints.length === 0) return existingPoints;
   // A recomputed metric is STILL a union -- only the precedence flips, so

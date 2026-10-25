@@ -1522,7 +1522,10 @@ function pickTrendToPublish(existingPoints, freshPoints, metricKey = null) {
   // Retraction only on a TARGET_SYMBOL run that names this metric -- see
   // generateSectorMetrics.js's pickTrendToPublish for why it is that narrow.
   const recomputing = !!metricKey && RECOMPUTE_METRICS.has(metricKey);
-  if (recomputing && process.env.TARGET_SYMBOL && (!freshPoints || freshPoints.length === 0)) return [];
+  // Retraction (a fresh empty result blanking a published series) is opt-in
+  // on top of a targeted recompute: RECOMPUTE_ALLOW_RETRACT=1. A recompute
+  // otherwise only adds points or replaces values -- never narrows a series.
+  if (recomputing && process.env.TARGET_SYMBOL && process.env.RECOMPUTE_ALLOW_RETRACT === '1' && (!freshPoints || freshPoints.length === 0)) return [];
   if (!freshPoints || freshPoints.length === 0) return existingPoints;
   // A point whose LABEL changed is invisible to the label-keyed merge below:
   // the corrected point looks brand new, the stale one still looks current,
