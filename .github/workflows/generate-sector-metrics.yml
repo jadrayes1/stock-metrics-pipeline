@@ -312,7 +312,9 @@ jobs:
             attempt=1
             while true; do
               EXPECTED_SHA=$(git -C gist-clone rev-parse HEAD)
+              node scripts/guardTrendSeries.js snapshot gist-clone trendsNative.json trendsYearly.json trendsQuarterly.json trendsTtm.json
               node scripts/mergeSingleSymbolIntoGist.js
+              node scripts/guardTrendSeries.js check gist-clone trendsNative.json trendsYearly.json trendsQuarterly.json trendsTtm.json --alive gist-clone/marketMetrics.json
               (
                 cd gist-clone
                 git config user.email "actions@github.com"
@@ -359,6 +361,7 @@ jobs:
             attempt=1
             while true; do
               EXPECTED_SHA=$(git -C gist-clone rev-parse HEAD)
+              node scripts/guardTrendSeries.js snapshot gist-clone trendsNative.json trendsYearly.json trendsQuarterly.json trendsTtm.json
               cp src/data/marketMetrics.json gist-clone/marketMetrics.json
               cp src/data/trendsNative.json gist-clone/trendsNative.json
               cp src/data/trendsQuarterly.json gist-clone/trendsQuarterly.json
@@ -372,6 +375,7 @@ jobs:
               # commit/snapshot as marketMetrics.json — apply-dcf-cap.yml
               # reads both together and they need to describe the same run.
               cp dcfCapCandidates.json gist-clone/dcfCapCandidates.json
+              node scripts/guardTrendSeries.js check gist-clone trendsNative.json trendsYearly.json trendsQuarterly.json trendsTtm.json --alive gist-clone/marketMetrics.json
               (
                 cd gist-clone
                 git config user.email "actions@github.com"
