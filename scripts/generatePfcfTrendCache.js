@@ -41,6 +41,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { buildSpinoffReports } = require('./lib/spinoffCarveOut');
 
 const OUTPUT_FILE = path.join(__dirname, '../pfcfTrendCache.json');
 const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/marketMetrics.json';
@@ -1662,6 +1663,79 @@ async function fetchMonthlyPrices(symbol, apiKey) {
 // whether a Twelve Data call was actually spent (so the caller can track
 // its own budget accurately — a Finnhub-side failure before reaching the
 // Twelve Data fetch shouldn't count against it).
+// ---------------------------------------------------------------------------
+// Recent spin-offs (lib/spinoffCarveOut.js -- same scoping as in
+// generateSectorMetrics.js: sparse reports, a Form 10-12B, "Combined"
+// carve-out statements). Verified live: Honeywell Aerospace (HONA) began
+// trading ~2026-06-29 and its P/E and P/FCF trends were empty -- one XBRL
+// 10-Q, no per-share data (its only quarter predates the spin), and never
+// four standalone quarters for a trailing window.
+// ---------------------------------------------------------------------------
+const SPINOFF_SPARSE_ANNUAL_THRESHOLD = 2;
+// A cover-page share count is applied only to periods ending this close to
+// (or after) its date -- the post-spin share count says nothing about a
+// period before the company existed as a listed entity.
+const SPINOFF_COVER_SHARES_MAX_DAYS_BEFORE = 60;
+
+async function fetchSecText(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SEC_FETCH_TIMEOUT_MS * 4);
+  try {
+    const res = await fetch(url, { headers: { 'User-Agent': SEC_USER_AGENT }, signal: controller.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.text();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// dei:EntityCommonStockSharesOutstanding, the cover-page count -- the only
+// share count a just-spun company's first 10-Q carries when that quarter
+// predates the spin (no EPS, no weighted-average shares).
+function latestCoverShares(companyFacts) {
+  const facts = companyFacts?.facts?.dei?.EntityCommonStockSharesOutstanding?.units?.shares || [];
+  return facts.filter((f) => f.val > 0 && f.end).sort((a, b) => b.end.localeCompare(a.end))[0] || null;
+}
+
+function addCoverSharesToReports(reports, cover) {
+  let added = 0;
+  for (const r of reports) {
+    if (!r?.endDate || !r.report) continue;
+    const daysBefore = (Date.parse(cover.end) - Date.parse(r.endDate)) / 86400000;
+    if (daysBefore > SPINOFF_COVER_SHARES_MAX_DAYS_BEFORE) continue;
+    if (findReportedDilutedShares(r.report.ic || []) != null) continue;
+    r.report.ic = [...(r.report.ic || []), { concept: 'us-gaap_WeightedAverageNumberOfDilutedSharesOutstanding', label: 'dei_EntityCommonStockSharesOutstanding (spin-off cover-page count)', value: cover.val }];
+    added++;
+  }
+  return added;
+}
+
+// A true trailing twelve months for a spin-off whose quarters cannot form a
+// standalone 4-quarter window: last fiscal year - its first q quarters
+// (year-to-date) + this year's first q quarters. Every input is a real
+// cumulative figure -- e.g. HONA at Q2 '26: FY2025 - H1 2025 + H1 2026.
+// Reports are year-to-date cumulative, the convention decumulateYtdByYear
+// already assumes for every quarterly report.
+function spinoffTrailingPoint(quarterlyReports, annualReports, flowOf, monthlyPrices) {
+  const latest = [...quarterlyReports].filter((r) => r.quarter >= 1 && r.quarter <= 3 && r.endDate).sort((a, b) => b.endDate.localeCompare(a.endDate))[0];
+  if (!latest) return null;
+  const priorYtd = quarterlyReports.find((r) => r.year === latest.year - 1 && r.quarter === latest.quarter);
+  const priorFy = annualReports.find((r) => r.year === latest.year - 1);
+  const shares = findReportedDilutedShares(latest.report?.ic || []);
+  if (!priorYtd || !priorFy || !(shares > 0)) return null;
+  const [cur, prevYtd, fy] = [latest, priorYtd, priorFy].map(flowOf);
+  if (cur == null || prevYtd == null || fy == null) return null;
+  const ttm = fy - prevYtd + cur;
+  const price = findClosestMonthlyPrice(monthlyPrices, new Date(latest.endDate));
+  if (price == null || ttm === 0) return null;
+  return { label: quarterLabelFromEndDate(latest.endDate), value: price / (ttm / shares), partial: false, quartersUsed: 4 };
+}
+
+function withPoint(series, point) {
+  if (!point) return series;
+  return [...(series || []).filter((p) => p.label !== point.label), point].sort((a, b) => (parseLabelToOrdinal(a.label) ?? 0) - (parseLabelToOrdinal(b.label) ?? 0));
+}
+
 async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, secTickerToCikMap, existingCacheEntry) {
   let fresh = { ttm: [], quarterly: [], yearly: [] };
   let freshPe = { ttm: [], quarterly: [], yearly: [] };
@@ -1750,6 +1824,30 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
               console.log(`  ${symbol}: filled missing shares into ${filledQ} quarterly + ${filledA} annual existing report(s) from SEC (Finnhub tagged the wrong statement as 'ic')`);
             }
           }
+        }
+      }
+    }
+
+    // Recent spin-off -- see SPINOFF_SPARSE_ANNUAL_THRESHOLD above.
+    let isSpinoff = false;
+    if (annualReports.length < SPINOFF_SPARSE_ANNUAL_THRESHOLD) {
+      const cik = secTickerToCikMap.get((RENAMED_TICKER_FINANCIALS_ALIASES[symbol] || symbol).toUpperCase()) || secTickerToCikMap.get(symbol.toUpperCase());
+      if (cik) {
+        const padded = String(Number(cik)).padStart(10, '0');
+        const companyFacts = await fetchSecJson(`${SEC_COMPANYFACTS_BASE}/CIK${padded}.json`);
+        const gaapFacts = { ...(companyFacts?.facts?.['us-gaap'] || {}), ...(companyFacts?.facts?.['ifrs-full'] || {}) };
+        const spinoff = await buildSpinoffReports(padded, gaapFacts, { fetchJson: fetchSecJson, fetchText: fetchSecText });
+        if (spinoff.annualReports.length) {
+          // Same CIK family as the real reports, so the builders' sameCik filters keep them.
+          const familyCik = quarterlyReports[0]?.cik ?? annualReports[0]?.cik;
+          if (familyCik != null) for (const r of [...spinoff.quarterlyReports, ...spinoff.annualReports]) r.cik = familyCik;
+          const merged = mergeSyntheticPfcfReports(quarterlyReports, annualReports, spinoff);
+          quarterlyReports = merged.quarterlyReports;
+          annualReports = merged.annualReports;
+          isSpinoff = true;
+          const cover = latestCoverShares(companyFacts);
+          const withShares = cover ? addCoverSharesToReports([...quarterlyReports, ...annualReports], cover) : 0;
+          console.log(`  ${symbol}: spin-off carve-out history added (${spinoff.annualReports.length} annual + ${spinoff.quarterlyReports.length} interim); cover-page share count on ${withShares} post-spin report(s)`);
         }
       }
     }
@@ -1872,6 +1970,18 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
       quarterly: buildPeQuarterlyFromFilingsAndPrices(quarterlyReports, annualReports, monthlyPrices),
       yearly: buildPeYearlyFromFilingsAndPrices(annualReports, monthlyPrices, quarterlyReports),
     };
+    if (isSpinoff) {
+      // The trailing point a spin-off's quarters can't form on their own --
+      // see spinoffTrailingPoint. Replaces only a same-label partial point.
+      const fcfOf = (r) => {
+        const ocf = findReportedOperatingCashFlowQ(r.report?.cf || []);
+        const capex = findReportedCapexQ(r.report?.cf || []);
+        return ocf == null || capex == null ? null : ocf - capex;
+      };
+      const niOf = (r) => findReportedNetIncome(r.report?.ic || []);
+      fresh.ttm = withPoint(fresh.ttm, spinoffTrailingPoint(quarterlyReports, annualReports, fcfOf, monthlyPrices));
+      freshPe.ttm = withPoint(freshPe.ttm, spinoffTrailingPoint(quarterlyReports, annualReports, niOf, monthlyPrices));
+    }
     computed = true;
   } catch (err) {
     console.log(`  skip ${symbol}: ${err.message}`);
