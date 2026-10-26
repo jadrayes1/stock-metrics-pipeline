@@ -101,6 +101,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { buildSpinoffReports } = require('./lib/spinoffCarveOut');
 
 const OUTPUT_FILE = path.join(__dirname, '../src/data/marketMetrics.json');
 // Trend caches (native/quarterly/yearly/ttm) publish to their OWN files,
@@ -1405,6 +1406,21 @@ async function fetchSecJson(url) {
   }
 }
 
+// HTML (not JSON) from SEC's archives -- the spin-off information statement
+// (see lib/spinoffCarveOut.js). Same User-Agent and timeout as fetchSecJson,
+// with more time: a 424B3 runs to ~10 MB.
+async function fetchSecText(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SEC_FETCH_TIMEOUT_MS * 4);
+  try {
+    const res = await fetch(url, { headers: { 'User-Agent': SEC_USER_AGENT }, signal: controller.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.text();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fetchSecTickerToCikMap() {
   const data = await fetchSecJson(SEC_TICKERS_URL);
   const map = new Map();
@@ -1868,7 +1884,8 @@ function fillMissingEquityInExistingReports(reports, byEnd) {
 // ---------------------------------------------------------------------------
 
 const SEC_ENRICHMENT_SPARSE_QUARTERLY_THRESHOLD = 4; // can't complete even one TTM window below this
-const SEC_ENRICHMENT_SPARSE_ANNUAL_THRESHOLD = 2; // can't compute a single YoY annual point below this
+const SEC_ENRICHMENT_SPARSE_ANNUAL_THRESHOLD = 2;
+const SPINOFF_SPARSE_ANNUAL_THRESHOLD = 2; // see the spin-off branch in processSymbol // can't compute a single YoY annual point below this
 
 // A second, independent enrichment trigger alongside the sparse-overall one
 // above — verified live for MSFT: 46 total quarterly reports (nowhere near
@@ -5061,8 +5078,10 @@ async function processSymbol(symbol, apiKey, ctx) {
         [mappedCik, ...(CIK_CONTINUITY_ALIASES[symbol] || [])].filter(Boolean).map((cik) => canonicalCikDigits(cik).padStart(10, '0'))
       );
       let combinedSynthesized = { quarterlyReports: [], annualReports: [] };
+      const gaapFactsByCik = new Map();
       for (const cik of ciksToEnrich) {
         const gaapFacts = await fetchSecUsGaapFacts(cik);
+        gaapFactsByCik.set(cik, gaapFacts);
         if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG gaapFacts concepts for cik', cik, Object.keys(gaapFacts).length);
         const synthesized = buildSecSyntheticReports(gaapFacts, cik, isFinancialIndustry(profile.industry));
         if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG synthesized for cik', cik, synthesized.quarterlyReports.length, synthesized.annualReports.length);
@@ -5076,6 +5095,26 @@ async function processSymbol(symbol, apiKey, ctx) {
         quarterlyFinancials = merged.quarterlyReports;
         annualReportedFinancials = merged.annualReports;
         if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG merged totals', quarterlyFinancials.length, annualReportedFinancials.length);
+      }
+      // A recent spin-off: still under SPINOFF_SPARSE_ANNUAL_THRESHOLD annual
+      // reports after every other source, so read its carve-out history from
+      // the spin-off information statement (lib/spinoffCarveOut.js, which
+      // also requires a Form 10-12B in the company's SEC history -- an
+      // established company never gets that far). Merged the same way:
+      // only periods still missing are filled.
+      if (annualReportedFinancials.length < SPINOFF_SPARSE_ANNUAL_THRESHOLD && mappedCik) {
+        const paddedCik = canonicalCikDigits(mappedCik).padStart(10, '0');
+        const spinoff = await buildSpinoffReports(paddedCik, gaapFactsByCik.get(paddedCik), {
+          fetchJson: fetchSecJson,
+          fetchText: fetchSecText,
+          debug: !!process.env.DEBUG_SEC_ENRICHMENT,
+        });
+        if (spinoff.annualReports.length || spinoff.quarterlyReports.length) {
+          const merged = mergeSyntheticReports(quarterlyFinancials, annualReportedFinancials, spinoff);
+          quarterlyFinancials = merged.quarterlyReports;
+          annualReportedFinancials = merged.annualReports;
+          console.log(`  ${symbol}: spin-off carve-out history added -- ${spinoff.annualReports.length} annual + ${spinoff.quarterlyReports.length} interim report(s) available`);
+        }
       }
     } catch (e) {
       if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG enrichment threw', e.message, e.stack);
