@@ -55,6 +55,12 @@ const gistMetricsPath = path.join(GIST_CLONE_DIR, 'marketMetrics.json');
 const gistMetrics = readJson(gistMetricsPath);
 
 gistMetrics.staleSymbols = (gistMetrics.staleSymbols || []).filter((s) => !targets.includes(s));
+// Same membership merge for the revenue-status lists (see generateSectorMetrics.js).
+for (const key of ['zeroRevenueSymbols', 'noRevenueReportedSymbols']) {
+  gistMetrics[key] = (gistMetrics[key] || []).filter((s) => !targets.includes(s));
+  for (const target of targets) if ((freshMetrics[key] || []).includes(target)) gistMetrics[key].push(target);
+  gistMetrics[key].sort();
+}
 for (const target of targets) {
   if (freshMetrics.metrics[target]) {
     gistMetrics.metrics[target] = freshMetrics.metrics[target];

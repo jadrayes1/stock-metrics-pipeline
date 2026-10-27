@@ -2515,18 +2515,39 @@ const REVENUE_CONTRACT_CONCEPT_PREFIX = 'us-gaap_RevenueFromContractWithCustomer
 const REVENUE_CONTRACT_CONCEPT_EXCLUDE = /RemainingPerformanceObligation|Disaggregation|PolicyTextBlock|TableTextBlock|Liability|Asset|Member|Axis|Domain|ExtensibleList/i;
 const REVENUE_LABEL_PATTERN = /^(total\s+)?(net\s+)?revenues?(,?\s*net)?$|^(total\s+)?net\s+sales$/i;
 
+// A revenue line reported as exactly $0 is kept apart from a missing one:
+// $0 is returned only when EVERY revenue line found says $0 (and the bank
+// fallback below finds nothing either). Verified live via SEC frames: 94
+// app tickers tag $0 under one revenue concept while reporting real revenue
+// under another -- Flowserve (FLS, ~\$4.5B revenue) among them -- and taking
+// the first concept found, $0 included, could publish a -100% "growth"
+// point; banks such as CBSH tag a $0 revenue concept beside real interest
+// income. A company whose filings say $0 throughout (pre-revenue biotech,
+// e.g. SELLAS/SLS) now gets an explicit 0 rather than nothing.
 function findReportedRevenue(icItems) {
+  let sawZero = false;
+  const take = (item) => {
+    if (!item || item.value == null) return null;
+    if (item.value === 0) {
+      sawZero = true;
+      return null;
+    }
+    return item.value;
+  };
   for (const concept of REVENUE_CONCEPT_CANDIDATES) {
-    const match = icItems.find((item) => item.concept === concept);
-    if (match) return match.value;
+    const v = take(icItems.find((item) => item.concept === concept));
+    if (v != null) return v;
   }
-  const contractRevenueMatch = icItems.find(
-    (item) => item.value != null && (item.concept || '').startsWith(REVENUE_CONTRACT_CONCEPT_PREFIX) && !REVENUE_CONTRACT_CONCEPT_EXCLUDE.test(item.concept)
-  );
-  if (contractRevenueMatch) return contractRevenueMatch.value;
-
-  const labelMatch = icItems.find((item) => REVENUE_LABEL_PATTERN.test((item.label || '').trim()));
-  if (labelMatch) return labelMatch.value;
+  for (const item of icItems) {
+    if (!(item.concept || '').startsWith(REVENUE_CONTRACT_CONCEPT_PREFIX) || REVENUE_CONTRACT_CONCEPT_EXCLUDE.test(item.concept)) continue;
+    const v = take(item);
+    if (v != null) return v;
+  }
+  for (const item of icItems) {
+    if (!REVENUE_LABEL_PATTERN.test((item.label || '').trim())) continue;
+    const v = take(item);
+    if (v != null) return v;
+  }
 
   // Mirrors findReportedRevenue in src/utils/metrics.js — some banks
   // (verified live: Capital One/COF) report no combined revenue line at
@@ -2550,7 +2571,16 @@ function findReportedRevenue(icItems) {
     return netInterestIncome.value;
   }
 
-  return null;
+  return sawZero ? 0 : null;
+}
+
+// Year-over-year growth between two revenue figures, with a reported $0 kept
+// apart from a missing one: $0 -> $0 is no change (0%), $X -> $0 is -100%,
+// and $0 -> $X has no defined growth (a missing point, not a guess).
+function revenueGrowthBetween(prev, cur) {
+  if (prev == null || cur == null) return null;
+  if (prev === 0) return cur === 0 ? 0 : null;
+  return clampImplausible((cur - prev) / prev);
 }
 
 function findReportedOperatingCashFlowQ(cfItems) {
@@ -3708,7 +3738,7 @@ function buildRevenueGrowthQuarterlyFromFilings(quarterlyReports, annualReports)
   for (const current of chronological) {
     const yearAgo = byKey.get(`${current.year - 1}-${current.quarter}`);
     if (!yearAgo) continue;
-    const value = clampImplausible(yearAgo.value ? (current.value - yearAgo.value) / yearAgo.value : null);
+    const value = revenueGrowthBetween(yearAgo.value, current.value);
     if (value != null) points.push({ label: calendarQuarterLabel(calendarLabels, current.year, current.quarter), value });
   }
   return points.slice(-QUARTERS_OF_HISTORY);
@@ -3738,7 +3768,7 @@ function buildRevenueGrowthYearlyFromFilings(annualReports) {
   for (let i = 1; i < records.length; i++) {
     const consecutive = records[i].year === records[i - 1].year + 1 || aboutAYearApart(records[i - 1].year, records[i].year);
     if (!consecutive) continue;
-    const value = clampImplausible(records[i - 1].revenue ? (records[i].revenue - records[i - 1].revenue) / records[i - 1].revenue : null);
+    const value = revenueGrowthBetween(records[i - 1].revenue, records[i].revenue);
     if (value != null) points.push({ label: calendarYearlyLabel(calendarLabels, records[i].year), value });
   }
   return points.slice(-QUARTERS_OF_HISTORY);
@@ -3763,10 +3793,10 @@ function buildRevenueGrowthTTMFromFilings(quarterlyReports, annualReports) {
   const points = [];
   for (const curr of orderedKeys) {
     const yearAgoKey = `${curr.year - 1}-${curr.quarter}`;
-    if (!ttmByKey[yearAgoKey]) continue;
+    if (ttmByKey[yearAgoKey] == null) continue;
     const currTTM = ttmByKey[`${curr.year}-${curr.quarter}`];
     const yearAgoTTM = ttmByKey[yearAgoKey];
-    const value = clampImplausible(yearAgoTTM ? (currTTM - yearAgoTTM) / yearAgoTTM : null);
+    const value = revenueGrowthBetween(yearAgoTTM, currTTM);
     if (value != null) points.push({ label: calendarQuarterLabel(calendarLabels, curr.year, curr.quarter), value });
   }
   return points.slice(-QUARTERS_OF_HISTORY);
@@ -4137,6 +4167,10 @@ async function fetchPreviouslyPublishedDataset() {
 
   return {
     metrics: asObject(metricsData?.metrics),
+    revenueLists: {
+      zeroRevenueSymbols: Array.isArray(metricsData?.zeroRevenueSymbols) ? metricsData.zeroRevenueSymbols : [],
+      noRevenueReportedSymbols: Array.isArray(metricsData?.noRevenueReportedSymbols) ? metricsData.noRevenueReportedSymbols : [],
+    },
     nativeTrends,
     yearlyTrends,
     quarterlyTrends,
@@ -5556,8 +5590,19 @@ async function processSymbol(symbol, apiKey, ctx) {
     }
   }
 
+  // Whether the company's latest real statement (one with net income)
+  // reports revenue as $0 or has no revenue line at all -- published so the
+  // trend screen can say which, instead of "not available yet". Verified
+  // live: SELLAS (SLS) files explicit $0 revenue every period since 2023.
+  const latestStatement = [...annualReportedFinancials, ...quarterlyFinancials]
+    .filter((r) => r?.endDate && findReportedNetIncome(r.report?.ic || []) != null)
+    .sort((a, b) => b.endDate.localeCompare(a.endDate))[0];
+  const latestRevenue = latestStatement ? findReportedRevenue(latestStatement.report?.ic || []) : undefined;
+  const revenueStatus = latestStatement == null ? null : latestRevenue === 0 ? 'zero' : latestRevenue == null ? 'notReported' : null;
+
   return {
     status: 'ok',
+    revenueStatus,
     profile: profileEntry,
     metrics: {
       industry: profile.industry,
@@ -5608,6 +5653,8 @@ async function runWorker(workerId, symbolSubset, apiKey, ctx) {
     // ticker's old data should stop publishing, unlike a merely
     // transient-failed one).
     deadSymbols: new Set(),
+    zeroRevenueSymbols: [],
+    noRevenueReportedSymbols: [],
   };
 
   for (let i = 0; i < symbolSubset.length; i++) {
@@ -5627,6 +5674,8 @@ async function runWorker(workerId, symbolSubset, apiKey, ctx) {
         if (r.dcfComputed) result.dcfComputed++;
         if (r.cardValuesReconstructed) result.cardValuesReconstructed++;
         if (r.dcfCapCandidate) result.dcfCapCandidates[symbol] = r.dcfCapCandidate;
+        if (r.revenueStatus === 'zero') result.zeroRevenueSymbols.push(symbol);
+        if (r.revenueStatus === 'notReported') result.noRevenueReportedSymbols.push(symbol);
         result.ok++;
       }
     } catch (err) {
@@ -5776,7 +5825,7 @@ async function main() {
       }
       try {
         const r = await processSymbol(target, apiKeys[0], ctx);
-        console.error(`DEBUG [${target}] trace result status=`, r.status, 'metrics=', JSON.stringify(r.metrics));
+        console.error(`DEBUG [${target}] trace result status=`, r.status, 'revenueStatus=', r.revenueStatus, 'metrics=', JSON.stringify(r.metrics));
         console.error(`DEBUG [${target}] yearlyTrends=`, JSON.stringify(r.yearlyTrends));
         console.error(`DEBUG [${target}] quarterlyTrends=`, JSON.stringify(r.quarterlyTrends));
         console.error(`DEBUG [${target}] ttmTrends=`, JSON.stringify(r.ttmTrends));
@@ -5931,7 +5980,13 @@ async function main() {
   // pretty-printing was adding meaningful overhead for no benefit on a
   // machine-generated, never-hand-edited file, and every byte matters now
   // that these files run into the tens of megabytes at full-universe scale.
-  const output = { generatedAt, metrics, industryLeaders, staleSymbols };
+  // Revenue status lists (see processSymbol's revenueStatus). A ticker this
+  // run didn't process (a hard failure) keeps its previously published
+  // membership, the same way its metrics are recovered.
+  const carry = (key, fresh) => [...new Set([...fresh, ...(previouslyPublished.revenueLists?.[key] || []).filter((s) => metrics[s] && !processedThisRun.has(s))])].sort();
+  const zeroRevenueSymbols = carry('zeroRevenueSymbols', workerResults.flatMap((r) => r.zeroRevenueSymbols));
+  const noRevenueReportedSymbols = carry('noRevenueReportedSymbols', workerResults.flatMap((r) => r.noRevenueReportedSymbols));
+  const output = { generatedAt, metrics, industryLeaders, staleSymbols, zeroRevenueSymbols, noRevenueReportedSymbols };
   fs.mkdirSync(path.dirname(OUTPUT_FILE), { recursive: true }); // works regardless of which repo this script runs in
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(output));
   fs.writeFileSync(OUTPUT_TRENDS_NATIVE_FILE, JSON.stringify({ generatedAt, trends: nativeTrends }));
