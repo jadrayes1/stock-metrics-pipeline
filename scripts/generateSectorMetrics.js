@@ -3720,9 +3720,24 @@ function buildRevenueGrowthYearlyFromFilings(annualReports) {
   if (process.env.DEBUG_SEC_ENRICHMENT) {
     console.error('DEBUG buildRevenueGrowthYearlyFromFilings records', JSON.stringify(records));
   }
+  // Consecutive by the fiscal year numbers -- or, when those skip, by the
+  // reports' real end dates being about a year apart. Verified live:
+  // Finnhub numbers Advance Auto Parts (AAP)'s fiscal 2025, which ended
+  // 2026-01-03, as year 2026, so its years ran 2023, 2024, 2026; the newest
+  // growth point fell back to FY '24, the recency gate dropped the series,
+  // and AAP showed no yearly revenue growth with 16 years of revenue.
+  const endDateByYear = new Map((annualReports || []).filter((r) => r?.year && r?.endDate).map((r) => [r.year, r.endDate]));
+  const aboutAYearApart = (a, b) => {
+    const ea = endDateByYear.get(a);
+    const eb = endDateByYear.get(b);
+    if (!ea || !eb) return false;
+    const days = (Date.parse(eb) - Date.parse(ea)) / 86400000;
+    return days >= 330 && days <= 400;
+  };
   const points = [];
   for (let i = 1; i < records.length; i++) {
-    if (records[i].year !== records[i - 1].year + 1) continue;
+    const consecutive = records[i].year === records[i - 1].year + 1 || aboutAYearApart(records[i - 1].year, records[i].year);
+    if (!consecutive) continue;
     const value = clampImplausible(records[i - 1].revenue ? (records[i].revenue - records[i - 1].revenue) / records[i - 1].revenue : null);
     if (value != null) points.push({ label: calendarYearlyLabel(calendarLabels, records[i].year), value });
   }
