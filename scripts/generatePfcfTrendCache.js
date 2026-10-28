@@ -46,6 +46,8 @@ const { buildSpinoffReports } = require('./lib/spinoffCarveOut');
 const OUTPUT_FILE = path.join(__dirname, '../pfcfTrendCache.json');
 const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/marketMetrics.json';
 const GIST_PFCF_TREND_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/pfcfTrendCache.json';
+const GIST_FOREIGN_FILER_LIST_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/foreignFilerList.json';
+let FOREIGN_FILERS = null; // loaded in main()
 
 // Widened from 1100ms (~54.5/min, a ~9% margin) to match
 // generateSectorMetrics.js's 2026-08-25 change — that pipeline's own runs
@@ -1998,7 +2000,7 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
   // During a scheduled sweep, also only a ticker not yet refreshed since the
   // sweep began: each ticker is recomputed exactly once, however many runs
   // the rotation takes.
-  const mayRecompute = computed && !alreadySwept(existingCacheEntry?.fetchedAt);
+  const mayRecompute = computed && !alreadySwept(existingCacheEntry?.fetchedAt) && FOREIGN_FILERS != null && !FOREIGN_FILERS.has(symbol);
   const cadences = pickCadenceTrendsToPublish(existingCacheEntry, fresh, mayRecompute ? 'pfcfRatio' : null);
   const peCadences = pickCadenceTrendsToPublish(existingCacheEntry?.pe, freshPe, mayRecompute ? 'peRatio' : null);
   if (process.env.DEBUG_PFCF_SYMBOLS?.split(',').map((s) => s.trim().toUpperCase()).includes(symbol)) {
@@ -2070,6 +2072,17 @@ async function main() {
     fetchJson(`${GIST_PFCF_TREND_URL}?${cacheBust}`).catch(() => ({ trends: {} })), // first-ever run: no existing cache yet
     fetchSecTickerToCikMap().catch(() => new Map()), // non-fatal — SEC enrichment below just never triggers without it
   ]);
+
+  // Foreign filers' P/E (the .pe key) is the foreign pipeline's to compute
+  // -- it converts each filer's home-currency earnings to dollars; this
+  // script never does. A recompute here must not overwrite those points.
+  // Verified live: the 2026-10-28 sweep run replaced Megan Holdings (MGN)'s
+  // FY '25 P/E 29.4 with 143,277.7 from ringgit figures against a dollar
+  // price. If the list can't be loaded, nothing is recomputed this run.
+  FOREIGN_FILERS = await fetchJson(`${GIST_FOREIGN_FILER_LIST_URL}?${cacheBust}`)
+    .then((d) => (Array.isArray(d?.foreignFilers) ? new Set(d.foreignFilers.map((f) => f.symbol)) : null))
+    .catch(() => null);
+  if (!FOREIGN_FILERS && RECOMPUTE_METRICS.size) console.log('::warning::Foreign-filer list unavailable -- no ticker is recomputed this run.');
 
   const cache = existingTrendCache.trends || {};
   // A real scalar pfcfRatio does NOT mean the Quarterly/Yearly/TTM trend
