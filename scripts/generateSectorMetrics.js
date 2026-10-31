@@ -3219,55 +3219,6 @@ function extractNativeQuarterlySeries(quarterly, metricKey) {
 // metricKey — a metric is only included if at least one point has a real
 // (non-null) value, so a ticker with nothing for, say, fcfMargin doesn't
 // publish an array of all-null points.
-// A TTM view for a ticker whose statements give no standalone quarters
-// (most foreign filers -- verified live: SBS and BABA had full quarterly
-// margin and revenue-growth series but an empty TTM tab). Built from the
-// same quarterly series the native trends use:
-//   profit/FCF margin: sum(margin_q x salesPerShare_q) / sum(salesPerShare_q)
-//     over four consecutive quarters -- exact when the share count is
-//     steady across the year, which per-share weighting assumes;
-//   revenue growth: four quarters' salesPerShare over the prior four.
-// Quarters must be consecutive (~3 months apart); a gap breaks the window.
-// ROIC, P/E and P/FCF are only given as trailing figures already and cannot
-// be split into quarters, so nothing is derived for them here.
-function deriveTtmFromQuarterlySeries(quarterly, metricKey) {
-  const series = quarterly || {};
-  const byPeriod = (entries) => new Map((entries || []).filter((e) => e?.period && e.v != null).map((e) => [e.period, e.v]));
-  const sales = byPeriod(series.salesPerShare);
-  const periods = [...sales.keys()].sort();
-  const consecutive = (a, b) => {
-    const days = (new Date(b) - new Date(a)) / 86400000;
-    return days >= 80 && days <= 100;
-  };
-  const window = (endIdx, length) => {
-    if (endIdx - length + 1 < 0) return null;
-    const w = periods.slice(endIdx - length + 1, endIdx + 1);
-    for (let i = 1; i < w.length; i++) if (!consecutive(w[i - 1], w[i])) return null;
-    return w;
-  };
-  const points = [];
-  if (metricKey === 'revenueGrowth') {
-    for (let i = 0; i < periods.length; i++) {
-      const w = window(i, 8);
-      if (!w) continue;
-      const prior = w.slice(0, 4).reduce((sum, p) => sum + sales.get(p), 0);
-      const recent = w.slice(4).reduce((sum, p) => sum + sales.get(p), 0);
-      if (prior > 0) points.push({ label: quarterLabelFromPeriod(w[7]), value: recent / prior - 1 });
-    }
-  } else if (metricKey === 'profitMargin' || metricKey === 'fcfMargin') {
-    const margin = byPeriod(series[metricKey === 'profitMargin' ? 'netMargin' : 'fcfMargin']);
-    for (let i = 0; i < periods.length; i++) {
-      const w = window(i, 4);
-      if (!w || !w.every((p) => margin.has(p))) continue;
-      const totalSales = w.reduce((sum, p) => sum + sales.get(p), 0);
-      if (!(totalSales > 0)) continue;
-      const weighted = w.reduce((sum, p) => sum + margin.get(p) * sales.get(p), 0);
-      points.push({ label: quarterLabelFromPeriod(w[3]), value: weighted / totalSales });
-    }
-  }
-  return points.slice(-QUARTERS_OF_HISTORY);
-}
-
 function buildNativeTrendsForTicker(quarterly) {
   const result = {};
   for (const metricKey of ['roic', 'revenueGrowth', 'profitMargin', 'fcfMargin', 'peRatio', 'pfcfRatio']) {
@@ -5392,12 +5343,6 @@ async function processSymbol(symbol, apiKey, ctx) {
     if (!published.length) {
       const foreignPoints = foreignFilingsTrendsForSymbol?.ttm?.[key];
       if (foreignPoints?.length) published = foreignPoints;
-    }
-    // Last resort, only for an otherwise-empty TTM series: derived from the
-    // quarterly per-share series -- see deriveTtmFromQuarterlySeries.
-    if (!published.length && !finnhubDataUntrusted) {
-      const derived = deriveTtmFromQuarterlySeries(quarterly, key);
-      if (derived.length) published = derived;
     }
     if (published.length) {
       mergedTtmForSymbol[key] = published;
