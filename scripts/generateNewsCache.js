@@ -109,6 +109,75 @@ function selectRelevantArticles(articles, companyName, symbol, maxItems) {
     .map((x) => x.article);
 }
 
+// The data provider's article links are its own redirect pages
+// ("https://finnhub.io/api/news?id=..."), so tapping a story in the app
+// showed the provider's address in Safari before landing on the publisher.
+// Each link is stored as the publisher's own address instead -- verified
+// live: every one is a 302 straight to the article (finance.yahoo.com,
+// benzinga.com, ...). The redirect pages expire: an expired one answers
+// 404, for the app's users too, so that article is dropped (DEAD_LINK). Any
+// other failure keeps the old address and is retried on the next run.
+const PROVIDER_REDIRECT = /^https?:\/\/(?:www\.)?finnhub\.io\/api\/news\?/i;
+const DEAD_LINK = null;
+const BACKFILL_BUDGET_MS = 20 * 60 * 1000;
+const BACKFILL_CONCURRENCY = 4;
+
+async function resolveArticleUrl(url) {
+  if (!PROVIDER_REDIRECT.test(url || '')) return url;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const res = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(10000) });
+      const location = res.headers.get('location');
+      if (res.status >= 300 && res.status < 400 && location && /^https?:\/\//i.test(location) && !PROVIDER_REDIRECT.test(location)) return location;
+      if (res.status === 404 || res.status === 410) return DEAD_LINK;
+      if (res.status !== 429) return url; // anything else: retried next run
+    } catch {
+      return url; // network hiccup -- retried next run
+    }
+    await sleep(2000 * (attempt + 1)); // rate-limited: back off and retry
+  }
+  return url;
+}
+
+async function resolveArticles(articles) {
+  const out = [];
+  for (const a of articles) {
+    const url = await resolveArticleUrl(a.url);
+    if (url !== DEAD_LINK) out.push({ ...a, url });
+  }
+  return out;
+}
+
+// Converts links already in the cache, a bounded batch per run.
+async function backfillResolvedUrls(cache) {
+  const pending = [];
+  for (const entry of Object.values(cache)) {
+    for (const a of entry?.articles || []) if (PROVIDER_REDIRECT.test(a?.url || '')) pending.push(a);
+  }
+  const start = Date.now();
+  let resolved = 0;
+  let dead = 0;
+  let next = 0;
+  const worker = async () => {
+    while (next < pending.length && Date.now() - start < BACKFILL_BUDGET_MS) {
+      const a = pending[next++];
+      const url = await resolveArticleUrl(a.url);
+      if (url === DEAD_LINK) {
+        a.dead = true;
+        dead++;
+      } else if (url !== a.url) {
+        a.url = url;
+        resolved++;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: BACKFILL_CONCURRENCY }, worker));
+  for (const entry of Object.values(cache)) {
+    if (Array.isArray(entry?.articles)) entry.articles = entry.articles.filter((a) => !a?.dead);
+  }
+  console.log(`Article links: resolved ${resolved}, dropped ${dead} expired, of ${pending.length} provider redirect links already in the cache.`);
+}
+
 async function main() {
   const apiKey = readFinnhubApiKey();
 
@@ -151,7 +220,7 @@ async function main() {
       await sleep(REQUEST_SPACING_MS);
 
       const rawArticles = await fetchCompanyNews(symbol, apiKey);
-      const relevant = selectRelevantArticles(rawArticles, profile.name, symbol, MAX_ARTICLES_PER_TICKER);
+      const relevant = await resolveArticles(selectRelevantArticles(rawArticles, profile.name, symbol, MAX_ARTICLES_PER_TICKER));
       cache[symbol] = { fetchedAt: new Date().toISOString(), articles: relevant };
       if (relevant.length > 0) withArticles++;
     } catch (err) {
@@ -168,6 +237,7 @@ async function main() {
     await sleep(REQUEST_SPACING_MS);
   }
 
+  await backfillResolvedUrls(cache);
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify({ generatedAt: new Date().toISOString(), articles: cache }));
   console.log(`Done. Processed ${processed} tickers this run (${withArticles} with relevant articles). Cache now covers ${Object.keys(cache).length}/${symbols.length} tickers total.`);
 }
