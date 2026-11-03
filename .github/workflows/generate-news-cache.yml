@@ -76,12 +76,13 @@ jobs:
           while true; do
             rm -rf gist-clone
             git clone --depth 1 "$CLONE_URL" gist-clone
-            if diff -q newsCache.json gist-clone/newsCache.json >/dev/null 2>&1; then
+            if diff -q newsCache.json gist-clone/newsCache.json >/dev/null 2>&1 && diff -q companyProfiles.json gist-clone/companyProfiles.json >/dev/null 2>&1; then
               echo "No changes to publish."
               break
             fi
             EXPECTED_SHA=$(git -C gist-clone rev-parse HEAD)
             cp newsCache.json gist-clone/newsCache.json
+            cp companyProfiles.json gist-clone/companyProfiles.json
             ( cd gist-clone
               git config user.email "actions@github.com"
               git config user.name "stock-metrics-pipeline"

@@ -36,6 +36,12 @@ const path = require('path');
 const OUTPUT_FILE = path.join(__dirname, '../newsCache.json');
 const GIST_NEWS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/newsCache.json';
 const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/marketMetrics.json';
+// The company profile this run already fetches per ticker (for the news
+// relevance filter), published as companyProfiles.json so the app's
+// proxy can answer /stock/profile2 from it instead of calling the
+// provider on every stock view -- only the fields the app reads.
+const PROFILES_OUTPUT_FILE = path.join(__dirname, '../companyProfiles.json');
+const GIST_PROFILES_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/companyProfiles.json';
 
 // Widened to match generateSectorMetrics.js's 2026-08-25 change — see that
 // file's own comment: a flat inter-request delay isn't a hard token-bucket,
@@ -182,10 +188,12 @@ async function main() {
   const apiKey = readFinnhubApiKey();
 
   console.log('Fetching current ticker universe + company names from the published sector-metrics feed...');
-  const [metricsDataset, existingNewsCache] = await Promise.all([
+  const [metricsDataset, existingNewsCache, existingProfiles] = await Promise.all([
     fetchJson(GIST_METRICS_URL),
     fetchJson(GIST_NEWS_URL).catch(() => ({ articles: {} })), // first-ever run: no existing cache yet
+    fetchJson(GIST_PROFILES_URL).catch(() => ({ profiles: {} })),
   ]);
+  const profiles = existingProfiles.profiles || {};
 
   const symbols = Object.keys(metricsDataset.metrics || {}).sort();
   const cache = existingNewsCache.articles || {};
@@ -217,6 +225,16 @@ async function main() {
     try {
       const profileRes = await fetch(`https://finnhub.io/api/v1/stock/profile2?symbol=${symbol}&token=${apiKey}`);
       const profile = profileRes.ok ? await profileRes.json() : {};
+      // A ticker the provider returns nothing for keeps its previous entry.
+      if (profile?.name) {
+        profiles[symbol] = {
+          name: profile.name,
+          logo: profile.logo || null,
+          finnhubIndustry: profile.finnhubIndustry || null,
+          shareOutstanding: profile.shareOutstanding ?? null,
+          fetchedAt: new Date().toISOString(),
+        };
+      }
       await sleep(REQUEST_SPACING_MS);
 
       const rawArticles = await fetchCompanyNews(symbol, apiKey);
@@ -239,6 +257,8 @@ async function main() {
 
   await backfillResolvedUrls(cache);
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify({ generatedAt: new Date().toISOString(), articles: cache }));
+  fs.writeFileSync(PROFILES_OUTPUT_FILE, JSON.stringify({ generatedAt: new Date().toISOString(), profiles }));
+  console.log(`Company profiles: ${Object.keys(profiles).length} published.`);
   console.log(`Done. Processed ${processed} tickers this run (${withArticles} with relevant articles). Cache now covers ${Object.keys(cache).length}/${symbols.length} tickers total.`);
 }
 
