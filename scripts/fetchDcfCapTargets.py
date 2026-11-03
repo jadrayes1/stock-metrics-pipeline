@@ -3,8 +3,10 @@
 scripts/generateSectorMetrics.js flagged as needing one, for one of two
 reasons (see the 'reason' field on each candidate):
   - 'cap': our own estimatedFairValue is at least DCF_CAP_CANDIDATE_MULTIPLE
-    (2.0x, see that file) above the current price — the real analyst high
+    (1.8x, see that file) above the current price — the real analyst high
     is used as a ceiling (scripts/applyDcfCap.js).
+  - 'floor': the mirror — our estimate is below the current price divided
+    by that multiple — the real analyst low is used as a floor.
   - 'fallback': DCF wasn't computable at all for this ticker — the real
     analyst mid-range ((high+low)/2, or mean/median if only one of those is
     available) is used to fill estimatedFairValue rather than leaving it
@@ -128,6 +130,7 @@ def main():
             if high is not None or low is not None or mean is not None or median is not None:
                 targets[symbol] = {
                     "reason": candidates[symbol].get("reason"),
+                    "currentPrice": candidates[symbol].get("currentPrice"),
                     "high": high,
                     "low": low,
                     "mean": mean,

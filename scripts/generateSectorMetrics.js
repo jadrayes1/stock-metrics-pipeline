@@ -5411,10 +5411,16 @@ async function processSymbol(symbol, apiKey, ctx) {
   // divergence check to the previous analyst-anchored value, not just
   // price, so a fresh DCF has to be reasonably close to BOTH before it is
   // trusted to replace what analysts said.
-  const previousAnchorSources = new Set(['analystConsensus', 'dcfCapped']);
+  const previousAnchorSources = new Set(['analystConsensus', 'dcfCapped', 'dcfFloored']);
   const previousAnchor = previousAnchorSources.has(previous?.estimatedFairValueSource) ? previous.estimatedFairValue : null;
   const isOutlierVsPrice = estimatedFairValue != null && impliedPrice != null && estimatedFairValue > impliedPrice * DCF_CAP_CANDIDATE_MULTIPLE;
   const isOutlierVsAnchor = estimatedFairValue != null && previousAnchor != null && estimatedFairValue > previousAnchor * DCF_CAP_CANDIDATE_MULTIPLE;
+  // The same multiple in the other direction: a DCF below price divided by
+  // it (about 56% of price at 1.8) is raised to the real analyst LOW --
+  // the mirror of the cap. Verified live: PLTR's DCF read $36.95 against
+  // $184; capital-heavy utilities (AWR $13.81 vs $86) and fast growers fall
+  // outside what a simple DCF captures the same way outliers above do.
+  const isLowOutlierVsPrice = estimatedFairValue != null && impliedPrice != null && estimatedFairValue < impliedPrice / DCF_CAP_CANDIDATE_MULTIPLE;
 
   // Two distinct reasons a ticker goes to the analyst-target lookup step
   // (scripts/fetchDcfCapTargets.py + applyDcfCap.js): our own DCF estimate
@@ -5433,6 +5439,8 @@ async function processSymbol(symbol, apiKey, ctx) {
   let dcfCapCandidate = null;
   if (estimatedFairValue != null && (isOutlierVsPrice || isOutlierVsAnchor)) {
     dcfCapCandidate = { reason: 'cap', estimatedFairValue, currentPrice: impliedPrice };
+  } else if (isLowOutlierVsPrice) {
+    dcfCapCandidate = { reason: 'floor', estimatedFairValue, currentPrice: impliedPrice };
   } else if (estimatedFairValue == null) {
     dcfCapCandidate = { reason: 'fallback', currentPrice: impliedPrice };
   }
@@ -5463,7 +5471,12 @@ async function processSymbol(symbol, apiKey, ctx) {
   // a trustworthy analyst number the moment it happens to duck under the
   // price-based ceiling alone.
   let estimatedFairValueSource;
-  if (previousAnchor != null && (estimatedFairValue == null || isOutlierVsPrice || isOutlierVsAnchor)) {
+  // A low outlier keeps only a previous FLOORED value: any other anchor (an
+  // analyst mid-range or a capped high) is not what the floor would give,
+  // so the raw DCF is published and applyDcfCap.js raises it to today's
+  // analyst low in the same workflow chain.
+  const keepsAnchorWhenLow = isLowOutlierVsPrice && previous?.estimatedFairValueSource === 'dcfFloored';
+  if (previousAnchor != null && (estimatedFairValue == null || isOutlierVsPrice || isOutlierVsAnchor || keepsAnchorWhenLow)) {
     estimatedFairValue = previousAnchor;
     estimatedFairValueSource = previous.estimatedFairValueSource;
   }
@@ -5997,12 +6010,13 @@ async function main() {
   fs.writeFileSync(OUTPUT_DCF_CAP_CANDIDATES_FILE, JSON.stringify({ generatedAt, candidates: dcfCapCandidates }));
   const capCandidateCount = Object.values(dcfCapCandidates).filter((c) => c.reason === 'cap').length;
   const fallbackCandidateCount = Object.values(dcfCapCandidates).filter((c) => c.reason === 'fallback').length;
+  const floorCandidateCount = Object.values(dcfCapCandidates).filter((c) => c.reason === 'floor').length;
   console.log(
     `Wrote ${ok} tickers to ${path.relative(process.cwd(), OUTPUT_FILE)} ` +
       `(${failed} failed, ${dead} dead/no-data excluded, ${dcfComputed} with a fair-value estimate, ${cardValuesReconstructed} card values freshly backfilled from reconstruction). ` +
       `Trend caches published: ${Object.keys(nativeTrends).length} native, ${Object.keys(quarterlyTrends).length} quarterly, ` +
       `${Object.keys(yearlyTrends).length} yearly, ${Object.keys(ttmTrends).length} ttm. ` +
-      `${Object.keys(dcfCapCandidates).length} tickers need an analyst-target lookup (${capCandidateCount} to cap an outlier DCF estimate >= ${DCF_CAP_CANDIDATE_MULTIPLE}x price, ${fallbackCandidateCount} to fill a mid-range estimate where DCF wasn't available) — written to ${path.relative(process.cwd(), OUTPUT_DCF_CAP_CANDIDATES_FILE)}.`
+      `${Object.keys(dcfCapCandidates).length} tickers need an analyst-target lookup (${capCandidateCount} to cap an outlier DCF estimate >= ${DCF_CAP_CANDIDATE_MULTIPLE}x price, ${floorCandidateCount} to floor one below price / ${DCF_CAP_CANDIDATE_MULTIPLE}, ${fallbackCandidateCount} to fill a mid-range estimate where DCF wasn't available) — written to ${path.relative(process.cwd(), OUTPUT_DCF_CAP_CANDIDATES_FILE)}.`
   );
   console.log(`Label backdate: ${LABEL_BACKDATED_SYMBOLS.size} tickers have a period ending in the first ${QUARTER_LABEL_BACKDATE_DAYS} days of a month: ${[...LABEL_BACKDATED_SYMBOLS].sort().join(',')}`);
 }

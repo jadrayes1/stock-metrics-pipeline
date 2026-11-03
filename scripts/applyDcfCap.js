@@ -6,6 +6,8 @@
 // generateSectorMetrics.js):
 //   - 'cap': our own estimatedFairValue exceeded the real analyst high —
 //     cap it there.
+//   - 'floor': the mirror -- our estimate fell below the real analyst low
+//     -- raise it there, tagged estimatedFairValueSource: 'dcfFloored'.
 //   - 'fallback': DCF wasn't computable at all for this ticker — fill
 //     estimatedFairValue with the real analyst mid-range ((high+low)/2, or
 //     mean/median if only one of those is available), tagged with
@@ -26,6 +28,9 @@
 const fs = require('fs');
 const path = require('path');
 
+// Must match generateSectorMetrics.js's constant of the same name.
+const DCF_CAP_CANDIDATE_MULTIPLE = 1.8;
+
 const METRICS_FILE = process.argv[2] || path.join(__dirname, '../src/data/marketMetrics.json');
 const TARGETS_FILE = process.argv[3] || path.join(__dirname, '../analystPriceTargets.json');
 
@@ -38,6 +43,7 @@ function computeMidRange(target) {
 
 function applyDcfCap(metrics, targets) {
   let capped = 0;
+  let floored = 0;
   let filled = 0;
   for (const [symbol, target] of Object.entries(targets)) {
     const entry = metrics[symbol];
@@ -55,6 +61,20 @@ function applyDcfCap(metrics, targets) {
         // before this workflow gets a chance to re-cap it again.
         entry.estimatedFairValueSource = 'dcfCapped';
         capped++;
+      }
+    } else if (target?.reason === 'floor') {
+      // Raising a value is the riskier direction (like 'fallback' below), so
+      // the same degenerate-coverage guard applies, plus one more: never
+      // raise past the cap's own ceiling (DCF_CAP_CANDIDATE_MULTIPLE x
+      // price) -- a stale target far above the price (JTAI's $80 at ~50x)
+      // would otherwise turn a low DCF into a high outlier.
+      const low = target.low;
+      const degenerateCoverage = typeof target.high === 'number' && typeof low === 'number' && target.high === low;
+      const ceiling = typeof target.currentPrice === 'number' ? target.currentPrice * DCF_CAP_CANDIDATE_MULTIPLE : null;
+      if (typeof low === 'number' && low > 0 && !degenerateCoverage && (ceiling == null || low <= ceiling) && entry.estimatedFairValue != null && entry.estimatedFairValue < low) {
+        entry.estimatedFairValue = low;
+        entry.estimatedFairValueSource = 'dcfFloored';
+        floored++;
       }
     } else if (target?.reason === 'fallback') {
       if (entry.estimatedFairValue == null) {
@@ -79,7 +99,7 @@ function applyDcfCap(metrics, targets) {
       }
     }
   }
-  return { capped, filled };
+  return { capped, floored, filled };
 }
 
 function main() {
@@ -91,12 +111,12 @@ function main() {
   const dataset = JSON.parse(fs.readFileSync(METRICS_FILE, 'utf8'));
   const { targets } = JSON.parse(fs.readFileSync(TARGETS_FILE, 'utf8'));
 
-  const { capped, filled } = applyDcfCap(dataset.metrics || {}, targets || {});
+  const { capped, floored, filled } = applyDcfCap(dataset.metrics || {}, targets || {});
   fs.writeFileSync(METRICS_FILE, JSON.stringify(dataset));
 
   console.log(
     `Applied ${Object.keys(targets || {}).length} resolved analyst targets to ${path.relative(process.cwd(), METRICS_FILE)}: ` +
-      `${capped} outlier DCF estimates capped, ${filled} missing DCF estimates filled with an analyst mid-range.`
+      `${capped} outlier DCF estimates capped, ${floored} raised to the analyst low, ${filled} missing DCF estimates filled with an analyst mid-range.`
   );
 }
 
