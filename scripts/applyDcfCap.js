@@ -48,6 +48,10 @@ function applyDcfCap(metrics, targets) {
   for (const [symbol, target] of Object.entries(targets)) {
     const entry = metrics[symbol];
     if (!entry) continue;
+    // The target range itself, for every looked-up ticker -- the app holds
+    // its live DCF to the same analyst low/high (stockData.js).
+    if (typeof target?.low === 'number' && target.low > 0) entry.analystLow = target.low;
+    if (typeof target?.high === 'number' && target.high > 0) entry.analystHigh = target.high;
 
     if (target?.reason === 'cap') {
       const high = target.high;

@@ -5622,6 +5622,11 @@ async function processSymbol(symbol, apiKey, ctx) {
       ...values,
       estimatedFairValue,
       estimatedFairValueSource,
+      // The real analyst target range, set by applyDcfCap.js and carried
+      // forward here (this run never looks targets up itself), so the app
+      // can hold a live DCF to the same low/high as the published one.
+      analystLow: previous?.analystLow ?? undefined,
+      analystHigh: previous?.analystHigh ?? undefined,
       // Published alongside the comparable metrics (not just kept in
       // profileEntry, which never persists across runs) specifically so
       // computeIndustryLeaders can still score a ticker that's recovered
