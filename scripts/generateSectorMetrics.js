@@ -4339,6 +4339,7 @@ function pickTrendToPublish(existingPoints, freshPoints, metricKey = null) {
 // newest point is genuinely stale, never trims or alters a fresh one.
 // ---------------------------------------------------------------------------
 
+const REVENUE_BASED_TREND_KEYS = new Set(['revenueGrowth', 'profitMargin', 'fcfMargin']);
 const RECENCY_CUTOFF_MONTHS = 18; // generous enough to absorb normal annual/quarterly filing lag, well short of "years stale"
 
 // Coarse by design (quarter/year-END approximation from a label like
@@ -5288,6 +5289,16 @@ async function processSymbol(symbol, apiKey, ctx) {
   const mergedYearlyForSymbol = {};
   const mergedQuarterlyForSymbol = {};
   const mergedTtmForSymbol = {};
+  // Revenue-based series the recency floor dropped -- kept aside, never in
+  // the merged maps above (the card backfill and the margin cross-check
+  // read those), and published only into the chart files for a company
+  // whose latest revenue is $0 or not reported -- see revenueStatus below.
+  const historicalByCadence = { yearly: {}, quarterly: {}, ttm: {} };
+  const keepHistorical = (cadence, key, previous, fresh) => {
+    if (!REVENUE_BASED_TREND_KEYS.has(key)) return;
+    const series = pickTrendToPublish(previous || [], fresh || [], key);
+    if (series?.length) historicalByCadence[cadence][key] = series;
+  };
   const previousYearlyForSymbol = previouslyPublishedYearlyTrends[symbol] || {};
   const previousQuarterlyForSymbol = previouslyPublishedQuarterlyTrends[symbol] || {};
   const previousTtmForSymbol = previouslyPublishedTtmTrends[symbol] || {};
@@ -5325,6 +5336,7 @@ async function processSymbol(symbol, apiKey, ctx) {
       // others — pickTrendToPublish falls back to the previous run.
     }
     let published = pickCadenceMetric(previousYearlyForSymbol[key], fresh, key);
+    if (!published.length) keepHistorical('yearly', key, previousYearlyForSymbol[key], fresh);
     if (!published.length) {
       const foreignPoints = foreignFilingsTrendsForSymbol?.yearly?.[key];
       if (foreignPoints?.length) published = foreignPoints;
@@ -5340,6 +5352,7 @@ async function processSymbol(symbol, apiKey, ctx) {
       // Same graceful-degradation philosophy as above.
     }
     let published = pickCadenceMetric(previousQuarterlyForSymbol[key], fresh, key);
+    if (!published.length) keepHistorical('quarterly', key, previousQuarterlyForSymbol[key], fresh);
     if (!published.length) {
       const foreignPoints = foreignFilingsTrendsForSymbol?.quarterly?.[key];
       if (foreignPoints?.length) published = foreignPoints;
@@ -5355,6 +5368,7 @@ async function processSymbol(symbol, apiKey, ctx) {
       // Same graceful-degradation philosophy as above.
     }
     let published = pickCadenceMetric(previousTtmForSymbol[key], fresh, key);
+    if (!published.length) keepHistorical('ttm', key, previousTtmForSymbol[key], fresh);
     if (!published.length) {
       const foreignPoints = foreignFilingsTrendsForSymbol?.ttm?.[key];
       if (foreignPoints?.length) published = foreignPoints;
@@ -5628,6 +5642,23 @@ async function processSymbol(symbol, apiKey, ctx) {
   const latestRevenue = latestStatement ? findReportedRevenue(latestStatement.report?.ic || []) : undefined;
   const revenueStatus = latestStatement == null ? null : latestRevenue === 0 ? 'zero' : latestRevenue == null ? 'notReported' : null;
 
+  // A company whose latest revenue is $0 or not reported has no recent
+  // revenue-based point by definition, so the 18-month recency floor
+  // dropped its revenue-based series per cadence -- unevenly: CAPR kept
+  // quarterly and TTM profit margin (Q4 '25) but lost yearly (last real
+  // point FY '24), so one tab showed history and another the $0-revenue
+  // note. For such a company only, an older series still goes into the
+  // CHART files (never the card values or rankings, computed above from
+  // the recent-only merged maps). Additive: a cadence that already has a
+  // recent series keeps it.
+  const chartTrends = (merged, cadence) => {
+    const out = { ...merged };
+    if (revenueStatus) {
+      for (const [key, series] of Object.entries(historicalByCadence[cadence])) if (!out[key]) out[key] = series;
+    }
+    return Object.keys(out).length ? out : null;
+  };
+
   return {
     status: 'ok',
     revenueStatus,
@@ -5653,9 +5684,9 @@ async function processSymbol(symbol, apiKey, ctx) {
       trendQualifiedMask: encodeTrendQualifiedMask(profileEntry.trendQualified),
     },
     nativeTrends: Object.keys(mergedNativeForSymbol).length ? mergedNativeForSymbol : null,
-    yearlyTrends: Object.keys(mergedYearlyForSymbol).length ? mergedYearlyForSymbol : null,
-    quarterlyTrends: Object.keys(mergedQuarterlyForSymbol).length ? mergedQuarterlyForSymbol : null,
-    ttmTrends: Object.keys(mergedTtmForSymbol).length ? mergedTtmForSymbol : null,
+    yearlyTrends: chartTrends(mergedYearlyForSymbol, 'yearly'),
+    quarterlyTrends: chartTrends(mergedQuarterlyForSymbol, 'quarterly'),
+    ttmTrends: chartTrends(mergedTtmForSymbol, 'ttm'),
     dcfComputed,
     cardValuesReconstructed,
     dcfCapCandidate,
