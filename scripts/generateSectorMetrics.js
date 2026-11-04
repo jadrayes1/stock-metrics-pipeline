@@ -2180,6 +2180,121 @@ async function fetchSecUsGaapFacts(cik) {
   return { ...(data?.facts?.['us-gaap'] || {}), ...(data?.facts?.['ifrs-full'] || {}) };
 }
 
+// A fact's fy is its FILING's DocumentFiscalYearFocus, and some filers tag
+// it inconsistently -- buildSecSyntheticReports keys periods by (fy, fp), so
+// two different quarters sharing one tag overwrite each other. Verified
+// live: Seneca Foods (SENEA, fiscal year ends March 31) tagged its 10-Q for
+// the quarter ended 2023-07-01 fy=2024/Q1 and the one ended 2024-06-29
+// fy=2024/Q1 as well (older filings name the fiscal year by the year it
+// starts, newer ones mostly by the year it ends, a few are off by two),
+// leaving holes no 4-quarter TTM window could span -- SENEA published no
+// TTM revenue growth at all despite SEC having every quarter.
+//
+// Only acts on filings whose tags collide (two filings, same fy/fp, period
+// ends more than 45 days apart). Their fy is re-derived from the period end
+// (the filing's latest duration-fact end) and the fiscal-year-end month,
+// plus a target offset -- the convention this ticker's financials-
+// reported entries use (see fiscalYearOffsetOf), so the synthesized entries
+// line up with the real ones they merge with; when there are none, the
+// convention most of the filer's own filings use.
+function correctMisTaggedFiscalYears(facts, reports = []) {
+  const filings = new Map(); // accn -> { fy, fp, end }
+  for (const concept of Object.values(facts)) {
+    for (const unitFacts of Object.values(concept?.units || {})) {
+      for (const f of unitFacts) {
+        if (!f.accn || f.fy == null || !f.fp || !f.start || !f.end) continue;
+        const filing = filings.get(f.accn);
+        if (!filing) filings.set(f.accn, { fy: f.fy, fp: f.fp, end: f.end });
+        else if (f.end > filing.end) filing.end = f.end;
+      }
+    }
+  }
+  // Filings sharing an fy/fp tag with a period ending more than 45 days
+  // apart -- two different periods on one slot.
+  const collidingFilings = () => {
+    const byTag = new Map();
+    for (const [accn, f] of filings) {
+      const tag = `${f.fy}-${f.fp}`;
+      if (!byTag.has(tag)) byTag.set(tag, []);
+      byTag.get(tag).push(accn);
+    }
+    const colliding = [];
+    for (const accns of byTag.values()) {
+      const ends = accns.map((accn) => Date.parse(filings.get(accn).end));
+      if (Math.max(...ends) - Math.min(...ends) > 45 * 86400000) colliding.push(...accns);
+    }
+    return colliding;
+  };
+  if (!collidingFilings().length) return facts;
+
+  const fiscalYearOf = fiscalYearOfFn([...filings.values()].filter((f) => f.fp === 'FY').map((f) => f.end));
+  if (!fiscalYearOf) return facts;
+  const target =
+    fiscalYearOffsetOf(reports.filter((r) => r?.year != null && r?.endDate).map((r) => ({ fy: r.year, end: r.endDate })), fiscalYearOf) ??
+    fiscalYearOffsetOf([...filings.values()], fiscalYearOf);
+  if (target == null) return facts;
+
+  // Only colliding filings move -- a filing alone on its tag keeps it even
+  // when it doesn't match the derived year (verified live: AAP's fiscal 2025
+  // ended 2026-01-03 and both SEC and the financials-reported entries call
+  // it 2026). Moving one can land it on another filing's tag (SENEA's
+  // quarter ended 2024-09-28 moves to fy2025/Q2, already taken by the
+  // mis-tagged 2025-09-27 one), so repeat until nothing collides; a moved
+  // filing sits at its derived year and never moves again.
+  const correctedFy = new Map();
+  for (let pass = 0; pass < 10; pass++) {
+    const moves = collidingFilings().filter((accn) => filings.get(accn).fy !== fiscalYearOf(filings.get(accn).end) + target);
+    if (!moves.length) break;
+    for (const accn of moves) {
+      const fy = fiscalYearOf(filings.get(accn).end) + target;
+      filings.get(accn).fy = fy;
+      correctedFy.set(accn, fy);
+    }
+  }
+  if (!correctedFy.size) return facts;
+  const corrected = {};
+  for (const [name, concept] of Object.entries(facts)) {
+    const units = {};
+    for (const [unit, unitFacts] of Object.entries(concept?.units || {})) {
+      units[unit] = unitFacts.map((f) => (correctedFy.has(f.accn) ? { ...f, fy: correctedFy.get(f.accn) } : f));
+    }
+    corrected[name] = { ...concept, units };
+  }
+  return corrected;
+}
+
+// end date -> fiscal year (named by the calendar year it ends in), from the
+// filer's annual period ends. 20 days back first, so a 52/53-week year
+// ending a few days into the next month counts as the month before
+// (Jan 3 -> December). null without any annual period to go on.
+function fiscalYearOfFn(annualEnds) {
+  const shifted = (end) => new Date(Date.parse(end) - 20 * 86400000);
+  const counts = new Map();
+  for (const end of annualEnds) {
+    const m = shifted(end).getUTCMonth() + 1;
+    counts.set(m, (counts.get(m) || 0) + 1);
+  }
+  if (!counts.size) return null;
+  const yearEndMonth = [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  return (end) => {
+    const d = shifted(end);
+    return d.getUTCMonth() + 1 <= yearEndMonth ? d.getUTCFullYear() : d.getUTCFullYear() + 1;
+  };
+}
+
+// The fy-minus-derived-year offset most of `periods` ({fy, end}) share, or
+// null when fewer than 4 or no clear (60%) majority.
+function fiscalYearOffsetOf(periods, fiscalYearOf) {
+  if (periods.length < 4) return null;
+  const counts = new Map();
+  for (const p of periods) {
+    const offset = p.fy - fiscalYearOf(p.end);
+    counts.set(offset, (counts.get(offset) || 0) + 1);
+  }
+  const [offset, n] = [...counts.entries()].sort((a, b) => b[1] - a[1])[0];
+  return n / periods.length >= 0.6 ? offset : null;
+}
+
 // Flow (ic/cf) concepts: Finnhub's own quarterly reports are YTD-cumulative
 // (a Q2 report's value is the 6-month total; decumulateYtdByYear subtracts
 // consecutive cumulative values to get a standalone quarter) — so for the
@@ -2462,7 +2577,15 @@ function fillEmptySections(existing, synthesized) {
       continue;
     }
     const existingConcepts = new Set(existingItems.map((item) => item.concept));
-    const additions = synthesizedItems.filter((item) => !existingConcepts.has(item.concept));
+    // sumDebt adds up every debt concept present, so a total (LongTermDebt)
+    // added beside the current + noncurrent parts already there counts the
+    // same debt twice. Verified live: Seneca Foods (SENEA) FY2020 reports
+    // LongTermDebtNoncurrent $217.1M + current portion $28.3M; the SEC fill
+    // added LongTermDebt $217.6M + LongTermDebtCurrent $0.5M on top, $463.4M
+    // in all, and yearly ROIC read 6.5% instead of 8.7%. Debt is only filled
+    // in when the report has none of its own.
+    const hasOwnDebt = section === 'bs' && existingItems.some((item) => DEBT_CONCEPTS.includes(item.concept));
+    const additions = synthesizedItems.filter((item) => !existingConcepts.has(item.concept) && !(hasOwnDebt && DEBT_CONCEPTS.includes(item.concept)));
     if (additions.length) existing.report[section] = [...existingItems, ...additions];
   }
 }
@@ -5145,7 +5268,7 @@ async function processSymbol(symbol, apiKey, ctx) {
       let combinedSynthesized = { quarterlyReports: [], annualReports: [] };
       const gaapFactsByCik = new Map();
       for (const cik of ciksToEnrich) {
-        const gaapFacts = await fetchSecUsGaapFacts(cik);
+        const gaapFacts = correctMisTaggedFiscalYears(await fetchSecUsGaapFacts(cik), [...quarterlyFinancials, ...annualReportedFinancials]);
         gaapFactsByCik.set(cik, gaapFacts);
         if (process.env.DEBUG_SEC_ENRICHMENT) console.error('DEBUG gaapFacts concepts for cik', cik, Object.keys(gaapFacts).length);
         const synthesized = buildSecSyntheticReports(gaapFacts, cik, isFinancialIndustry(profile.industry));
@@ -6086,6 +6209,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  correctMisTaggedFiscalYears,
   extractDcfInputs,
   computeEstimatedFairValue,
   readFinnhubApiKeys,
