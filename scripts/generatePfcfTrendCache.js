@@ -1677,6 +1677,20 @@ async function fetchMonthlyPrices(symbol, apiKey) {
 // 10-Q, no per-share data (its only quarter predates the spin), and never
 // four standalone quarters for a trailing window.
 // ---------------------------------------------------------------------------
+// A yearly P/FCF or P/E needs the share price at fiscal year-end; a company
+// whose shares began trading after its latest fiscal year ended has none --
+// verified live: CCXI's only fiscal year ended Dec 31, 2025 and it first
+// traded Feb 9, 2026, so it has quarterly/TTM ratios (2026 quarter-ends)
+// but no yearly one until FY2026 closes. Returns the reason for the app to
+// show, or null. monthlyPrices spans at most 48 months, so its first bar is
+// only after the fiscal year-end for a recent listing.
+function listedAfterFiscalYearEnd(annualReports, monthlyPrices) {
+  const lastFyEnd = (annualReports || []).map((r) => String(r?.endDate || '').slice(0, 10)).filter(Boolean).sort().pop();
+  const firstPrice = (monthlyPrices || []).map((p) => String(p.date).slice(0, 10)).sort()[0];
+  if (!lastFyEnd || !firstPrice || firstPrice <= lastFyEnd) return null;
+  return { reason: 'listedAfterFiscalYearEnd', fiscalYearEnd: lastFyEnd, firstTradeMonth: firstPrice.slice(0, 7) };
+}
+
 const SPINOFF_SPARSE_ANNUAL_THRESHOLD = 2;
 // A cover-page share count is applied only to periods ending this close to
 // (or after) its date -- the post-spin share count says nothing about a
@@ -1744,6 +1758,10 @@ function withPoint(series, point) {
 
 async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, secTickerToCikMap, existingCacheEntry) {
   let fresh = { ttm: [], quarterly: [], yearly: [] };
+  // Why the yearly P/FCF and P/E are empty, when the reason is known -- see
+  // listedAfterFiscalYearEnd. Kept from the last computation when this run
+  // doesn't compute.
+  let yearlyNote = existingCacheEntry?.yearlyNote ?? null;
   let freshPe = { ttm: [], quarterly: [], yearly: [] };
   let computed = false;
   let usedTwelveDataCall = false;
@@ -1989,6 +2007,7 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
       freshPe.ttm = withPoint(freshPe.ttm, spinoffTrailingPoint(quarterlyReports, annualReports, niOf, monthlyPrices));
     }
     computed = true;
+    yearlyNote = listedAfterFiscalYearEnd(annualReports, monthlyPrices);
   } catch (err) {
     console.log(`  skip ${symbol}: ${err.message}`);
     // pickCadenceTrendsToPublish below falls back to whatever was already
@@ -2011,7 +2030,9 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
       console.error(`DEBUG_PFCF_MERGE ${symbol} pfcf.${c} result:   ${fmt(cadences[c])}`);
     }
   }
-  return { entry: { fetchedAt: new Date().toISOString(), ...cadences, pe: peCadences }, usedTwelveDataCall };
+  const hasYearly = (cadences.yearly?.length || 0) + (peCadences.yearly?.length || 0) > 0;
+  const note = yearlyNote && !hasYearly ? yearlyNote : null;
+  return { entry: { fetchedAt: new Date().toISOString(), ...cadences, pe: peCadences, ...(note ? { yearlyNote: note } : {}) }, usedTwelveDataCall };
 }
 
 // Runs one Twelve Data key's share of the priority list — mirrors
