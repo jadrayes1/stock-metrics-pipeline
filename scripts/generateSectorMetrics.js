@@ -4085,6 +4085,9 @@ const GIST_TRENDS_TTM_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f4
 // pfcfRatio CARD value when this script's own native/no-price-needed
 // sources have nothing -- see the fetch site's own comment for why that
 // backfill was missing.
+// Today's closing prices (generateClosingPriceCache.js) -- only used to keep
+// a ticker with no current price out of the industry leaders.
+const GIST_CLOSING_PRICES_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/closingPriceCache.json';
 const GIST_PFCF_TREND_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/pfcfTrendCache.json';
 // Published by foreign-filings-pipeline's generateForeignPfcfCache.js —
 // same read-only backfill role as GIST_PFCF_TREND_URL above, but for
@@ -4676,7 +4679,16 @@ function hasRecentTrendActivity(symbol, quarterlyTrends, ttmTrends, nativeTrends
   return false;
 }
 
-function computeIndustryLeaders(metrics, profiles, quarterlyTrends, ttmTrends, nativeTrends) {
+// A leader must be ranked on real, current figures. Two gaps passed the
+// "every metric present" check while skewing the percentiles -- verified
+// live: SVA (Sinovac, halted from trading since 2019) ranked #2 in
+// Biotechnology with no current price, a P/E of exactly 0 (which ranks as
+// the cheapest possible) and a P/FCF of 0.11. So a leader needs a current
+// closing price (pricedSymbols; skipped when null) and a non-zero P/E and
+// P/FCF -- 0 there stands for "no figure", never a real multiple.
+const ZERO_MEANS_MISSING = new Set(['peRatio', 'pfcfRatio']);
+
+function computeIndustryLeaders(metrics, profiles, quarterlyTrends, ttmTrends, nativeTrends, pricedSymbols = null) {
   const byIndustry = {};
   for (const [symbol, data] of Object.entries(metrics)) {
     if (!data.industry) continue;
@@ -4707,7 +4719,10 @@ function computeIndustryLeaders(metrics, profiles, quarterlyTrends, ttmTrends, n
     // entire industry from ever having a real leader.
     const requiredKeys = isFinancialIndustry(industry) ? COMPARABLE_KEYS.filter((k) => k !== 'fcfMargin') : COMPARABLE_KEYS;
     const eligible = symbols.filter(
-      (s) => requiredKeys.every((k) => metrics[s][k] !== null && metrics[s][k] !== undefined) && hasRecentTrendActivity(s, quarterlyTrends, ttmTrends, nativeTrends)
+      (s) =>
+        requiredKeys.every((k) => metrics[s][k] !== null && metrics[s][k] !== undefined && !(ZERO_MEANS_MISSING.has(k) && metrics[s][k] === 0)) &&
+        (!pricedSymbols || pricedSymbols.has(s)) &&
+        hasRecentTrendActivity(s, quarterlyTrends, ttmTrends, nativeTrends)
     );
     if (!eligible.length) continue;
 
@@ -5972,7 +5987,13 @@ async function main() {
     console.log(`Recovered ${recoveredFromFailure} hard-failed tickers' previously-published data (never regress a ticker to nothing).`);
   }
 
-  const industryLeaders = computeIndustryLeaders(metrics, profiles, quarterlyTrends, ttmTrends, nativeTrends);
+  // A failed or partial price download skips the price check rather than
+  // emptying every industry's leaders.
+  const closingPrices = (await fetchJsonSafe(GIST_CLOSING_PRICES_URL))?.prices || {};
+  const pricedList = Object.entries(closingPrices).filter(([, v]) => v?.price > 0).map(([sym]) => sym);
+  const pricedSymbols = pricedList.length >= 1000 ? new Set(pricedList) : null;
+  if (!pricedSymbols) console.warn(`Closing prices unavailable (${pricedList.length}) -- industry leaders not checked for a current price this run.`);
+  const industryLeaders = computeIndustryLeaders(metrics, profiles, quarterlyTrends, ttmTrends, nativeTrends, pricedSymbols);
   const totalLeaderTickers = industryLeaders.reduce((sum, entry) => sum + entry.leaders.length, 0);
   const shortLeaderIndustries = industryLeaders.filter((entry) => entry.leaders.length < MIN_LEADERS_PER_INDUSTRY).length;
   console.log(
