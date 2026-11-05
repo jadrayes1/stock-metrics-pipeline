@@ -2567,6 +2567,23 @@ function buildSecSyntheticReports(gaapFacts, cik, isFinancial = false) {
 // for that SAME concept (never overwritten) -- this only ADDS a
 // synthesized concept Finnhub's own report doesn't have any value for at
 // all.
+// SEC's total debt for a period from its synthesized balance-sheet items,
+// each obligation counted once: total long-term debt (or, without it, its
+// current + noncurrent parts) plus short-term borrowings and commercial
+// paper. A filer tagging none of those gets its largest single debt
+// figure instead -- verified live: Oracle (ORCL) FY2015 tags its $42B of
+// notes only as UnsecuredDebt (DebtCurrent $2.0B beside it is part of
+// that), and its own report lists the long-term notes under a concept
+// sumDebt doesn't count, leaving $2.0B. null when it lists no debt at all.
+function dedupedSecDebt(items) {
+  const val = (concept) => items.find((item) => item.concept === concept && item.value != null)?.value;
+  const parts = [val('us-gaap_LongTermDebtNoncurrent'), val('us-gaap_LongTermDebtCurrent')].filter((v) => v != null);
+  const longTerm = val('us-gaap_LongTermDebt') ?? (parts.length ? parts.reduce((a, b) => a + b, 0) : null);
+  if (longTerm != null) return longTerm + (val('us-gaap_ShortTermBorrowings') ?? 0) + (val('us-gaap_CommercialPaper') ?? 0);
+  const debtValues = items.filter((item) => DEBT_CONCEPTS.includes(item.concept) && item.value != null).map((item) => item.value);
+  return debtValues.length ? Math.max(...debtValues) : null;
+}
+
 function fillEmptySections(existing, synthesized) {
   for (const section of ['ic', 'cf', 'bs']) {
     const existingItems = existing.report[section] || [];
@@ -2582,11 +2599,27 @@ function fillEmptySections(existing, synthesized) {
     // same debt twice. Verified live: Seneca Foods (SENEA) FY2020 reports
     // LongTermDebtNoncurrent $217.1M + current portion $28.3M; the SEC fill
     // added LongTermDebt $217.6M + LongTermDebtCurrent $0.5M on top, $463.4M
-    // in all, and yearly ROIC read 6.5% instead of 8.7%. Debt is only filled
-    // in when the report has none of its own.
-    const hasOwnDebt = section === 'bs' && existingItems.some((item) => DEBT_CONCEPTS.includes(item.concept));
-    const additions = synthesizedItems.filter((item) => !existingConcepts.has(item.concept) && !(hasOwnDebt && DEBT_CONCEPTS.includes(item.concept)));
-    if (additions.length) existing.report[section] = [...existingItems, ...additions];
+    // in all, and yearly ROIC read 6.5% instead of 8.7% (HD FY2021: $72.0B
+    // against SEC's own $34.8B). So when the report already carries real debt,
+    // it's compared with SEC's total for the period, counted once
+    // (dedupedSecDebt): close to or above it, the report's own debt stands;
+    // well below it (the report only lists part -- TULP FY2024 $2M of SEC's
+    // $39M), SEC's figure replaces it. A report whose own debt lines add to
+    // zero (CBAN FY2021, a $0 line beside $88M SEC reports) is filled as
+    // before.
+    let additions = synthesizedItems.filter((item) => !existingConcepts.has(item.concept));
+    if (section === 'bs') {
+      const ownDebt = sumDebt(existingItems);
+      const secDebt = dedupedSecDebt(synthesizedItems);
+      if (ownDebt > 0) {
+        additions = additions.filter((item) => !DEBT_CONCEPTS.includes(item.concept));
+        if (secDebt != null && ownDebt < 0.85 * secDebt) {
+          existing.report[section] = existingItems.filter((item) => !DEBT_CONCEPTS.includes(item.concept));
+          additions.push({ concept: 'us-gaap_LongTermDebt', label: 'Total debt (SEC XBRL enrichment, deduplicated)', value: secDebt });
+        }
+      }
+    }
+    if (additions.length) existing.report[section] = [...existing.report[section], ...additions];
   }
 }
 
@@ -2695,6 +2728,36 @@ function findReportedRevenue(icItems) {
   }
 
   return sawZero ? 0 : null;
+}
+
+// FCF margin's denominator. The same as findReportedRevenue, except for the
+// mortgage-REIT case its last branch covers (net interest income, no
+// non-interest-income line): there it's TOTAL interest income instead.
+// Operating cash flow is a gross figure -- interest received, not interest
+// net of funding cost -- so against net interest income the ratio is not a
+// margin at all. Verified live: Invesco Mortgage Capital (IVR) FY2025 OCF
+// $157M over net interest income $75M = 208%, FY2024 497%; every recent
+// year then failed the assumed-zero-capex plausibility bound, so IVR had no
+// yearly FCF margin, while its TTM tab and headline card (from the market-
+// data source, which divides by total interest income) read ~50%. Against
+// total interest income ($295M) FY2025 is 53%. Only that branch changes:
+// any report whose revenue resolves earlier keeps exactly the same figure.
+const GROSS_INTEREST_INCOME_CONCEPTS = ['us-gaap_InterestAndDividendIncomeOperating', 'us-gaap_InterestIncomeOperating'];
+
+function findFcfMarginRevenue(icItems) {
+  const revenue = findReportedRevenue(icItems);
+  const netInterestIncome = icItems.find((item) => item.concept === 'us-gaap_InterestIncomeExpenseNet');
+  const nonInterestIncome = icItems.find((item) => item.concept === 'us-gaap_NoninterestIncome');
+  const fromNetInterestOnly = netInterestIncome && !nonInterestIncome && revenue === netInterestIncome.value;
+  if (!fromNetInterestOnly) return revenue;
+  // Same check findReportedRevenue's own branch order implies: nothing
+  // earlier matched, so revenue really did come from net interest income.
+  if (findReportedRevenue(icItems.filter((item) => item !== netInterestIncome)) != null) return revenue;
+  for (const concept of GROSS_INTEREST_INCOME_CONCEPTS) {
+    const gross = icItems.find((item) => item.concept === concept && item.value != null && item.value > 0);
+    if (gross) return gross.value;
+  }
+  return revenue;
 }
 
 // Year-over-year growth between two revenue figures, with a reported $0 kept
@@ -3391,7 +3454,7 @@ function buildFcfMarginTrendFromFilings(quarterlyReports, annualReports) {
   const findCapex = (cfItems) => findReportedCapexQ(cfItems, noCapex);
   const ocf = decumulateYtdByYear(quarterlyReports, annualReports, findReportedOperatingCashFlowQ, 'cf');
   const capex = decumulateYtdByYear(quarterlyReports, annualReports, findCapex, 'cf');
-  const revenue = decumulateYtdByYear(quarterlyReports, annualReports, findReportedRevenue, 'ic');
+  const revenue = decumulateYtdByYear(quarterlyReports, annualReports, findFcfMarginRevenue, 'ic');
 
   // `revenue[key] != null`, not a truthy check — mirrors buildFcfMarginFromFilings
   // in src/utils/metrics.js; see that file for the full rationale (a real
@@ -3798,7 +3861,7 @@ function buildFcfMarginQuarterlyFromFilings(quarterlyReports, annualReports) {
   const records = buildStandaloneFlowQuarters(quarterlyReports, annualReports, {
     ocf: { fn: findReportedOperatingCashFlowQ, section: 'cf' },
     capex: { fn: (cfItems) => findReportedCapexQ(cfItems, noCapex), section: 'cf' },
-    revenue: { fn: findReportedRevenue, section: 'ic', disallowNegative: true },
+    revenue: { fn: findFcfMarginRevenue, section: 'ic', disallowNegative: true },
   });
   return records
     .map((r) => ({
@@ -3820,7 +3883,7 @@ function buildFcfMarginYearlyFromFilings(annualReports, quarterlyReports = null)
   const records = buildAnnualFlowPoints(annualReports, {
     ocf: { fn: findReportedOperatingCashFlowQ, section: 'cf' },
     capex: { fn: (cfItems) => findReportedCapexQ(cfItems, noCapex), section: 'cf' },
-    revenue: { fn: findReportedRevenue, section: 'ic', disallowNegative: true },
+    revenue: { fn: findFcfMarginRevenue, section: 'ic', disallowNegative: true },
   });
   return records
     .map((r) => ({
