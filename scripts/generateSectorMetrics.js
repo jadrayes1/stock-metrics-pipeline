@@ -1103,6 +1103,53 @@ const DEBT_CONCEPTS = [
   'us-gaap_CurrentPortionOfLongtermBorrowings',
   'us-gaap_ShorttermBorrowings',
 ];
+// Notes and loans, a second tier counted only where the standard concepts
+// above leave that slot empty -- a filer tagging both reports the same debt
+// twice (LongTermNotesPayable is a component of LongTermDebtNoncurrent).
+// Verified live: Oracle (ORCL) carries its long-term debt only as
+// LongTermNotesAndLoans ($85.3B at FY2025) and the current part as
+// NotesPayableCurrent ($7.3B), so its debt read as $4-11B for FY2023-26 and
+// yearly ROIC as 33-201%.
+// Within a slot the same notes can sit under two of the main concepts at
+// once (ORCL FY2023: LongTermNotesAndLoans and LongTermNotesPayable, both
+// $86.42B), so the largest is taken; the "Other..." concepts are separate
+// obligations and are added on top (SunPower/SPWR FY2024: $92.6M notes +
+// $53.2M other notes + $1.5M other current).
+const NOTE_DEBT_CONCEPTS_LONG_TERM = ['us-gaap_LongTermNotesAndLoans', 'us-gaap_LongTermNotesPayable', 'us-gaap_LongTermLoansPayable'];
+const NOTE_DEBT_CONCEPTS_CURRENT = ['us-gaap_NotesPayableCurrent', 'us-gaap_LoansPayableCurrent', 'us-gaap_NotesAndLoansPayableCurrent'];
+const OTHER_NOTE_DEBT_CONCEPTS_LONG_TERM = ['us-gaap_OtherLongTermNotesPayable'];
+const OTHER_NOTE_DEBT_CONCEPTS_CURRENT = ['us-gaap_OtherNotesPayableCurrent'];
+const STANDARD_LONG_TERM_DEBT = new Set([
+  'us-gaap_LongTermDebtNoncurrent',
+  'us-gaap_LongTermDebt',
+  'us-gaap_OtherLongTermDebtNoncurrent',
+  'us-gaap_LongTermDebtAndCapitalLeaseObligations',
+  'us-gaap_SecuredDebt',
+  'us-gaap_UnsecuredDebt',
+  'us-gaap_LongtermBorrowings',
+]);
+const STANDARD_CURRENT_DEBT = new Set([
+  'us-gaap_LongTermDebtCurrent',
+  'us-gaap_DebtCurrent',
+  'us-gaap_SecuredDebtCurrent',
+  'us-gaap_LongTermDebtAndCapitalLeaseObligationsCurrent',
+  'us-gaap_CurrentPortionOfLongtermBorrowings',
+  'us-gaap_ShortTermBorrowings',
+  'us-gaap_ShorttermBorrowings',
+  'us-gaap_CommercialPaper',
+  // LongTermDebt is a total that includes the current portion.
+  'us-gaap_LongTermDebt',
+]);
+// Every concept that can count as debt somewhere above -- for code that
+// moves debt lines around rather than summing them.
+const ALL_DEBT_CONCEPTS = [
+  ...DEBT_CONCEPTS,
+  ...NOTE_DEBT_CONCEPTS_LONG_TERM,
+  ...NOTE_DEBT_CONCEPTS_CURRENT,
+  ...OTHER_NOTE_DEBT_CONCEPTS_LONG_TERM,
+  ...OTHER_NOTE_DEBT_CONCEPTS_CURRENT,
+];
+
 const DEBT_LABEL_KEYWORDS = ['term debt', 'commercial paper', 'notes payable', 'loans and notes payable', 'current maturities of long-term debt', 'short-term debt', 'short-term borrowings'];
 
 function sumDebt(bsItems) {
@@ -1112,6 +1159,9 @@ function sumDebt(bsItems) {
   const seenConcepts = new Set();
   let total = 0;
   let matchedAny = false;
+  const present = new Set(bsItems.filter((item) => item.value != null).map((item) => item.concept));
+  const hasStandardLongTerm = [...present].some((c) => STANDARD_LONG_TERM_DEBT.has(c));
+  const hasStandardCurrent = [...present].some((c) => STANDARD_CURRENT_DEBT.has(c));
   for (const item of bsItems) {
     if (item.value == null) continue;
     if (DEBT_CONCEPTS.includes(item.concept) && !seenConcepts.has(item.concept + item.value)) {
@@ -1119,6 +1169,22 @@ function sumDebt(bsItems) {
       total += item.value;
       matchedAny = true;
     }
+  }
+  // Notes, per slot: the largest main figure plus any "Other..." notes --
+  // see NOTE_DEBT_CONCEPTS_LONG_TERM.
+  const valuesOf = (concepts) => bsItems.filter((item) => item.value != null && concepts.includes(item.concept)).map((item) => item.value);
+  const notesSlot = (main, other) => {
+    const mainValues = valuesOf(main);
+    const otherValues = valuesOf(other);
+    if (!mainValues.length && !otherValues.length) return null;
+    return (mainValues.length ? Math.max(...mainValues) : 0) + otherValues.reduce((a, v) => a + v, 0);
+  };
+  const notesLongTerm = hasStandardLongTerm ? null : notesSlot(NOTE_DEBT_CONCEPTS_LONG_TERM, OTHER_NOTE_DEBT_CONCEPTS_LONG_TERM);
+  const notesCurrent = hasStandardCurrent ? null : notesSlot(NOTE_DEBT_CONCEPTS_CURRENT, OTHER_NOTE_DEBT_CONCEPTS_CURRENT);
+  for (const v of [notesLongTerm, notesCurrent]) {
+    if (v == null) continue;
+    total += v;
+    matchedAny = true;
   }
   if (matchedAny) return total;
   // Fallback: keyword-matched debt-instrument labels (avoids "Total
@@ -2148,7 +2214,7 @@ const SEC_INVESTING_SUBTOTAL_CONCEPTS = ['NetCashProvidedByUsedInInvestingActivi
 // "total...holders...equity" wording that a SEC-synthesized fact's
 // concept-name-derived label ("Equity (SEC XBRL enrichment)") never has.
 const SEC_EQUITY_CONCEPTS = ['StockholdersEquity', 'StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest', 'Equity'];
-const SEC_DEBT_CONCEPTS = DEBT_CONCEPTS.map((c) => c.replace(/^us-gaap_/, ''));
+const SEC_DEBT_CONCEPTS = ALL_DEBT_CONCEPTS.map((c) => c.replace(/^us-gaap_/, ''));
 // 'CashAndCashEquivalents' is ifrs-full's own cash concept -- verified live
 // for TSM (clean USD-unit facts). Also needs an exact-concept check added
 // to findReportedCashBalance's own altMatch below.
@@ -2580,7 +2646,7 @@ function dedupedSecDebt(items) {
   const parts = [val('us-gaap_LongTermDebtNoncurrent'), val('us-gaap_LongTermDebtCurrent')].filter((v) => v != null);
   const longTerm = val('us-gaap_LongTermDebt') ?? (parts.length ? parts.reduce((a, b) => a + b, 0) : null);
   if (longTerm != null) return longTerm + (val('us-gaap_ShortTermBorrowings') ?? 0) + (val('us-gaap_CommercialPaper') ?? 0);
-  const debtValues = items.filter((item) => DEBT_CONCEPTS.includes(item.concept) && item.value != null).map((item) => item.value);
+  const debtValues = items.filter((item) => ALL_DEBT_CONCEPTS.includes(item.concept) && item.value != null).map((item) => item.value);
   return debtValues.length ? Math.max(...debtValues) : null;
 }
 
@@ -2612,9 +2678,9 @@ function fillEmptySections(existing, synthesized) {
       const ownDebt = sumDebt(existingItems);
       const secDebt = dedupedSecDebt(synthesizedItems);
       if (ownDebt > 0) {
-        additions = additions.filter((item) => !DEBT_CONCEPTS.includes(item.concept));
+        additions = additions.filter((item) => !ALL_DEBT_CONCEPTS.includes(item.concept));
         if (secDebt != null && ownDebt < 0.85 * secDebt) {
-          existing.report[section] = existingItems.filter((item) => !DEBT_CONCEPTS.includes(item.concept));
+          existing.report[section] = existingItems.filter((item) => !ALL_DEBT_CONCEPTS.includes(item.concept));
           additions.push({ concept: 'us-gaap_LongTermDebt', label: 'Total debt (SEC XBRL enrichment, deduplicated)', value: secDebt });
         }
       }
