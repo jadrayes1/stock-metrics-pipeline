@@ -4339,6 +4339,8 @@ const GIST_TRENDS_TTM_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f4
 // backfill was missing.
 // Today's closing prices (generateClosingPriceCache.js) -- only used to keep
 // a ticker with no current price out of the industry leaders.
+// Published by generateNewsCache.js -- names for tickers outside this run's universe.
+const GIST_COMPANY_PROFILES_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/companyProfiles.json';
 const GIST_CLOSING_PRICES_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/closingPriceCache.json';
 const GIST_PFCF_TREND_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/pfcfTrendCache.json';
 // Published by foreign-filings-pipeline's generateForeignPfcfCache.js —
@@ -6268,6 +6270,20 @@ async function main() {
   }
   if (recoveredFromFailure) {
     console.log(`Recovered ${recoveredFromFailure} hard-failed tickers' previously-published data (never regress a ticker to nothing).`);
+  }
+  // A recovered ticker is usually one that left this run's universe, not a
+  // failed fetch -- the search index is built from that universe, so it
+  // was published but unsearchable. Verified live: TWO (delisted
+  // 2026-09-24), AVB, WBD and MIMI (still trading) were all in the dataset,
+  // shown as "Not currently trading" or with a live price, and none could
+  // be found by search. Kept searchable under the name the news pipeline's
+  // company profiles hold, or the ticker itself when it has none.
+  const searchable = new Set(tickerSearchIndex.map((e) => e.symbol));
+  const recoveredUnsearchable = Object.keys(metrics).filter((sym) => !processedThisRun.has(sym) && !searchable.has(sym));
+  if (recoveredUnsearchable.length) {
+    const savedProfiles = (await fetchJsonSafe(GIST_COMPANY_PROFILES_URL))?.profiles || {};
+    for (const sym of recoveredUnsearchable) tickerSearchIndex.push({ symbol: sym, name: savedProfiles[sym]?.name || sym, type: 'Common Stock' });
+    console.log(`Kept ${recoveredUnsearchable.length} recovered tickers searchable.`);
   }
 
   // A failed or partial price download skips the price check rather than
