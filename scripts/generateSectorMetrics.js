@@ -5896,6 +5896,26 @@ async function processSymbol(symbol, apiKey, ctx) {
   const latestRevenue = latestStatement ? findReportedRevenue(latestStatement.report?.ic || []) : undefined;
   const revenueStatus = latestStatement == null ? null : latestRevenue === 0 ? 'zero' : latestRevenue == null ? 'notReported' : null;
 
+  // The quarter a company first reported revenue after reporting $0, when
+  // that was under a year ago -- so no revenue growth exists yet (growth
+  // from $0 is undefined) and the trend screen can say why. Verified live:
+  // Oklo (OKLO) reported $0 through Q3 2025 and its first revenue, $1.21M,
+  // in the quarter ended 2026-06-30. Read from year-to-date figures as
+  // filed, where the first nonzero one marks the quarter revenue began.
+  let revenueStartedQuarter = null;
+  {
+    const byEnd = [...quarterlyFinancials, ...annualReportedFinancials]
+      .filter((r) => r?.endDate)
+      .map((r) => ({ end: r.endDate.slice(0, 10), revenue: findReportedRevenue(r.report?.ic || []) }))
+      .filter((r) => r.revenue != null)
+      .sort((x, y) => x.end.localeCompare(y.end));
+    const first = byEnd.findIndex((r, i) => r.revenue > 0 && i > 0 && byEnd[i - 1].revenue === 0 && byEnd.slice(i).every((later) => later.revenue > 0));
+    if (first > 0 && Date.now() - Date.parse(byEnd[first].end) < 365 * 86400000) {
+      const d = new Date(Date.parse(byEnd[first].end) - QUARTER_LABEL_BACKDATE_DAYS * 86400000);
+      revenueStartedQuarter = `Q${Math.floor(d.getUTCMonth() / 3) + 1} '${String(d.getUTCFullYear()).slice(2)}`;
+    }
+  }
+
   // A company whose latest revenue is $0 or not reported has no recent
   // revenue-based point by definition, so the 18-month recency floor
   // dropped its revenue-based series per cadence -- unevenly: CAPR kept
@@ -5916,6 +5936,7 @@ async function processSymbol(symbol, apiKey, ctx) {
   return {
     status: 'ok',
     revenueStatus,
+    revenueStartedQuarter,
     profile: profileEntry,
     metrics: {
       industry: profile.industry,
@@ -5973,6 +5994,7 @@ async function runWorker(workerId, symbolSubset, apiKey, ctx) {
     deadSymbols: new Set(),
     zeroRevenueSymbols: [],
     noRevenueReportedSymbols: [],
+    revenueStarted: {},
   };
 
   for (let i = 0; i < symbolSubset.length; i++) {
@@ -5994,6 +6016,7 @@ async function runWorker(workerId, symbolSubset, apiKey, ctx) {
         if (r.dcfCapCandidate) result.dcfCapCandidates[symbol] = r.dcfCapCandidate;
         if (r.revenueStatus === 'zero') result.zeroRevenueSymbols.push(symbol);
         if (r.revenueStatus === 'notReported') result.noRevenueReportedSymbols.push(symbol);
+        if (r.revenueStartedQuarter) result.revenueStarted[symbol] = r.revenueStartedQuarter;
         result.ok++;
       }
     } catch (err) {
@@ -6062,6 +6085,25 @@ async function main() {
     `Loaded ${Object.keys(previouslyPublishedMetrics).length} previously-published tickers' metrics ` +
       `(merge-protected against a bad run — see pickMetricValue/pickTrendToPublish).`
   );
+
+  // Published tickers that dropped out of the symbol list are still
+  // processed while their filings are still served. Until now they were only
+  // restored from the last publish, so they froze -- verified live: 107 of
+  // them, among them delisted TWO and AVB (whose quarterly/yearly trends
+  // had been lost entirely) and still-trading EQR, CCXI, MSGS. One that the
+  // source no longer knows at all ("dead") is restored from the last publish
+  // as before rather than dropped -- it shows as Not currently trading.
+  const outOfUniverseSymbols = new Set();
+  {
+    const inRun = new Set(symbols);
+    const targets = process.env.TARGET_SYMBOL ? new Set(process.env.TARGET_SYMBOL.split(',').map((t) => t.trim().toUpperCase()).filter(Boolean)) : null;
+    for (const sym of Object.keys(previouslyPublishedMetrics)) {
+      if (inRun.has(sym) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(sym) || (targets && !targets.has(sym))) continue;
+      outOfUniverseSymbols.add(sym);
+      symbols.push(sym);
+    }
+    if (outOfUniverseSymbols.size) console.log(`Also processing ${outOfUniverseSymbols.size} previously-published tickers no longer in the symbol list.`);
+  }
 
   // Fetched once for the whole run — used only to fill a Finnhub crawl gap
   // in revenueGrowth's YoY comparison from SEC's own free companyfacts API
@@ -6196,7 +6238,7 @@ async function main() {
     Object.assign(quarterlyTrends, r.quarterlyTrends);
     Object.assign(ttmTrends, r.ttmTrends);
     Object.assign(dcfCapCandidates, r.dcfCapCandidates);
-    for (const s of r.deadSymbols) deadSymbols.add(s);
+    for (const s of r.deadSymbols) if (!outOfUniverseSymbols.has(s)) deadSymbols.add(s);
     ok += r.ok;
     failed += r.failed;
     dead += r.dead;
@@ -6279,7 +6321,8 @@ async function main() {
   // be found by search. Kept searchable under the name the news pipeline's
   // company profiles hold, or the ticker itself when it has none.
   const searchable = new Set(tickerSearchIndex.map((e) => e.symbol));
-  const recoveredUnsearchable = Object.keys(metrics).filter((sym) => !processedThisRun.has(sym) && !searchable.has(sym));
+  // Also every out-of-universe ticker this run processed -- same index gap.
+  const recoveredUnsearchable = Object.keys(metrics).filter((sym) => (!processedThisRun.has(sym) || outOfUniverseSymbols.has(sym)) && !searchable.has(sym));
   if (recoveredUnsearchable.length) {
     const savedProfiles = (await fetchJsonSafe(GIST_COMPANY_PROFILES_URL))?.profiles || {};
     for (const sym of recoveredUnsearchable) tickerSearchIndex.push({ symbol: sym, name: savedProfiles[sym]?.name || sym, type: 'Common Stock' });
@@ -6334,7 +6377,10 @@ async function main() {
   const carry = (key, fresh) => [...new Set([...fresh, ...(previouslyPublished.revenueLists?.[key] || []).filter((s) => metrics[s] && !processedThisRun.has(s))])].sort();
   const zeroRevenueSymbols = carry('zeroRevenueSymbols', workerResults.flatMap((r) => r.zeroRevenueSymbols));
   const noRevenueReportedSymbols = carry('noRevenueReportedSymbols', workerResults.flatMap((r) => r.noRevenueReportedSymbols));
-  const output = { generatedAt, metrics, industryLeaders, staleSymbols, zeroRevenueSymbols, noRevenueReportedSymbols };
+  // { SYM: "Q2 '26" } -- see processSymbol's revenueStartedQuarter. Fresh
+  // only: it expires on its own once a year of revenue exists.
+  const revenueStartedSymbols = Object.assign({}, ...workerResults.map((r) => r.revenueStarted));
+  const output = { generatedAt, metrics, industryLeaders, staleSymbols, zeroRevenueSymbols, noRevenueReportedSymbols, revenueStartedSymbols };
   fs.mkdirSync(path.dirname(OUTPUT_FILE), { recursive: true }); // works regardless of which repo this script runs in
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(output));
   fs.writeFileSync(OUTPUT_TRENDS_NATIVE_FILE, JSON.stringify({ generatedAt, trends: nativeTrends }));
