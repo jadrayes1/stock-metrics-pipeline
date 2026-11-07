@@ -6273,7 +6273,17 @@ async function main() {
   // A failed or partial price download skips the price check rather than
   // emptying every industry's leaders.
   const closingPrices = (await fetchJsonSafe(GIST_CLOSING_PRICES_URL))?.prices || {};
-  const pricedList = Object.entries(closingPrices).filter(([, v]) => v?.price > 0).map(([sym]) => sym);
+  // A price at least as recent as 10 days before the file's newest one --
+  // measured against the file, not today, so a price download that's itself
+  // a few days late doesn't empty the leaders. A ticker that stopped
+  // trading keeps its last close in the file: verified live, BioLife
+  // Solutions (BLFS), last traded 2026-10-05, was still a Life Sciences
+  // Tools leader on 11-07. Same 10 days as the app's "Not currently
+  // trading" label (NOT_TRADING_AFTER_DAYS in src/api/stockData.js).
+  const newestCloseUnix = Math.max(0, ...Object.values(closingPrices).map((v) => v?.asOfUnix || 0));
+  const pricedList = Object.entries(closingPrices)
+    .filter(([, v]) => v?.price > 0 && !(v.asOfUnix > 0 && newestCloseUnix - v.asOfUnix > 10 * 86400))
+    .map(([sym]) => sym);
   const pricedSymbols = pricedList.length >= 1000 ? new Set(pricedList) : null;
   if (!pricedSymbols) console.warn(`Closing prices unavailable (${pricedList.length}) -- industry leaders not checked for a current price this run.`);
   const industryLeaders = computeIndustryLeaders(metrics, profiles, quarterlyTrends, ttmTrends, nativeTrends, pricedSymbols);
