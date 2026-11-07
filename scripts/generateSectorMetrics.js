@@ -510,6 +510,30 @@ const RENAMED_TICKER_FINANCIALS_ALIASES = {
   VMRK: 'EQR',
 };
 
+// A symbol reused by a new company, where the data source still serves the
+// PREVIOUS holder under it and the new holder under its old symbol -- the
+// reverse of RENAMED_TICKER_FINANCIALS_ALIASES, and for the profile and
+// ratio engine, not just financials-reported. Verified live: Mint
+// Incorporation renamed itself Axonex AI Group on 2026-10-13 (SEC CIK
+// 1998560, formerNames "Mint Inc Ltd") and moved from MIMI to AXNX, which
+// had belonged to Axonics Inc (CIK 1603756, acquired 2024). The source's
+// AXNX profile still reads "Axonics Inc" / Health Care and its ratio
+// series are Axonics' through 2024 (revenue growth 26%), while MIMI serves
+// Axonex's own (fiscal year to 2026-03-31). AXNX published Axonics'
+// figures as Axonex's. Add an entry only after confirming both sides
+// directly, same bar as RENAMED_TICKER_FINANCIALS_ALIASES.
+const TICKER_REUSE_DATA_ALIASES = {
+  AXNX: 'MIMI',
+};
+
+// Old symbol -> current symbol for a company that changed ticker: both
+// alias maps above, inverted. Published as renamedSymbols so the app can
+// point an old symbol at the current one.
+const RENAMED_SYMBOLS = Object.fromEntries([
+  ...Object.entries(RENAMED_TICKER_FINANCIALS_ALIASES).map(([current, old]) => [old, current]),
+  ...Object.entries(TICKER_REUSE_DATA_ALIASES).map(([current, old]) => [old, current]),
+]);
+
 // financials-reported also needs the dual-class redirect (DUAL_CLASS_ALIASES
 // above, which was deliberately scoped to only the /stock/metric ratio
 // engine when first added) — verified live this session that the gap is
@@ -828,7 +852,7 @@ function buildFdicTrends(records) {
 }
 
 async function fetchMetricsFor(symbol, apiKey) {
-  const requestSymbol = DUAL_CLASS_ALIASES[symbol] || symbol;
+  const requestSymbol = TICKER_REUSE_DATA_ALIASES[symbol] || DUAL_CLASS_ALIASES[symbol] || symbol;
   const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/metric?symbol=${requestSymbol}&metric=all&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
@@ -836,7 +860,7 @@ async function fetchMetricsFor(symbol, apiKey) {
 }
 
 async function fetchProfileFor(symbol, apiKey) {
-  const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/profile2?symbol=${symbol}&token=${apiKey}`);
+  const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/profile2?symbol=${TICKER_REUSE_DATA_ALIASES[symbol] || symbol}&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
   // Verified live: Finnhub returns the literal string "N/A" for some tickers
@@ -6380,7 +6404,9 @@ async function main() {
   // { SYM: "Q2 '26" } -- see processSymbol's revenueStartedQuarter. Fresh
   // only: it expires on its own once a year of revenue exists.
   const revenueStartedSymbols = Object.assign({}, ...workerResults.map((r) => r.revenueStarted));
-  const output = { generatedAt, metrics, industryLeaders, staleSymbols, zeroRevenueSymbols, noRevenueReportedSymbols, revenueStartedSymbols };
+  // Only for old symbols this dataset actually carries.
+  const renamedSymbols = Object.fromEntries(Object.entries(RENAMED_SYMBOLS).filter(([old, current]) => metrics[old] && metrics[current]));
+  const output = { generatedAt, metrics, industryLeaders, staleSymbols, zeroRevenueSymbols, noRevenueReportedSymbols, revenueStartedSymbols, renamedSymbols };
   fs.mkdirSync(path.dirname(OUTPUT_FILE), { recursive: true }); // works regardless of which repo this script runs in
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(output));
   fs.writeFileSync(OUTPUT_TRENDS_NATIVE_FILE, JSON.stringify({ generatedAt, trends: nativeTrends }));

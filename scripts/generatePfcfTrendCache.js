@@ -229,7 +229,8 @@ function decumulateFdicNetIncome(rows) {
 // quarter without a split/major buyback, so this is a reasonable
 // approximation, not a fabrication of the underlying earnings data itself.
 async function fetchFinnhubShareCount(symbol, apiKey) {
-  const data = await fetchJson(`https://finnhub.io/api/v1/stock/profile2?symbol=${symbol}&token=${apiKey}`);
+  // AXNX: see TICKER_REUSE_DATA_ALIASES in generateSectorMetrics.js.
+  const data = await fetchJson(`https://finnhub.io/api/v1/stock/profile2?symbol=${{ AXNX: 'MIMI' }[symbol] || symbol}&token=${apiKey}`);
   const shares = typeof data?.shareOutstanding === 'number' ? data.shareOutstanding * 1e6 : null;
   return shares != null && shares >= MIN_PLAUSIBLE_SHARES ? shares : null;
 }
@@ -1692,7 +1693,7 @@ function priceSourceRefusedSymbol(data) {
 // no yearly or quarterly P/E and P/FCF at all (AVB, TWO, EQR), never used
 // where a real price exists. Returns [] when the series is missing.
 async function fetchDerivedQuarterEndPrices(symbol, finnhubKey) {
-  const data = await fetchJson(`https://finnhub.io/api/v1/stock/metric?symbol=${symbol}&metric=all&token=${finnhubKey}`);
+  const data = await fetchJson(`https://finnhub.io/api/v1/stock/metric?symbol=${{ AXNX: 'MIMI' }[symbol] || symbol}&metric=all&token=${finnhubKey}`);
   const q = data?.series?.quarterly || {};
   const epsByPeriod = new Map((q.eps || []).filter((x) => Number.isFinite(x?.v)).map((x) => [x.period, x.v]));
   const periods = [...epsByPeriod.keys()].sort();

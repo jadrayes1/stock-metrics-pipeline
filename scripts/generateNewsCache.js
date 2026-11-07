@@ -40,6 +40,10 @@ const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f4597
 // relevance filter), published as companyProfiles.json so the app's
 // proxy can answer /stock/profile2 from it instead of calling the
 // provider on every stock view -- only the fields the app reads.
+// A reused symbol whose profile the data source still serves for the
+// previous holder -- see TICKER_REUSE_DATA_ALIASES in generateSectorMetrics.js
+// (AXNX reads "Axonics Inc"; Axonex AI Group's profile is under MIMI).
+const PROFILE_SYMBOL_ALIASES = { AXNX: 'MIMI' };
 const PROFILES_OUTPUT_FILE = path.join(__dirname, '../companyProfiles.json');
 const GIST_PROFILES_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/companyProfiles.json';
 
@@ -223,7 +227,7 @@ async function main() {
     }
 
     try {
-      const profileRes = await fetch(`https://finnhub.io/api/v1/stock/profile2?symbol=${symbol}&token=${apiKey}`);
+      const profileRes = await fetch(`https://finnhub.io/api/v1/stock/profile2?symbol=${PROFILE_SYMBOL_ALIASES[symbol] || symbol}&token=${apiKey}`);
       const profile = profileRes.ok ? await profileRes.json() : {};
       // A ticker the provider returns nothing for keeps its previous entry.
       if (profile?.name) {
