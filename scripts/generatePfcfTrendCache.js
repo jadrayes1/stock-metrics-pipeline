@@ -1657,9 +1657,61 @@ function fixMislabeledQuarterlyYears(quarterlyReports, annualReports) {
 }
 
 async function fetchMonthlyPrices(symbol, apiKey) {
-  const data = await fetchJson(`https://api.twelvedata.com/time_series?symbol=${symbol}&interval=1month&outputsize=48&apikey=${apiKey}`);
-  if (data?.status !== 'ok' || !Array.isArray(data.values)) return [];
+  // Read the body whatever the status: a refused symbol comes back as an
+  // HTTP 404 with the reason in the body, which fetchJson would throw on.
+  // Anything else non-200 still throws, exactly as before.
+  const res = await fetch(`https://api.twelvedata.com/time_series?symbol=${symbol}&interval=1month&outputsize=48&apikey=${apiKey}`);
+  const data = await res.json().catch(() => null);
+  if (!res.ok && !(res.status === 404 && data?.status === 'error')) throw new Error(`HTTP ${res.status} fetching prices for ${symbol}`);
+  if (data?.status !== 'ok' || !Array.isArray(data.values)) {
+    if (priceSourceRefusedSymbol(data)) refusedPriceSymbols.add(symbol);
+    return [];
+  }
   return data.values.map((v) => ({ date: v.datetime, close: parseFloat(v.close) })).filter((v) => !Number.isNaN(v.close));
+}
+
+// The price source refusing the SYMBOL itself -- not knowing it, or not on
+// this plan -- as opposed to a transient failure or running out of daily
+// credits (429), which must never trigger the fallback below: a fallback
+// value published once is kept by the merge even after real prices return.
+// Verified live: AVB and TWO (delisted) return 404 "symbol ... missing or
+// invalid"; EQR (still trading) returns 404 "available starting with the
+// Grow or Venture plan".
+const refusedPriceSymbols = new Set();
+function priceSourceRefusedSymbol(data) {
+  if (!data || data.status !== 'error' || data.code === 429) return false;
+  return data.code === 404 || data.code === 403 || /symbol|figi|plan/i.test(data.message || '');
+}
+
+// Quarter-end prices for a ticker the price source refuses, derived from
+// the main source's own quarterly series: TTM P/E x the last four quarters'
+// EPS, which is the price that P/E was computed from. Dated on the quarter
+// end itself, so findClosestMonthlyPrice matches it exactly. Checked against
+// real daily closes 2023-2026: median error 0.3-1.1% for AAPL/MSFT/KO/NEE,
+// 3.3% for O (one quarter 17.7%) -- close enough where the alternative is
+// no yearly or quarterly P/E and P/FCF at all (AVB, TWO, EQR), never used
+// where a real price exists. Returns [] when the series is missing.
+async function fetchDerivedQuarterEndPrices(symbol, finnhubKey) {
+  const data = await fetchJson(`https://finnhub.io/api/v1/stock/metric?symbol=${symbol}&metric=all&token=${finnhubKey}`);
+  const q = data?.series?.quarterly || {};
+  const epsByPeriod = new Map((q.eps || []).filter((x) => Number.isFinite(x?.v)).map((x) => [x.period, x.v]));
+  const periods = [...epsByPeriod.keys()].sort();
+  const prices = [];
+  for (const point of q.peTTM || []) {
+    const i = periods.indexOf(point?.period);
+    if (i < 3 || !Number.isFinite(point?.v) || point.v === 0) continue;
+    const ttmEps = periods.slice(i - 3, i + 1).reduce((sum, k) => sum + epsByPeriod.get(k), 0);
+    const price = point.v * ttmEps;
+    if (Number.isFinite(price) && price > 0) prices.push({ date: point.period, close: price });
+  }
+  // Same 48-month reach as the real price series (outputsize=48 above): the
+  // series goes back to 2000 and would otherwise expose filings no ticker's
+  // ratios are built from -- verified live, AVB's FY2010 filing data gave a
+  // yearly P/E of 4.3 billion.
+  const cutoff = new Date();
+  cutoff.setUTCMonth(cutoff.getUTCMonth() - 48);
+  const cutoffDate = cutoff.toISOString().slice(0, 10);
+  return prices.filter((p) => p.date >= cutoffDate).sort((a, b) => b.date.localeCompare(a.date));
 }
 
 // One ticker's full fetch-and-reconstruct pass — factored out of main()'s
@@ -1971,8 +2023,16 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
     }
 
     await sleep(TWELVEDATA_REQUEST_SPACING_MS);
-    const monthlyPrices = await fetchMonthlyPrices(symbol, twelveDataKey);
+    let monthlyPrices = await fetchMonthlyPrices(symbol, twelveDataKey);
     usedTwelveDataCall = true;
+    if (!monthlyPrices.length && refusedPriceSymbols.has(symbol)) {
+      await sleep(FINNHUB_REQUEST_SPACING_MS);
+      monthlyPrices = await fetchDerivedQuarterEndPrices(symbol, finnhubKey).catch(() => []);
+      if (monthlyPrices.length) console.log(`  ${symbol}: price source refused the symbol -- using ${monthlyPrices.length} quarter-end prices derived from TTM P/E x EPS`);
+      // No derived prices either: skip, keeping the cached entry -- what a
+      // refusal (then an HTTP error) did before the fallback existed.
+      else throw new Error('price source refused the symbol and no derived prices are available');
+    }
 
     // All three cadences reuse this SAME fetched data — no extra API
     // calls beyond the ones already budgeted above. industry is already
