@@ -395,9 +395,31 @@ function findSecValueForFyFp(gaapFacts, concepts, fy, fp, unit) {
   for (const concept of concepts) {
     const facts = gaapFacts[concept]?.units?.[unit] || [];
     const fact = pickDurationFact(facts, fy, fp);
-    if (fact) return { value: fact.val, concept: `us-gaap_${concept}`, end: fact.end };
+    if (fact) return { value: fact.val, concept: `us-gaap_${concept}`, start: fact.start, end: fact.end };
   }
   return null;
+}
+
+// A share count restated by a later filing -- a split or reverse split --
+// for the same period, latest filing wins (same rule as
+// fetchSecSharesFactsByPeriod below). A period's fy/fp is its ORIGINAL
+// filing's, so pickDurationFact never sees the restatement, which the
+// next year's report carries under its own fy. Verified live: Axonex AI
+// Group (AXNX) did a 1-for-10 reverse split; its FY2025 20-F reports
+// 21,424,555 weighted shares for FY2025, its FY2026 20-F restates that
+// as 2,142,456, and the unrestated count against split-adjusted prices
+// put FY2025 P/FCF at -261.1 instead of -26.1.
+function latestFiledSharesByPeriod(gaapFacts) {
+  const latest = new Map();
+  for (const concept of SEC_SHARES_CONCEPTS) {
+    for (const f of gaapFacts[concept]?.units?.shares || []) {
+      if (f.val == null || !f.start || !f.end) continue;
+      const key = `${concept}|${f.start}|${f.end}`;
+      const existing = latest.get(key);
+      if (!existing || (f.filed && (!existing.filed || f.filed > existing.filed))) latest.set(key, { val: f.val, filed: f.filed });
+    }
+  }
+  return latest;
 }
 
 // See pickStandaloneDurationFact's own comment for the rationale.
@@ -482,6 +504,7 @@ function isPeCacheStale(existingPe, maxQuartersBehind = 3) {
 // `r.cik === currentCik` check is the same function, imported unchanged).
 function buildSecSyntheticPfcfReports(gaapFacts, cik) {
   const normalizedCik = cik != null ? String(Number(cik)) : cik;
+  const sharesRestatedByPeriod = latestFiledSharesByPeriod(gaapFacts);
   const quarterNumber = { Q1: 1, Q2: 2, Q3: 3, Q4: 4 };
 
   const fyFpKeys = new Map();
@@ -527,6 +550,10 @@ function buildSecSyntheticPfcfReports(gaapFacts, cik) {
       .map((r) => ({ concept: r.concept, label: `${r.concept} (SEC XBRL enrichment)`, value: r.value }));
 
     let sharesFact = findSecValueForFyFp(gaapFacts, SEC_SHARES_CONCEPTS, fy, fp, 'shares');
+    if (sharesFact) {
+      const restated = sharesRestatedByPeriod.get(`${sharesFact.concept.replace(/^us-gaap_/, '')}|${sharesFact.start}|${sharesFact.end}`);
+      if (restated && restated.val !== sharesFact.value) sharesFact = { ...sharesFact, value: restated.val };
+    }
     if (sharesFact && sharesFact.value < MIN_PLAUSIBLE_SHARES) sharesFact = null; // see MIN_PLAUSIBLE_SHARES above
     const netIncomeFact = findSecValueForFyFp(gaapFacts, SEC_NET_INCOME_CONCEPTS, fy, fp, 'USD');
     const icItems = [sharesFact, netIncomeFact]
