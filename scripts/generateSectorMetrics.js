@@ -856,7 +856,7 @@ async function fetchMetricsFor(symbol, apiKey) {
   const res = await fetchFinnhub(`https://finnhub.io/api/v1/stock/metric?symbol=${requestSymbol}&metric=all&token=${apiKey}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
-  return { current: data?.metric || {}, quarterly: data?.series?.quarterly || {} };
+  return { current: data?.metric || {}, quarterly: data?.series?.quarterly || {}, annual: data?.series?.annual || {} };
 }
 
 async function fetchProfileFor(symbol, apiKey) {
@@ -3510,6 +3510,87 @@ function buildNativeTrendsForTicker(quarterly) {
   return result;
 }
 
+// Yearly / quarterly / TTM series built from the market-data source's own
+// /stock/metric series -- only ever used for a cadence every other source
+// left EMPTY (see the builder loops in processSymbol). A metric's native
+// series covers one cadence each (TTM for ROIC/FCF margin, quarterly for
+// profit margin/revenue growth); for a filer whose filings yield nothing
+// structured -- quarterly results only in 6-K press releases, or no 20-F
+// yet -- every other cadence was empty beside a full native one. Verified
+// live: OMAB (12 native quarters of every metric, no quarterly or TTM
+// series at all), SKHY (SK hynix's 2026 US listing: native only), ASR, PAC.
+//   yearly       ROIC, net margin, FCF margin straight from the annual
+//                series; revenue growth from annual sales per share, year
+//                over consecutive year
+//   ttm          revenue growth: last four quarters' sales per share vs the
+//                four before; profit margin: the four quarters' net margins
+//                weighted by sales per share (net income over revenue)
+// Per-share figures, so growth is per share -- the same basis the native
+// revenue growth series already uses. Quarters must be consecutive (80-100
+// days apart): a half-year reporter's series never forms a TTM window.
+function buildProviderFallbackTrends(quarterlySeries, annualSeries) {
+  const out = { yearly: {}, quarterly: {}, ttm: {} };
+  const asc = (arr) => (arr || []).filter((x) => x?.period && Number.isFinite(x?.v)).sort((a, b) => a.period.localeCompare(b.period));
+  const days = (a, b) => (Date.parse(b) - Date.parse(a)) / 86400000;
+  const fyLabel = (period) => {
+    const m = quarterLabelFromPeriod(period)?.match(/'(\d{2})$/);
+    return m ? `FY '${m[1]}` : null;
+  };
+  const yearlyFrom = (arr) => asc(arr).map((x) => ({ label: fyLabel(x.period), value: clampImplausible(x.v) })).filter((p) => p.label && p.value != null);
+  out.yearly.roic = yearlyFrom(annualSeries?.roic);
+  out.yearly.profitMargin = yearlyFrom(annualSeries?.netMargin);
+  out.yearly.fcfMargin = yearlyFrom(annualSeries?.fcfMargin);
+  const annualSales = asc(annualSeries?.salesPerShare);
+  out.yearly.revenueGrowth = [];
+  for (let i = 1; i < annualSales.length; i++) {
+    const gap = days(annualSales[i - 1].period, annualSales[i].period);
+    if (gap < 330 || gap > 400) continue;
+    const value = revenueGrowthBetween(annualSales[i - 1].v, annualSales[i].v);
+    const label = fyLabel(annualSales[i].period);
+    if (value != null && label) out.yearly.revenueGrowth.push({ label, value });
+  }
+
+  // No quarterly fallback: profit margin and revenue growth are the two
+  // quarterly-native metrics, so their Quarterly tab already IS the native
+  // series; ROIC/FCF margin have no quarterly figure in the source at all.
+
+  const sales = asc(quarterlySeries?.salesPerShare);
+  const marginByPeriod = new Map(asc(quarterlySeries?.netMargin).map((x) => [x.period, x.v]));
+  const consecutive = (rows) => rows.every((r, i) => i === 0 || (days(rows[i - 1].period, r.period) >= 80 && days(rows[i - 1].period, r.period) <= 100));
+  out.ttm.revenueGrowth = [];
+  out.ttm.profitMargin = [];
+  for (let i = 3; i < sales.length; i++) {
+    const window = sales.slice(i - 3, i + 1);
+    if (!consecutive(window)) continue;
+    const label = quarterLabelFromPeriod(sales[i].period);
+    const revenue = window.reduce((sum, r) => sum + r.v, 0);
+    if (i >= 7) {
+      const prior = sales.slice(i - 7, i - 3);
+      if (consecutive(sales.slice(i - 7, i + 1)) && prior.length === 4) {
+        const value = revenueGrowthBetween(prior.reduce((sum, r) => sum + r.v, 0), revenue);
+        if (value != null) out.ttm.revenueGrowth.push({ label, value });
+      }
+    }
+    if (revenue > 0 && window.every((r) => marginByPeriod.has(r.period))) {
+      const netIncome = window.reduce((sum, r) => sum + r.v * marginByPeriod.get(r.period), 0);
+      const value = clampImplausible(netIncome / revenue);
+      if (value != null) out.ttm.profitMargin.push({ label, value });
+    }
+  }
+  // Sales per share is only a revenue proxy while the share count holds
+  // still; a split, ADR-ratio change or large issuance shows up as a jump
+  // and an equal reversal. Verified live: FMX's annual series read
+  // +451%, -79%, +439%, -81% (FY '17-'20). A series with a jump over +150%
+  // next to a drop past -50% is dropped whole.
+  const brokenBasis = (series) => series.some((p, i) => i > 0 && ((p.value > 1.5 && series[i - 1].value < -0.5) || (p.value < -0.5 && series[i - 1].value > 1.5)));
+  if (brokenBasis(out.yearly.revenueGrowth)) out.yearly.revenueGrowth = [];
+  if (brokenBasis(out.ttm.revenueGrowth)) out.ttm.revenueGrowth = [];
+  for (const cadence of Object.keys(out)) {
+    for (const key of Object.keys(out[cadence])) out[cadence][key] = out[cadence][key].slice(-QUARTERS_OF_HISTORY);
+  }
+  return out;
+}
+
 // Mirrors buildFcfMarginFromFilings in src/utils/metrics.js — full trend,
 // not just the latest point. Reuses findReportedOperatingCashFlowQ/
 // findReportedCapexQ/findReportedRevenue/decumulateYtdByYear/
@@ -5109,7 +5190,7 @@ async function processSymbol(symbol, apiKey, ctx) {
   }
 
   await sleep(REQUEST_SPACING_MS);
-  const { current, quarterly } = await fetchMetricsFor(symbol, apiKey);
+  const { current, quarterly, annual } = await fetchMetricsFor(symbol, apiKey);
 
   // netMargin's quarterly series is one of the more consistently-present
   // fields (see QUARTERLY_FIELD_MAP in src/utils/metrics.js) — used here
@@ -5607,6 +5688,23 @@ async function processSymbol(symbol, apiKey, ctx) {
   // quarterly P&L) — quarterly/ttm fall back to this same object but will
   // just stay empty for those tickers, which is correct, not a bug.
   const foreignFilingsTrendsForSymbol = ctx.foreignFilingsCache[symbol];
+  // Last resort for a cadence still empty after the above -- see
+  // buildProviderFallbackTrends. Not for a ticker whose native data is
+  // known to belong to another company (finnhubDataUntrusted).
+  const providerFallback = finnhubDataUntrusted ? null : buildProviderFallbackTrends(quarterly, annual);
+  const fromProvider = (cadence, key) => {
+    const series = providerFallback?.[cadence]?.[key];
+    return series?.length ? pickCadenceMetric(undefined, series, key) : [];
+  };
+  // Empty, or under 4 points (too thin to read as a trend -- ASR's and PAC's
+  // TTM series were 1-3 points beside 12 native quarters): add the source's
+  // points, the existing ones winning any shared label.
+  const withProviderFallback = (cadence, key, published) => {
+    if (published.length >= 4) return published;
+    const fallback = fromProvider(cadence, key);
+    if (!fallback.length) return published;
+    return published.length ? pickTrendToPublish(published, fallback, key) : fallback;
+  };
 
   let cardValuesReconstructed = false;
 
@@ -5625,6 +5723,7 @@ async function processSymbol(symbol, apiKey, ctx) {
       const foreignPoints = foreignFilingsTrendsForSymbol?.yearly?.[key];
       if (foreignPoints?.length) published = foreignPoints;
     }
+    published = withProviderFallback('yearly', key, published);
     if (published.length) mergedYearlyForSymbol[key] = published;
   }
   for (const key of Object.keys(quarterlyBuilders)) {
@@ -5641,6 +5740,7 @@ async function processSymbol(symbol, apiKey, ctx) {
       const foreignPoints = foreignFilingsTrendsForSymbol?.quarterly?.[key];
       if (foreignPoints?.length) published = foreignPoints;
     }
+    published = withProviderFallback('quarterly', key, published);
     if (published.length) mergedQuarterlyForSymbol[key] = published;
   }
   for (const key of Object.keys(ttmBuilders)) {
@@ -5657,6 +5757,7 @@ async function processSymbol(symbol, apiKey, ctx) {
       const foreignPoints = foreignFilingsTrendsForSymbol?.ttm?.[key];
       if (foreignPoints?.length) published = foreignPoints;
     }
+    published = withProviderFallback('ttm', key, published);
     if (published.length) {
       mergedTtmForSymbol[key] = published;
       // Backfill the CARD value too, not just the trend cache, whenever
