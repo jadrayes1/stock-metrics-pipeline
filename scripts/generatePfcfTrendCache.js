@@ -1750,6 +1750,48 @@ function priceSourceRefusedSymbol(data) {
   return data.code === 404 || data.code === 403 || /symbol|figi|plan/i.test(data.message || '');
 }
 
+// P/E and P/FCF from the market-data source's own figures, for a series
+// the filings left empty. Verified live: PAC (Grupo Aeroportuario del
+// Pacifico) had one yearly P/E point (FY '16) and no yearly P/FCF though
+// the source carries both for every year; OMAB and SKHY had no quarterly
+// or yearly P/E and P/FCF beside full native TTM series.
+//   ttm        the source's quarterly TTM P/E and P/FCF series
+//   yearly     its annual P/E and P/FCF series
+//   quarterly  P/E only -- this file's definition (quarter-end price over
+//              4x that quarter's EPS) from the source's quarterly EPS and
+//              the same price series the filings path uses. It has no
+//              quarterly free cash flow, so no quarterly P/FCF.
+// Labels from each period's end date, the same as every other point here.
+async function providerRatioFallback(symbol, finnhubKey) {
+  const data = await fetchJson(`https://finnhub.io/api/v1/stock/metric?symbol=${{ AXNX: 'MIMI' }[symbol] || symbol}&metric=all&token=${finnhubKey}`);
+  const q = data?.series?.quarterly || {};
+  const a = data?.series?.annual || {};
+  const sortAsc = (arr) => (arr || []).filter((x) => x?.period && Number.isFinite(x?.v) && x.v !== 0).sort((x, y) => x.period.localeCompare(y.period));
+  const quarterSeries = (arr) => sortAsc(arr).map((x) => ({ label: quarterLabelFromEndDate(x.period), value: x.v })).filter((p) => p.label).slice(-QUARTERS_OF_HISTORY);
+  const yearSeries = (arr) => sortAsc(arr).map((x) => ({ label: calendarYearlyLabelFromEndDate(x.period, Number(x.period.slice(0, 4))), value: x.v })).slice(-QUARTERS_OF_HISTORY);
+  // Price from the source's own TTM P/E x TTM EPS, not monthlyPrices: for an
+  // ADR the price series is the US share in dollars while EPS is per local
+  // share in local currency (SKHY: won; OMAB: pesos, 8 shares per ADS), so
+  // mixing the two read SKHY's quarterly P/E as 0.000 and OMAB's at a third
+  // of its TTM P/E. Kept entirely in the source's units, the quarterly
+  // figure is TTM P/E x TTM EPS / (4 x quarter EPS).
+  const epsAsc = sortAsc(q.eps);
+  const peTtmByPeriod = new Map(sortAsc(q.peTTM).map((x) => [x.period, x.v]));
+  const peQuarterly = epsAsc
+    .map((x, i) => {
+      const peTtm = peTtmByPeriod.get(x.period);
+      if (i < 3 || peTtm == null) return null;
+      const ttmEps = epsAsc.slice(i - 3, i + 1).reduce((sum, e) => sum + e.v, 0);
+      return { label: quarterLabelFromEndDate(x.period), value: (peTtm * ttmEps) / (4 * x.v) };
+    })
+    .filter((p) => p && p.label && Number.isFinite(p.value))
+    .slice(-QUARTERS_OF_HISTORY);
+  return {
+    pfcf: { ttm: quarterSeries(q.pfcfTTM), yearly: yearSeries(a.pfcf) },
+    pe: { ttm: quarterSeries(q.peTTM), quarterly: peQuarterly, yearly: yearSeries(a.pe) },
+  };
+}
+
 // Quarter-end prices for a ticker the price source refuses, derived from
 // the main source's own quarterly series: TTM P/E x the last four quarters'
 // EPS, which is the price that P/E was computed from. Dated on the quarter
@@ -2133,6 +2175,38 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
       const niOf = (r) => findReportedNetIncome(r.report?.ic || []);
       fresh.ttm = withPoint(fresh.ttm, spinoffTrailingPoint(quarterlyReports, annualReports, fcfOf, monthlyPrices));
       freshPe.ttm = withPoint(freshPe.ttm, spinoffTrailingPoint(quarterlyReports, annualReports, niOf, monthlyPrices));
+    }
+    // A series still empty here, with nothing published for it either, is
+    // filled from the market-data source's own figures -- see
+    // providerRatioFallback. Never mixed into a series that has points.
+    // "Nothing published" also covers a published series too thin or old to
+    // stand on its own -- verified live: PAC's yearly P/E was a single FY '16
+    // point, ASR's TTM P/E a single Q2 '25 point, each beside 12 native
+    // quarters. Fewer than 4 points, or a latest point over 2 years old.
+    const thin = (series) => {
+      if (!series?.length) return true;
+      if (series.length < 4) return true;
+      const m = String(series[series.length - 1].label || '').match(/'(\d{2})$/);
+      return !m || 2000 + Number(m[1]) < new Date().getUTCFullYear() - 2;
+    };
+    const emptyBoth = (freshSeries, existingSeries) => !freshSeries?.length && thin(existingSeries);
+    const needs = {
+      pfcfTtm: emptyBoth(fresh.ttm, existingCacheEntry?.ttm),
+      pfcfYearly: emptyBoth(fresh.yearly, existingCacheEntry?.yearly),
+      peTtm: emptyBoth(freshPe.ttm, existingCacheEntry?.pe?.ttm),
+      peQuarterly: emptyBoth(freshPe.quarterly, existingCacheEntry?.pe?.quarterly),
+      peYearly: emptyBoth(freshPe.yearly, existingCacheEntry?.pe?.yearly),
+    };
+    if (Object.values(needs).some(Boolean)) {
+      await sleep(FINNHUB_REQUEST_SPACING_MS);
+      const fallback = await providerRatioFallback(symbol, finnhubKey).catch(() => null);
+      if (fallback) {
+        if (needs.pfcfTtm) fresh.ttm = fallback.pfcf.ttm;
+        if (needs.pfcfYearly) fresh.yearly = fallback.pfcf.yearly;
+        if (needs.peTtm) freshPe.ttm = fallback.pe.ttm;
+        if (needs.peQuarterly) freshPe.quarterly = fallback.pe.quarterly;
+        if (needs.peYearly) freshPe.yearly = fallback.pe.yearly;
+      }
     }
     computed = true;
     yearlyNote = listedAfterFiscalYearEnd(annualReports, monthlyPrices);
