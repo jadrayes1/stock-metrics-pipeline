@@ -2820,9 +2820,15 @@ function findReportedRevenue(icItems) {
   return sawZero ? 0 : null;
 }
 
-// FCF margin's denominator. The same as findReportedRevenue, except for the
-// mortgage-REIT case its last branch covers (net interest income, no
-// non-interest-income line): there it's TOTAL interest income instead.
+// The revenue figure FCF margin, profit margin and revenue growth divide
+// by. The same as findReportedRevenue, except for the mortgage-REIT case its
+// last branch covers (net interest income, no non-interest-income line):
+// there it's TOTAL interest income instead. Extended from FCF margin to the
+// other two after TWO (Two Harbors): net interest income ran tiny and at
+// times negative through 2023-2025, so quarterly profit margin swung from
+// -1,034% to +1,320% while the market-data source's own series (total
+// revenue) read 7-97%, and TTM -- which skips a window with a negative
+// revenue quarter -- had no points at all.
 // Operating cash flow is a gross figure -- interest received, not interest
 // net of funding cost -- so against net interest income the ratio is not a
 // margin at all. Verified live: Invesco Mortgage Capital (IVR) FY2025 OCF
@@ -2834,7 +2840,7 @@ function findReportedRevenue(icItems) {
 // any report whose revenue resolves earlier keeps exactly the same figure.
 const GROSS_INTEREST_INCOME_CONCEPTS = ['us-gaap_InterestAndDividendIncomeOperating', 'us-gaap_InterestIncomeOperating'];
 
-function findFcfMarginRevenue(icItems) {
+function findTopLineRevenue(icItems) {
   const revenue = findReportedRevenue(icItems);
   const netInterestIncome = icItems.find((item) => item.concept === 'us-gaap_InterestIncomeExpenseNet');
   const nonInterestIncome = icItems.find((item) => item.concept === 'us-gaap_NoninterestIncome');
@@ -3544,7 +3550,7 @@ function buildFcfMarginTrendFromFilings(quarterlyReports, annualReports) {
   const findCapex = (cfItems) => findReportedCapexQ(cfItems, noCapex);
   const ocf = decumulateYtdByYear(quarterlyReports, annualReports, findReportedOperatingCashFlowQ, 'cf');
   const capex = decumulateYtdByYear(quarterlyReports, annualReports, findCapex, 'cf');
-  const revenue = decumulateYtdByYear(quarterlyReports, annualReports, findFcfMarginRevenue, 'ic');
+  const revenue = decumulateYtdByYear(quarterlyReports, annualReports, findTopLineRevenue, 'ic');
 
   // `revenue[key] != null`, not a truthy check — mirrors buildFcfMarginFromFilings
   // in src/utils/metrics.js; see that file for the full rationale (a real
@@ -3951,7 +3957,7 @@ function buildFcfMarginQuarterlyFromFilings(quarterlyReports, annualReports) {
   const records = buildStandaloneFlowQuarters(quarterlyReports, annualReports, {
     ocf: { fn: findReportedOperatingCashFlowQ, section: 'cf' },
     capex: { fn: (cfItems) => findReportedCapexQ(cfItems, noCapex), section: 'cf' },
-    revenue: { fn: findFcfMarginRevenue, section: 'ic', disallowNegative: true },
+    revenue: { fn: findTopLineRevenue, section: 'ic', disallowNegative: true },
   });
   return records
     .map((r) => ({
@@ -3973,7 +3979,7 @@ function buildFcfMarginYearlyFromFilings(annualReports, quarterlyReports = null)
   const records = buildAnnualFlowPoints(annualReports, {
     ocf: { fn: findReportedOperatingCashFlowQ, section: 'cf' },
     capex: { fn: (cfItems) => findReportedCapexQ(cfItems, noCapex), section: 'cf' },
-    revenue: { fn: findFcfMarginRevenue, section: 'ic', disallowNegative: true },
+    revenue: { fn: findTopLineRevenue, section: 'ic', disallowNegative: true },
   });
   return records
     .map((r) => ({
@@ -3988,7 +3994,7 @@ function buildFcfMarginYearlyFromFilings(annualReports, quarterlyReports = null)
 
 function buildRevenueGrowthQuarterlyFromFilings(quarterlyReports, annualReports) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
-  const standalone = decumulateYtdByYear(quarterlyReports, annualReports, findReportedRevenue, 'ic', true);
+  const standalone = decumulateYtdByYear(quarterlyReports, annualReports, findTopLineRevenue, 'ic', true);
   if (process.env.DEBUG_SEC_ENRICHMENT) {
     console.error('DEBUG buildRevenueGrowthQuarterlyFromFilings standalone', JSON.stringify(standalone));
     console.error('DEBUG buildRevenueGrowthQuarterlyFromFilings quarterlyReports years/quarters/ciks', JSON.stringify((quarterlyReports || []).map((q) => ({ year: q.year, quarter: q.quarter, cik: q.cik, form: q.form }))));
@@ -4022,7 +4028,7 @@ function buildRevenueGrowthQuarterlyFromFilings(quarterlyReports, annualReports)
 
 function buildRevenueGrowthYearlyFromFilings(annualReports) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(null, annualReports);
-  const records = buildAnnualFlowPoints(annualReports, { revenue: { fn: findReportedRevenue, section: 'ic' } });
+  const records = buildAnnualFlowPoints(annualReports, { revenue: { fn: findTopLineRevenue, section: 'ic' } });
   if (process.env.DEBUG_SEC_ENRICHMENT) {
     console.error('DEBUG buildRevenueGrowthYearlyFromFilings records', JSON.stringify(records));
   }
@@ -4052,7 +4058,7 @@ function buildRevenueGrowthYearlyFromFilings(annualReports) {
 
 function buildRevenueGrowthTTMFromFilings(quarterlyReports, annualReports) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
-  const records = buildStandaloneFlowQuarters(quarterlyReports, annualReports, { revenue: { fn: findReportedRevenue, section: 'ic', disallowNegative: true } });
+  const records = buildStandaloneFlowQuarters(quarterlyReports, annualReports, { revenue: { fn: findTopLineRevenue, section: 'ic', disallowNegative: true } });
   const windows = buildTrailingWindows(records, 4).filter((w) => !w.partial);
 
   const ttmByKey = {};
@@ -4082,7 +4088,7 @@ function buildRevenueGrowthTTMFromFilings(quarterlyReports, annualReports) {
 
 function buildProfitMarginQuarterlyFromFilings(quarterlyReports, annualReports) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
-  const revenue = decumulateYtdByYear(quarterlyReports, annualReports, findReportedRevenue, 'ic');
+  const revenue = decumulateYtdByYear(quarterlyReports, annualReports, findTopLineRevenue, 'ic');
   const netIncome = decumulateYtdByYear(quarterlyReports, annualReports, findReportedNetIncome, 'ic');
   const chronological = Object.keys(revenue)
     .filter((key) => netIncome[key] != null && revenue[key])
@@ -4099,7 +4105,7 @@ function buildProfitMarginYearlyFromFilings(annualReports) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(null, annualReports);
   const records = buildAnnualFlowPoints(annualReports, {
     netIncome: { fn: findReportedNetIncome, section: 'ic' },
-    revenue: { fn: findReportedRevenue, section: 'ic', disallowNegative: true },
+    revenue: { fn: findTopLineRevenue, section: 'ic', disallowNegative: true },
   });
   return records
     .map((r) => ({ label: calendarYearlyLabel(calendarLabels, r.year), value: clampImplausible(r.revenue ? r.netIncome / r.revenue : null) }))
@@ -4111,7 +4117,7 @@ function buildProfitMarginTTMFromFilings(quarterlyReports, annualReports) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
   const records = buildStandaloneFlowQuarters(quarterlyReports, annualReports, {
     netIncome: { fn: findReportedNetIncome, section: 'ic' },
-    revenue: { fn: findReportedRevenue, section: 'ic', disallowNegative: true },
+    revenue: { fn: findTopLineRevenue, section: 'ic', disallowNegative: true },
   });
   return buildTrailingWindows(records, 4)
     .map(({ quarters, anchor, partial }) => {

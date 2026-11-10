@@ -742,30 +742,73 @@ function findReportedOperatingCashFlowQ(cfItems) {
 // airlines like DAL). PaymentsToAcquireIntangibleAssets added for JTAI (Jet.AI)
 // -- verified live: its 2023-2024 10-Qs tag capitalized software/IP spend
 // under this standard concept instead of any PP&E variant.
+const PFCF_CAPEX_LABEL =
+  /purchases? of property|payments? (for|to) acquire (other )?property|capital expenditures|capital spending|capital improvements|flight equipment|deposits? (on|for) aircraft|investment in vehicles/i;
+
 function findReportedCapexQ(cfItems) {
-  const concepts = [
-    'us-gaap_PaymentsToAcquirePropertyPlantAndEquipment',
-    'us-gaap_PaymentsToAcquireProductiveAssets',
-    'us-gaap_PaymentsForCapitalImprovements',
-    'us-gaap_PaymentsToAcquireOtherPropertyPlantAndEquipment',
-    'us-gaap_PaymentsForFlightEquipment',
-    'us-gaap_PaymentsToAcquireOtherProductiveAssets',
-    'us-gaap_PaymentsToAcquireIntangibleAssets',
-    // Verified live: CHCI (Comstock Holding Companies) tags its real,
-    // current, much larger capex-equivalent spend here instead of any PP&E
-    // variant -- see the identical addition + comment in
-    // generateSectorMetrics.js's own findReportedCapexQ.
-    'us-gaap_PaymentsToAcquireRealEstateAndRealEstateJointVentures',
-  ];
-  // Summed rather than first-match — verified live: DAL splits its real
-  // capex across TWO simultaneous lines ("Flight equipment, including
-  // advance payments" + "Ground property and equipment, including
-  // technology"), never a single combined figure. Returning just the
-  // first match would understate real capex by ~15-20% for DAL
-  // specifically; summing is a no-op for the common case where a filer
-  // only ever tags one of these concepts.
+  const concepts = PFCF_CAPEX_CONCEPTS;
   const matches = cfItems.filter((item) => concepts.includes(item.concept));
   if (matches.length) return matches.reduce((sum, item) => sum + item.value, 0);
+  return findReportedCapexQFallback(cfItems);
+}
+
+// A filer that reports an investing section in period after period and
+// never a capex line in any of them has no capex to report -- the same
+// test generateSectorMetrics.js's filerNeverDisclosesCapex applies before
+// its FCF margin assumes $0, so the two never disagree about a filer.
+// Verified live: Two Harbors (TWO), a mortgage REIT, publishes 12 points
+// of FCF margin per cadence on assumed-zero capex but had no quarterly or
+// yearly P/FCF at all -- every period's capex read as missing. Its TTM
+// P/FCF (the market-data source's own, on the same zero) showed ~3.5.
+const MIN_PERIODS_TO_CONCLUDE_NO_CAPEX = 8;
+function filerNeverDisclosesCapex(...reportSets) {
+  let periodsWithInvestingSection = 0;
+  for (const reports of reportSets) {
+    for (const r of reports || []) {
+      const cfItems = r?.report?.cf || [];
+      if (!cfItems.length) continue;
+      if (cfItems.some((item) => PFCF_CAPEX_CONCEPTS.includes(item.concept) || PFCF_CAPEX_LABEL.test(item.label || ''))) return false;
+      if (cfItems.some((item) => /investing activities/i.test(item.label || ''))) periodsWithInvestingSection++;
+    }
+  }
+  return periodsWithInvestingSection >= MIN_PERIODS_TO_CONCLUDE_NO_CAPEX;
+}
+
+// Marks every report with an operating cash flow line as $0 capex, via the
+// same ImpliedZeroCapex sentinel the SEC rebuild sets.
+function markImpliedZeroCapex(reportSets) {
+  for (const reports of reportSets) {
+    for (const r of reports || []) {
+      const cf = r?.report?.cf;
+      if (!cf?.length || findReportedOperatingCashFlowQ(cf) == null || cf.some((item) => item.concept === 'ImpliedZeroCapex')) continue;
+      cf.push({ concept: 'ImpliedZeroCapex', label: 'No capex disclosed by this filer (assumed $0)', value: 0 });
+    }
+  }
+}
+
+const PFCF_CAPEX_CONCEPTS = [
+  'us-gaap_PaymentsToAcquirePropertyPlantAndEquipment',
+  'us-gaap_PaymentsToAcquireProductiveAssets',
+  'us-gaap_PaymentsForCapitalImprovements',
+  'us-gaap_PaymentsToAcquireOtherPropertyPlantAndEquipment',
+  'us-gaap_PaymentsForFlightEquipment',
+  'us-gaap_PaymentsToAcquireOtherProductiveAssets',
+  'us-gaap_PaymentsToAcquireIntangibleAssets',
+  // Verified live: CHCI (Comstock Holding Companies) tags its real,
+  // current, much larger capex-equivalent spend here instead of any PP&E
+  // variant -- see the identical addition + comment in
+  // generateSectorMetrics.js's own findReportedCapexQ.
+  'us-gaap_PaymentsToAcquireRealEstateAndRealEstateJointVentures',
+];
+
+// Summed rather than first-match — verified live: DAL splits its real
+// capex across TWO simultaneous lines ("Flight equipment, including
+// advance payments" + "Ground property and equipment, including
+// technology"), never a single combined figure. Returning just the
+// first match would understate real capex by ~15-20% for DAL
+// specifically; summing is a no-op for the common case where a filer
+// only ever tags one of these concepts.
+function findReportedCapexQFallback(cfItems) {
   // "deposits? (on|for) aircraft" added for JTAI (Jet.AI) -- verified live:
   // its 2025 10-Qs tag real cash paid toward acquiring aircraft under a
   // company-specific extension concept (JTAI_PaymentsForOtherDepositsOnAircraft),
@@ -775,11 +818,7 @@ function findReportedCapexQ(cfItems) {
   // live: its dominant capex line (~$7.8B/half-year, ~70x its much smaller
   // separately-tagged PP&E line) is tagged car_InvestmentInVehicles, a
   // custom extension never exposed via companyfacts.
-  const labelMatch = cfItems.find((item) =>
-    /purchases? of property|payments? (for|to) acquire (other )?property|capital expenditures|capital spending|capital improvements|flight equipment|deposits? (on|for) aircraft|investment in vehicles/i.test(
-      item.label || ''
-    )
-  );
+  const labelMatch = cfItems.find((item) => PFCF_CAPEX_LABEL.test(item.label || ''));
   if (labelMatch) return labelMatch.value;
   // No capex line found -- treat as a real $0 (not missing data) ONLY when
   // this filer's cash-flow statement has no "Investing Activities" section
@@ -2028,6 +2067,7 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
     const now = new Date();
     const isFutureReport = (r) => r?.endDate && new Date(r.endDate) > now;
     quarterlyReports = (quarterlyReports || []).filter((r) => !isFutureReport(r));
+    if (filerNeverDisclosesCapex(quarterlyReports, annualReports)) markImpliedZeroCapex([quarterlyReports, annualReports]);
     annualReports = (annualReports || []).filter((r) => !isFutureReport(r));
 
     if (process.env.DEBUG_PFCF_SYMBOLS?.split(',').map((s) => s.trim().toUpperCase()).includes(symbol)) {
