@@ -3492,6 +3492,15 @@ function extractNativeQuarterlySeries(quarterly, metricKey) {
     }
     return points.reverse();
   }
+  // The source's "fcfMargin" series is a single quarter's FCF margin, not
+  // trailing-twelve-month -- verified live: AAPL's reads 22.6% / 29.2% /
+  // 24.0% for Q3/Q2/Q1 '26, exactly the filings' QUARTERLY figures, while
+  // the filings' TTM reads 28.4% / 29.3% / 28.6%. This series is the
+  // TTM-tab native one (NATIVE_CADENCE_BY_METRIC.fcfMargin = 'ttm' in the
+  // app), so it's built as a real TTM figure instead: TTM FCF per share
+  // over the four quarters' sales per share (AAPL 28.8% / 29.6% / 28.9%,
+  // KO and HD identical to the filings).
+  if (metricKey === 'fcfMargin') return providerTtmFcfMargin(series);
   const field = NATIVE_QUARTERLY_FIELD_MAP[metricKey];
   const entries = ((field && series[field]) || []).slice(0, QUARTERS_OF_HISTORY);
   return entries.map((entry) => ({ label: quarterLabelFromPeriod(entry?.period), value: entry?.v ?? null })).reverse();
@@ -3510,6 +3519,51 @@ function buildNativeTrendsForTicker(quarterly) {
   return result;
 }
 
+// TTM FCF margin from the source's quarterly series: its TTM FCF per share
+// over the last four (consecutive) quarters' sales per share, oldest first.
+function providerTtmFcfMargin(quarterlySeries) {
+  const days = (a, b) => (Date.parse(b) - Date.parse(a)) / 86400000;
+  const sales = (quarterlySeries?.salesPerShare || []).filter((x) => x?.period >= '2000' && Number.isFinite(x?.v)).sort((a, b) => a.period.localeCompare(b.period));
+  const fcfTtm = new Map((quarterlySeries?.fcfPerShareTTM || []).filter((x) => x?.period && Number.isFinite(x?.v)).map((x) => [x.period, x.v]));
+  const points = [];
+  for (let i = 3; i < sales.length; i++) {
+    const window = sales.slice(i - 3, i + 1);
+    if (!window.every((w, k) => k === 0 || (days(window[k - 1].period, w.period) >= 80 && days(window[k - 1].period, w.period) <= 100))) continue;
+    const revenue = window.reduce((t, w) => t + w.v, 0);
+    const fcf = fcfTtm.get(sales[i].period);
+    if (fcf == null || !(revenue > 0)) continue;
+    points.push({ label: quarterLabelFromPeriod(sales[i].period), value: clampImplausible(fcf / revenue) });
+  }
+  return points.slice(-QUARTERS_OF_HISTORY);
+}
+
+// Quarterly ROIC from the source's per-share series, on this file's own
+// definition (buildRoicQuarterlyFromFilings: 4 x quarter EBIT x (1 - 21%)
+// over debt + equity): 4 x 0.79 x EBIT per share over book value per share
+// x (1 + debt/equity), book value per share being price / price-to-book and
+// price TTM P/E x TTM EPS -- all per local share, so currency and ADR ratio
+// cancel. Matches the filings for HD in every quarter and AAPL Q2-Q4 '25,
+// MSFT/KO within a few points (debt definition).
+function providerQuarterlyRoic(quarterlySeries) {
+  const byPeriod = (k) => new Map((quarterlySeries?.[k] || []).filter((x) => x?.period && Number.isFinite(x?.v)).map((x) => [x.period, x.v]));
+  const eps = (quarterlySeries?.eps || []).filter((x) => x?.period >= '2000' && Number.isFinite(x?.v)).sort((a, b) => a.period.localeCompare(b.period));
+  const pe = byPeriod('peTTM');
+  const pb = byPeriod('pb');
+  const de = byPeriod('totalDebtToEquity');
+  const ebit = byPeriod('ebitPerShare');
+  const points = [];
+  for (let i = 3; i < eps.length; i++) {
+    const p = eps[i].period;
+    if (!pe.get(p) || !pb.get(p) || !ebit.has(p) || !de.has(p)) continue;
+    const price = pe.get(p) * eps.slice(i - 3, i + 1).reduce((t, x) => t + x.v, 0);
+    const bookPerShare = price / pb.get(p);
+    const investedPerShare = bookPerShare * (1 + de.get(p));
+    if (!(investedPerShare > 0)) continue;
+    points.push({ label: quarterLabelFromPeriod(p), value: clampImplausible((4 * (1 - ROIC_ASSUMED_TAX_RATE) * ebit.get(p)) / investedPerShare) });
+  }
+  return points.filter((x) => x.value != null).slice(-QUARTERS_OF_HISTORY);
+}
+
 // Yearly / quarterly / TTM series built from the market-data source's own
 // /stock/metric series -- only ever used for a cadence every other source
 // left EMPTY (see the builder loops in processSymbol). A metric's native
@@ -3522,6 +3576,8 @@ function buildNativeTrendsForTicker(quarterly) {
 //   yearly       ROIC, net margin, FCF margin straight from the annual
 //                series; revenue growth from annual sales per share, year
 //                over consecutive year
+//   quarterly    FCF margin (the source's single-quarter series) and ROIC
+//                (providerQuarterlyRoic)
 //   ttm          revenue growth: last four quarters' sales per share vs the
 //                four before; profit margin: the four quarters' net margins
 //                weighted by sales per share (net income over revenue)
@@ -3530,7 +3586,9 @@ function buildNativeTrendsForTicker(quarterly) {
 // days apart): a half-year reporter's series never forms a TTM window.
 function buildProviderFallbackTrends(quarterlySeries, annualSeries) {
   const out = { yearly: {}, quarterly: {}, ttm: {} };
-  const asc = (arr) => (arr || []).filter((x) => x?.period && Number.isFinite(x?.v)).sort((a, b) => a.period.localeCompare(b.period));
+  // From 2000 on only: a two-digit label year can't tell 1998 from 2098,
+  // so the recency check read INO's "Q4 '98" FCF margin as current.
+  const asc = (arr) => (arr || []).filter((x) => x?.period >= '2000' && Number.isFinite(x?.v)).sort((a, b) => a.period.localeCompare(b.period));
   const days = (a, b) => (Date.parse(b) - Date.parse(a)) / 86400000;
   const fyLabel = (period) => {
     const m = quarterLabelFromPeriod(period)?.match(/'(\d{2})$/);
@@ -3550,9 +3608,16 @@ function buildProviderFallbackTrends(quarterlySeries, annualSeries) {
     if (value != null && label) out.yearly.revenueGrowth.push({ label, value });
   }
 
-  // No quarterly fallback: profit margin and revenue growth are the two
-  // quarterly-native metrics, so their Quarterly tab already IS the native
-  // series; ROIC/FCF margin have no quarterly figure in the source at all.
+  // Quarterly: FCF margin from the source's single-quarter series and ROIC
+  // from its per-share series (providerQuarterlyRoic). Not profit margin or
+  // revenue growth: those are quarterly-native, so their Quarterly tab
+  // already IS the native series. TTM FCF margin and ROIC likewise come
+  // from the source (providerTtmFcfMargin, its TTM ROIC series).
+  const quarterlyFcf = asc(quarterlySeries?.fcfMargin).map((x) => ({ label: quarterLabelFromPeriod(x.period), value: clampImplausible(x.v) })).filter((p) => p.label && p.value != null);
+  out.quarterly.fcfMargin = quarterlyFcf;
+  out.quarterly.roic = providerQuarterlyRoic(quarterlySeries);
+  out.ttm.fcfMargin = providerTtmFcfMargin(quarterlySeries);
+  out.ttm.roic = asc(quarterlySeries?.roicTTM).map((x) => ({ label: quarterLabelFromPeriod(x.period), value: clampImplausible(x.v) })).filter((p) => p.label && p.value != null);
 
   const sales = asc(quarterlySeries?.salesPerShare);
   const marginByPeriod = new Map(asc(quarterlySeries?.netMargin).map((x) => [x.period, x.v]));
