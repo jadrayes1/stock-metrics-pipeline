@@ -5771,6 +5771,19 @@ async function processSymbol(symbol, apiKey, ctx) {
         values[key] = published[published.length - 1].value;
         cardValuesReconstructed = true;
       }
+      // An extreme native revenue growth (over 1,000%) beside an ordinary
+      // reconstructed TTM figure (under 200%) is the native engine's own
+      // base mismatch, not real growth -- the reconstruction wins. Verified
+      // live: DMRC's native revenueGrowthTTMYoy reads 29,329.99% because its
+      // quarterly series interleaves another filer's (sales per share ~25
+      // beside Digimarc's ~0.35); its own filings give TTM growth of -11.2%.
+      // Same remedy KNOWN_IMPLAUSIBLE_NATIVE_FIELDS applies by hand to
+      // HTLM/GECC, here only where both figures exist and disagree that far.
+      const reconstructedLatest = published[published.length - 1].value;
+      if (key === 'revenueGrowth' && Math.abs(values[key]) > 10 && reconstructedLatest != null && Math.abs(reconstructedLatest) < 2) {
+        values[key] = reconstructedLatest;
+        cardValuesReconstructed = true;
+      }
     }
   }
   // The TTM backfill above only ever checks the TTM reconstruction --
