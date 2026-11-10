@@ -161,6 +161,21 @@ async function fetchPreviouslyPublished() {
   }
 }
 
+// symbol -> company name: the news pipeline's company profiles first (e.g.
+// "Palantir Technologies Inc"), then the ticker search index.
+async function fetchHoldingNames() {
+  const names = new Map();
+  try {
+    const index = await fetchJson(GIST_ETF_PROFILE_URL.replace('etfProfileCache.json', 'tickerSearchIndex.json'));
+    for (const t of index?.tickers || []) if (t?.symbol && t?.name) names.set(t.symbol, t.name);
+  } catch {}
+  try {
+    const profiles = await fetchJson(GIST_ETF_PROFILE_URL.replace('etfProfileCache.json', 'companyProfiles.json'));
+    for (const [symbol, p] of Object.entries(profiles?.profiles || {})) if (p?.name) names.set(symbol, p.name);
+  } catch {}
+  return names;
+}
+
 async function main() {
   const apiKey = readAlphaVantageApiKey();
   const cache = await fetchPreviouslyPublished();
@@ -199,6 +214,22 @@ async function main() {
     processed++;
     await sleep(REQUEST_SPACING_MS);
   }
+
+  // A holding the source names "n/a" or nothing gets the company name the
+  // other pipelines already publish -- verified live: PLTR has no name in
+  // XLK, VGT, IYW and IGV (the source discloses it only in some funds), so
+  // the ETFs tab listed it as a bare symbol; HIMS, SPCX, SHOP and BN the
+  // same in one fund each. Every cached ETF, not just this run's.
+  const names = await fetchHoldingNames();
+  let named = 0;
+  for (const profile of Object.values(cache)) {
+    for (const h of profile?.holdings || []) {
+      if (h.name || !names.has(h.symbol)) continue;
+      h.name = names.get(h.symbol);
+      named++;
+    }
+  }
+  if (named) console.log(`Named ${named} holding(s) the source left unnamed.`);
 
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify({ generatedAt: new Date().toISOString(), profiles: cache }));
   console.log(`Done. Processed ${processed} ETFs this run. Cache now covers ${Object.keys(cache).length}/${ETF_UNIVERSE.length} tracked ETFs.`);
