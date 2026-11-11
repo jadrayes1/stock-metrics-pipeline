@@ -3544,22 +3544,30 @@ function providerTtmFcfMargin(quarterlySeries) {
 // price TTM P/E x TTM EPS -- all per local share, so currency and ADR ratio
 // cancel. Matches the filings for HD in every quarter and AAPL Q2-Q4 '25,
 // MSFT/KO within a few points (debt definition).
-function providerQuarterlyRoic(quarterlySeries) {
+function providerQuarterlyRoic(quarterlySeries, { trailing = false } = {}) {
   const byPeriod = (k) => new Map((quarterlySeries?.[k] || []).filter((x) => x?.period && Number.isFinite(x?.v)).map((x) => [x.period, x.v]));
   const eps = (quarterlySeries?.eps || []).filter((x) => x?.period >= '2000' && Number.isFinite(x?.v)).sort((a, b) => a.period.localeCompare(b.period));
   const pe = byPeriod('peTTM');
   const pb = byPeriod('pb');
   const de = byPeriod('totalDebtToEquity');
   const ebit = byPeriod('ebitPerShare');
+  const days = (a, b) => (Date.parse(b) - Date.parse(a)) / 86400000;
   const points = [];
   for (let i = 3; i < eps.length; i++) {
     const p = eps[i].period;
     if (!pe.get(p) || !pb.get(p) || !ebit.has(p) || !de.has(p)) continue;
-    const price = pe.get(p) * eps.slice(i - 3, i + 1).reduce((t, x) => t + x.v, 0);
+    const window = eps.slice(i - 3, i + 1);
+    const price = pe.get(p) * window.reduce((t, x) => t + x.v, 0);
     const bookPerShare = price / pb.get(p);
     const investedPerShare = bookPerShare * (1 + de.get(p));
     if (!(investedPerShare > 0)) continue;
-    points.push({ label: quarterLabelFromPeriod(p), value: clampImplausible((4 * (1 - ROIC_ASSUMED_TAX_RATE) * ebit.get(p)) / investedPerShare) });
+    let yearEbit = 4 * ebit.get(p);
+    if (trailing) {
+      // Four consecutive quarters' EBIT, over the latest quarter's capital.
+      if (!window.every((w, k) => ebit.has(w.period) && (k === 0 || (days(window[k - 1].period, w.period) >= 80 && days(window[k - 1].period, w.period) <= 100)))) continue;
+      yearEbit = window.reduce((t, w) => t + ebit.get(w.period), 0);
+    }
+    points.push({ label: quarterLabelFromPeriod(p), value: clampImplausible(((1 - ROIC_ASSUMED_TAX_RATE) * yearEbit) / investedPerShare) });
   }
   return points.filter((x) => x.value != null).slice(-QUARTERS_OF_HISTORY);
 }
@@ -3617,7 +3625,16 @@ function buildProviderFallbackTrends(quarterlySeries, annualSeries) {
   out.quarterly.fcfMargin = quarterlyFcf;
   out.quarterly.roic = providerQuarterlyRoic(quarterlySeries);
   out.ttm.fcfMargin = providerTtmFcfMargin(quarterlySeries);
-  out.ttm.roic = asc(quarterlySeries?.roicTTM).map((x) => ({ label: quarterLabelFromPeriod(x.period), value: clampImplausible(x.v) })).filter((p) => p.label && p.value != null);
+  // TTM ROIC on the same definition as the quarterly series above, so the
+  // two cadences agree. The source's own TTM ROIC is a different measure --
+  // verified live: FORTY's read 5-6% for years then 31-40% from Q4 '25,
+  // beside 12-17% quarterly; its filings give ~13% for 2024 (operating
+  // profit ~$290M over $1.39B equity + $0.31B debt). Kept only where the
+  // per-share inputs are missing.
+  const trailingRoic = providerQuarterlyRoic(quarterlySeries, { trailing: true });
+  const sourceTtmRoic = asc(quarterlySeries?.roicTTM).map((x) => ({ label: quarterLabelFromPeriod(x.period), value: clampImplausible(x.v) })).filter((p) => p.label && p.value != null);
+  out.ttm.roic = trailingRoic.length ? trailingRoic : sourceTtmRoic;
+  out.ttm.roicSource = trailingRoic.length ? sourceTtmRoic : [];
 
   const sales = asc(quarterlySeries?.salesPerShare);
   const marginByPeriod = new Map(asc(quarterlySeries?.netMargin).map((x) => [x.period, x.v]));
@@ -5823,6 +5840,18 @@ async function processSymbol(symbol, apiKey, ctx) {
       if (foreignPoints?.length) published = foreignPoints;
     }
     published = withProviderFallback('ttm', key, published);
+    // A TTM ROIC series published from the source's own TTM ROIC (every
+    // shared label matching it) is replaced by the same-definition rebuild
+    // on a targeted ROIC recompute -- see out.ttm.roic in
+    // buildProviderFallbackTrends. Still the union: no label is lost.
+    if (key === 'roic' && process.env.TARGET_SYMBOL && RECOMPUTE_METRICS.has('roic') && published.length && providerFallback?.ttm?.roicSource?.length) {
+      const source = new Map(providerFallback.ttm.roicSource.map((p) => [p.label, p.value]));
+      const shared = published.filter((p) => source.has(p.label));
+      if (shared.length >= 4 && shared.length === published.length && shared.every((p) => Math.abs(p.value - source.get(p.label)) < 1e-3)) {
+        const rebuilt = fromProvider('ttm', 'roic');
+        if (rebuilt.length) published = pickTrendToPublish(published, rebuilt, 'roic');
+      }
+    }
     if (published.length) {
       mergedTtmForSymbol[key] = published;
       // Backfill the CARD value too, not just the trend cache, whenever
