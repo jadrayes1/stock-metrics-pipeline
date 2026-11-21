@@ -176,6 +176,108 @@ async function fetchHoldingNames() {
   return names;
 }
 
+// ---------------------------------------------------------------------------
+// Closed-end funds -- verified live: Destiny Tech100 (DXYZ) is type "Closed-
+// End Fund", not "ETP", so the app opened it as a company and showed almost
+// nothing, and Alpha Vantage has no profile for it at all (ETF_PROFILE
+// returns {}). A registered closed-end fund files a quarterly N-PORT report
+// with every position and its weight, plus net assets, so its profile here
+// comes from SEC instead. No expense ratio: N-PORT doesn't carry one.
+// ---------------------------------------------------------------------------
+const SEC_USER_AGENT = 'stock-analyzer-app stock-metrics-pipeline contact:jadrayescpp@gmail.com';
+const SEC_REQUEST_SPACING_MS = 130; // SEC's fair-access limit is 10 requests/second
+const LISTED_MICS = new Set(['XNYS', 'XNAS', 'XASE', 'ARCX', 'BATS']);
+const HOLDINGS_SHOWN = 10;
+
+async function fetchSec(url) {
+  const res = await fetch(url, { headers: { 'User-Agent': SEC_USER_AGENT }, signal: AbortSignal.timeout(30000) });
+  await sleep(SEC_REQUEST_SPACING_MS);
+  if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
+  return res;
+}
+
+// Exchange-listed closed-end funds with an SEC filer id: [{symbol, cik}].
+async function fetchClosedEndFunds() {
+  const key = process.env.FINNHUB_API_KEY;
+  if (!key) return [];
+  const symbols = await fetchJson(`https://finnhub.io/api/v1/stock/symbol?exchange=US&token=${key}`);
+  const ciks = new Map(Object.values(await (await fetchSec('https://www.sec.gov/files/company_tickers.json')).json()).map((t) => [t.ticker, t.cik_str]));
+  return symbols
+    .filter((s) => s.type === 'Closed-End Fund' && LISTED_MICS.has(s.mic) && ciks.has(s.symbol))
+    .map((s) => ({ symbol: s.symbol, cik: String(ciks.get(s.symbol)) }));
+}
+
+// The company a position is really in. DXYZ holds most of its stakes
+// through vehicles named for them -- "Magnitude ANC III, LLC (economic
+// exposure to Anthropic PBC Series B Preferred Shares)" -- and SpaceX
+// through four of them plus listed SPCX shares, so positions are grouped by
+// the company named inside, without its share class.
+const SHARE_CLASS = /\s*(?:[-–,]\s*)?(?:\b(?:Series|Class)\s+[A-Z0-9][\w-]*\b.*|\b(?:Common|Preferred|Ordinary)\s+(?:Stock|Shares?)\b.*|\bPreferred\b.*)$/i;
+function underlyingName(name) {
+  const inner = String(name || '').match(/\((?:economic exposure to|invested in)\s+(.+?)\)\s*$/i);
+  return (inner ? inner[1] : String(name || '')).replace(SHARE_CLASS, '').trim();
+}
+const normalizeCompany = (n) =>
+  String(n || '')
+    .toLowerCase()
+    .replace(/[.,'()&-]/g, ' ')
+    .replace(/\b(inc|corp|corporation|co|company|ltd|limited|plc|pbc|llc|lp|nv|n v|bv|b v|na|n a|sa|ag|se|holdings?|group)\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+// N-PORT's XML escapes names -- verified live: Gabelli (GAB) holds
+// "DEERE &amp; COMPANY".
+const decodeXml = (s) => (s == null ? s : s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n)).replace(/&amp;/g, '&'));
+
+function parseNport(xml) {
+  const tag = (block, t) => decodeXml((block.match(new RegExp(`<${t}>([^<]*)</${t}>`)) || [])[1]);
+  const netAssets = parseFloat(tag(xml, 'netAssets'));
+  const positions = xml
+    .split('<invstOrSec>')
+    .slice(1)
+    .map((block) => ({
+      name: tag(block, 'name'),
+      ticker: (block.match(/<ticker value="([^"]+)"/) || [])[1] || null,
+      assetCat: tag(block, 'assetCat'),
+      pct: parseFloat(tag(block, 'pctVal')),
+    }))
+    // "N/A": a position the fund left unnamed (PIM) -- nothing to show.
+    .filter((p) => p.name && !/^n\/?a$/i.test(p.name.trim()) && p.pct > 0);
+  return { netAssets: Number.isFinite(netAssets) ? netAssets : null, positions };
+}
+
+async function fetchClosedEndFundProfile(cik, symbolByName) {
+  const sub = await (await fetchSec(`https://data.sec.gov/submissions/CIK${cik.padStart(10, '0')}.json`)).json();
+  const r = sub?.filings?.recent;
+  let latest = null;
+  for (let i = 0; i < (r?.form?.length || 0); i++) {
+    if (!/^NPORT-P(\/A)?$/.test(r.form[i])) continue;
+    // Newest period; for the same period, the newest filing (an amendment).
+    if (!latest || r.reportDate[i] > latest.reportDate || (r.reportDate[i] === latest.reportDate && r.filingDate[i] > latest.filingDate)) {
+      latest = { reportDate: r.reportDate[i], filingDate: r.filingDate[i], accession: r.accessionNumber[i] };
+    }
+  }
+  if (!latest) throw new Error('no N-PORT report');
+  const xml = await (await fetchSec(`https://www.sec.gov/Archives/edgar/data/${Number(cik)}/${latest.accession.replace(/-/g, '')}/primary_doc.xml`)).text();
+  const { netAssets, positions } = parseNport(xml);
+  const groups = new Map();
+  for (const p of positions) {
+    const cash = p.assetCat === 'STIV';
+    const name = cash ? 'Cash & money market funds' : underlyingName(p.name);
+    const key = cash ? 'cash' : normalizeCompany(name) || name;
+    const g = groups.get(key) || { name, symbol: null, weight: 0 };
+    g.weight += p.pct / 100;
+    if (!cash && !g.symbol && p.ticker && /^[A-Z.]{1,6}$/.test(p.ticker)) g.symbol = p.ticker;
+    groups.set(key, g);
+  }
+  for (const [key, g] of groups) if (!g.symbol && key !== 'cash') g.symbol = symbolByName.get(key) || null;
+  const holdings = [...groups.values()]
+    .sort((a, b) => b.weight - a.weight)
+    .slice(0, HOLDINGS_SHOWN)
+    .map((g) => ({ symbol: g.symbol, name: g.name, weight: +g.weight.toFixed(4) }));
+  return { expenseRatio: null, netAssets, holdings, fundType: 'closedEnd', holdingsAsOf: latest.reportDate };
+}
+
 async function main() {
   const apiKey = readAlphaVantageApiKey();
   const cache = await fetchPreviouslyPublished();
@@ -221,6 +323,34 @@ async function main() {
   // the ETFs tab listed it as a bare symbol; HIMS, SPCX, SHOP and BN the
   // same in one fund each. Every cached ETF, not just this run's.
   const names = await fetchHoldingNames();
+
+  // Every exchange-listed closed-end fund, each run -- SEC requests, so no
+  // Alpha Vantage budget. A tracked ETF's entry is never touched, and a
+  // failed fund keeps its previous entry.
+  const symbolByName = new Map();
+  for (const [symbol, name] of names) {
+    const key = normalizeCompany(name);
+    if (!key) continue;
+    symbolByName.set(key, symbolByName.has(key) && symbolByName.get(key) !== symbol ? null : symbol); // two companies on one name: no guess
+  }
+  let funds = [];
+  try {
+    funds = await fetchClosedEndFunds();
+  } catch (err) {
+    console.log(`Closed-end fund list unavailable: ${err.message}`);
+  }
+  let fundsDone = 0;
+  for (const { symbol, cik } of funds) {
+    if (ETF_UNIVERSE.includes(symbol)) continue;
+    try {
+      cache[symbol] = { fetchedAt: new Date().toISOString(), ...(await fetchClosedEndFundProfile(cik, symbolByName)) };
+      fundsDone++;
+    } catch (err) {
+      console.log(`  skip closed-end fund ${symbol}: ${err.message}`);
+    }
+  }
+  console.log(`Closed-end funds: ${fundsDone}/${funds.length} profiled from their N-PORT reports.`);
+
   let named = 0;
   for (const profile of Object.values(cache)) {
     for (const h of profile?.holdings || []) {
@@ -232,7 +362,7 @@ async function main() {
   if (named) console.log(`Named ${named} holding(s) the source left unnamed.`);
 
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify({ generatedAt: new Date().toISOString(), profiles: cache }));
-  console.log(`Done. Processed ${processed} ETFs this run. Cache now covers ${Object.keys(cache).length}/${ETF_UNIVERSE.length} tracked ETFs.`);
+  console.log(`Done. Processed ${processed} ETFs this run. Cache now covers ${Object.keys(cache).length} funds (${ETF_UNIVERSE.length} tracked ETFs plus closed-end funds).`);
 }
 
 main().catch((err) => {

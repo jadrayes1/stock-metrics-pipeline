@@ -60,6 +60,10 @@ jobs:
       - name: Generate ETF profile cache
         env:
           ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
+          # Closed-end funds' holdings (from their SEC N-PORT reports) -- the
+          # symbol list that finds them is the same FINNHUB_API_KEY secret
+          # generate-sector-metrics.yml already uses.
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
         run: node scripts/generateEtfProfileCache.js
 
       - name: Publish to gist
