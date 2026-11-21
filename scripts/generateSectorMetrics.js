@@ -420,7 +420,15 @@ function extractMetricValues(current, quarterly, impliedPrice) {
   // same array) -- the scalar card showed "--" despite the data already
   // being one property access away. Mirrors roic's exact fallback shape.
   const profitMargin = clampImplausible(current.netProfitMarginTTM != null ? current.netProfitMarginTTM / 100 : latestQuarterly(quarterly, 'netMargin'));
-  const fcfMargin = clampImplausible(latestQuarterly(quarterly, 'fcfMargin'));
+  // Not when that point is over ~13 months older than the newest quarter
+  // of sales -- verified live: NBIS's series stops at Q1 2023 (39.46, the
+  // Yandex-divestiture quarter) while its sales run to Q3 2026, and the card
+  // showed +3,946%. A null here falls through to the pipeline's own
+  // reconstructed TTM figure below.
+  const fcfPoint = quarterly?.fcfMargin?.[0];
+  const newestSales = quarterly?.salesPerShare?.[0];
+  const fcfStale = fcfPoint?.period && newestSales?.period && Date.parse(newestSales.period) - Date.parse(fcfPoint.period) > 400 * 86400000;
+  const fcfMargin = fcfStale ? null : clampImplausible(latestQuarterly(quarterly, 'fcfMargin'));
   const peRatio = current.peTTM ?? (impliedPrice != null && current.epsTTM ? impliedPrice / current.epsTTM : null);
   const pfcfRatio = latestQuarterly(quarterly, 'pfcfTTM') ?? current.pfcfShareTTM ?? null;
   return { roic, revenueGrowth, profitMargin, fcfMargin, peRatio, pfcfRatio };
