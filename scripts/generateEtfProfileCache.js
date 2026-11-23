@@ -220,6 +220,10 @@ function underlyingName(name) {
 const normalizeCompany = (n) =>
   String(n || '')
     .toLowerCase()
+    // The ticker list's own share-class suffixes: "ANTHROPIC PBC-CL A",
+    // "ALPHABET INC-CL A (GOOGLE)".
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/[-\s]cl(?:ass)?\s+[a-z0-9]+\b.*$/, ' ')
     .replace(/[.,'()&-]/g, ' ')
     .replace(/\b(inc|corp|corporation|co|company|ltd|limited|plc|pbc|llc|lp|nv|n v|bv|b v|na|n a|sa|ag|se|holdings?|group)\b/g, ' ')
     .replace(/\s+/g, ' ')
@@ -327,11 +331,25 @@ async function main() {
   // Every exchange-listed closed-end fund, each run -- SEC requests, so no
   // Alpha Vantage budget. A tracked ETF's entry is never touched, and a
   // failed fund keeps its previous entry.
-  const symbolByName = new Map();
+  // One company's share classes (GOOGL/GOOG, BRK.A/BRK.B: one SEC filer
+  // id) link to one of them; two different companies on one name link to
+  // neither.
+  let cikByTicker = new Map();
+  try {
+    cikByTicker = new Map(Object.values(await (await fetchSec('https://www.sec.gov/files/company_tickers.json')).json()).map((t) => [t.ticker, t.cik_str]));
+  } catch {}
+  const candidates = new Map();
   for (const [symbol, name] of names) {
     const key = normalizeCompany(name);
     if (!key) continue;
-    symbolByName.set(key, symbolByName.has(key) && symbolByName.get(key) !== symbol ? null : symbol); // two companies on one name: no guess
+    if (!candidates.has(key)) candidates.set(key, new Set());
+    candidates.get(key).add(symbol);
+  }
+  const symbolByName = new Map();
+  for (const [key, set] of candidates) {
+    const symbols = [...set].sort((a, b) => a.length - b.length || a.localeCompare(b));
+    const ciks = new Set(symbols.map((sym) => cikByTicker.get(sym) ?? cikByTicker.get(sym.replace('.', '-'))));
+    symbolByName.set(key, symbols.length === 1 || (ciks.size === 1 && !ciks.has(undefined)) ? symbols[0] : null);
   }
   let funds = [];
   try {
