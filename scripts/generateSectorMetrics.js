@@ -4227,6 +4227,63 @@ function buildRevenueGrowthYearlyFromFilings(annualReports) {
   return points.slice(-QUARTERS_OF_HISTORY);
 }
 
+// Yearly revenue growth as each annual report states it: the year against
+// the prior year printed beside it in the same filing, on the same basis.
+// Only fills years the report-to-report builder above leaves empty.
+// Verified live: FuboTV (FUBO) combined with Disney's Hulu + Live TV, which
+// became the accounting acquirer; its FY2026 10-K (year ended 2026-09-30)
+// restates history as Hulu Live's on a September year, while its last
+// pre-deal 10-K was calendar 2024 ($1.62B) -- two years apart on different
+// books, so no yearly growth at all. The FY2026 10-K itself gives FY'26
+// $6,107M vs FY'25 $4,413M vs FY'24 $4,220M.
+function buildSameFilingYearlyRevenueGrowth(gaapFacts) {
+  const DAY = 86400000;
+  const byEnd = new Map(); // end -> { value, filed }
+  for (const concept of SEC_REVENUE_CONCEPTS) {
+    const facts = (gaapFacts?.[concept]?.units?.USD || []).filter((f) => f.accn && f.start && f.end && Number.isFinite(f.val) && /^(10-K|10-KT|20-F|40-F)/.test(f.form || ''));
+    const annual = facts.filter((f) => {
+      const days = (Date.parse(f.end) - Date.parse(f.start)) / DAY;
+      return days >= 350 && days <= 380;
+    });
+    const byAccn = new Map();
+    for (const f of annual) {
+      if (!byAccn.has(f.accn)) byAccn.set(f.accn, []);
+      byAccn.get(f.accn).push(f);
+    }
+    for (const list of byAccn.values()) {
+      for (const cur of list) {
+        if (byEnd.has(cur.end) && byEnd.get(cur.end).concept !== concept) continue; // first concept wins a year
+        const gap = (prior) => (Date.parse(cur.end) - Date.parse(prior.end)) / DAY;
+        const prior = list.find((f) => gap(f) >= 330 && gap(f) <= 400);
+        const value = prior ? revenueGrowthBetween(prior.val, cur.val) : null;
+        if (value == null) continue;
+        const existing = byEnd.get(cur.end);
+        if (!existing || String(cur.filed) > String(existing.filed)) byEnd.set(cur.end, { value, filed: cur.filed, concept });
+      }
+    }
+  }
+  return [...byEnd.entries()].map(([end, v]) => ({ end, value: v.value })).sort((a, b) => a.end.localeCompare(b.end));
+}
+
+function withSameFilingYearlyRevenueGrowth(points, annualReports, gaapFacts) {
+  const extra = buildSameFilingYearlyRevenueGrowth(gaapFacts);
+  if (!extra.length) return points;
+  const calendarLabels = buildCalendarLabelsByFiscalKey(null, annualReports);
+  const have = new Set((points || []).map((p) => p.label));
+  const added = [];
+  for (const { end, value } of extra) {
+    // The year's own report, when there is one, labels it as the builder does.
+    const report = (annualReports || []).find((r) => r?.endDate && r?.year && Math.abs(Date.parse(r.endDate) - Date.parse(end)) <= 20 * 86400000);
+    const label = report ? calendarYearlyLabel(calendarLabels, report.year) : yearlyLabel(new Date(Date.parse(end) - 45 * 86400000).getUTCFullYear());
+    if (have.has(label)) continue;
+    have.add(label);
+    added.push({ label, value });
+  }
+  if (!added.length) return points;
+  const year = (l) => Number(String(l).match(/'(\d{2})$/)?.[1] ?? NaN);
+  return [...(points || []), ...added].sort((a, b) => year(a.label) - year(b.label)).slice(-QUARTERS_OF_HISTORY);
+}
+
 function buildRevenueGrowthTTMFromFilings(quarterlyReports, annualReports) {
   const calendarLabels = buildCalendarLabelsByFiscalKey(quarterlyReports, annualReports);
   const records = buildStandaloneFlowQuarters(quarterlyReports, annualReports, { revenue: { fn: findTopLineRevenue, section: 'ic', disallowNegative: true } });
@@ -5568,6 +5625,9 @@ async function processSymbol(symbol, apiKey, ctx) {
   if ([...quarterlyFinancials, ...annualReportedFinancials].some((r) => r?.endDate && new Date(r.endDate).getUTCDate() <= QUARTER_LABEL_BACKDATE_DAYS)) {
     LABEL_BACKDATED_SYMBOLS.add(symbol);
   }
+  // The SEC facts the enrichment below fetches, kept for the yearly revenue
+  // growth builder (withSameFilingYearlyRevenueGrowth).
+  let secGaapFactsByCik = null;
   if (
     quarterlyFinancials.length < SEC_ENRICHMENT_SPARSE_QUARTERLY_THRESHOLD ||
     annualReportedFinancials.length < SEC_ENRICHMENT_SPARSE_ANNUAL_THRESHOLD ||
@@ -5599,6 +5659,7 @@ async function processSymbol(symbol, apiKey, ctx) {
       );
       let combinedSynthesized = { quarterlyReports: [], annualReports: [] };
       const gaapFactsByCik = new Map();
+      secGaapFactsByCik = gaapFactsByCik;
       for (const cik of ciksToEnrich) {
         const gaapFacts = correctMisTaggedFiscalYears(await fetchSecUsGaapFacts(cik), [...quarterlyFinancials, ...annualReportedFinancials]);
         gaapFactsByCik.set(cik, gaapFacts);
@@ -5710,7 +5771,9 @@ async function processSymbol(symbol, apiKey, ctx) {
   }
 
   const yearlyBuilders = {
-    revenueGrowth: () => fdicTrends?.yearly.revenueGrowth || buildRevenueGrowthYearlyFromFilings(annualReportedFinancials),
+    revenueGrowth: () =>
+      fdicTrends?.yearly.revenueGrowth ||
+      withSameFilingYearlyRevenueGrowth(buildRevenueGrowthYearlyFromFilings(annualReportedFinancials), annualReportedFinancials, secGaapFactsByCik?.get(canonicalCikDigits(ctx.secTickerToCikMap?.get(symbol.toUpperCase()) || '').padStart(10, '0'))),
     profitMargin: () => fdicTrends?.yearly.profitMargin || buildProfitMarginYearlyFromFilings(annualReportedFinancials),
     // Deliberately NOT gated on isBankLike the way revenueGrowth/profitMargin/
     // roic's bank-specific fallbacks are -- verified live: HOOD (Robinhood,
