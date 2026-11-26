@@ -6412,6 +6412,28 @@ async function main() {
       symbols.push(sym);
     }
     if (outOfUniverseSymbols.size) console.log(`Also processing ${outOfUniverseSymbols.size} previously-published tickers no longer in the symbol list.`);
+    // Tickers trending on Reddit/StockTwits that the symbol list leaves out
+    // -- verified live: Frontera Energy (FECCF, over the counter; it reports
+    // in Canada, not to the SEC) trended on StockTwits and opened with no
+    // data. Processed like the ones above, from the source's own series;
+    // once published they stay in the run that way.
+    try {
+      const res = await fetch(`${GIST_METRICS_URL.replace('marketMetrics.json', 'trendingSocialCache.json')}?_cb=${Date.now()}`);
+      const trending = res.ok ? await res.json() : null;
+      const inRunNow = new Set(symbols);
+      const added = [];
+      for (const item of [...(trending?.reddit || []), ...(trending?.stocktwits || [])]) {
+        const sym = String(item?.symbol || '').toUpperCase();
+        if (!sym || inRunNow.has(sym) || EXCLUDED_STALE_UNIVERSE_SYMBOLS.has(sym) || (targets && !targets.has(sym))) continue;
+        inRunNow.add(sym);
+        outOfUniverseSymbols.add(sym);
+        symbols.push(sym);
+        added.push(sym);
+      }
+      if (added.length) console.log(`Also processing ${added.length} trending ticker(s) outside the symbol list: ${added.join(', ')}`);
+    } catch (err) {
+      console.log(`Trending list unavailable: ${err.message}`);
+    }
   }
 
   // Fetched once for the whole run — used only to fill a Finnhub crawl gap
@@ -6634,7 +6656,7 @@ async function main() {
   const recoveredUnsearchable = Object.keys(metrics).filter((sym) => (!processedThisRun.has(sym) || outOfUniverseSymbols.has(sym)) && !searchable.has(sym));
   if (recoveredUnsearchable.length) {
     const savedProfiles = (await fetchJsonSafe(GIST_COMPANY_PROFILES_URL))?.profiles || {};
-    for (const sym of recoveredUnsearchable) tickerSearchIndex.push({ symbol: sym, name: savedProfiles[sym]?.name || sym, type: 'Common Stock' });
+    for (const sym of recoveredUnsearchable) tickerSearchIndex.push({ symbol: sym, name: savedProfiles[sym]?.name || profiles[sym]?.name || sym, type: 'Common Stock' });
     console.log(`Kept ${recoveredUnsearchable.length} recovered tickers searchable.`);
   }
 
