@@ -48,6 +48,9 @@ const GIST_METRICS_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f4597
 const GIST_PFCF_TREND_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/pfcfTrendCache.json';
 const GIST_FOREIGN_FILER_LIST_URL = 'https://gist.githubusercontent.com/jadrayes1/5cd7f459788725521246717b9e164a8e/raw/foreignFilerList.json';
 let FOREIGN_FILERS = null; // loaded in main()
+// Tickers the foreign pipeline already gives a quarterly P/FCF from their
+// filings (foreignPfcfCache.json); loaded in main(), null if unavailable.
+let FOREIGN_QUARTERLY_PFCF = null;
 
 // Widened from 1100ms (~54.5/min, a ~9% margin) to match
 // generateSectorMetrics.js's 2026-08-25 change — that pipeline's own runs
@@ -1757,10 +1760,11 @@ function priceSourceRefusedSymbol(data) {
 // or yearly P/E and P/FCF beside full native TTM series.
 //   ttm        the source's quarterly TTM P/E and P/FCF series
 //   yearly     its annual P/E and P/FCF series
-//   quarterly  P/E only -- this file's definition (quarter-end price over
-//              4x that quarter's EPS) from the source's quarterly EPS and
-//              the same price series the filings path uses. It has no
-//              quarterly free cash flow, so no quarterly P/FCF.
+//   quarterly  this file's definition, quarter-end price over 4x that
+//              quarter's EPS / free cash flow per share. FCF per share is
+//              the source's single-quarter FCF margin x that quarter's
+//              sales per share -- verified live: OMAB had 12 quarterly P/E
+//              and 12 TTM P/FCF points but no quarterly P/FCF.
 // Labels from each period's end date, the same as every other point here.
 async function providerRatioFallback(symbol, finnhubKey) {
   const data = await fetchJson(`https://finnhub.io/api/v1/stock/metric?symbol=${{ AXNX: 'MIMI' }[symbol] || symbol}&metric=all&token=${finnhubKey}`);
@@ -1786,8 +1790,23 @@ async function providerRatioFallback(symbol, finnhubKey) {
     })
     .filter((p) => p && p.label && Number.isFinite(p.value))
     .slice(-QUARTERS_OF_HISTORY);
+  const fcfMarginByPeriod = new Map(sortAsc(q.fcfMargin).map((x) => [x.period, x.v]));
+  const salesByPeriod = new Map(sortAsc(q.salesPerShare).map((x) => [x.period, x.v]));
+  const pfcfQuarterly = epsAsc
+    .map((x, i) => {
+      const peTtm = peTtmByPeriod.get(x.period);
+      const margin = fcfMarginByPeriod.get(x.period);
+      const sales = salesByPeriod.get(x.period);
+      if (i < 3 || peTtm == null || margin == null || sales == null) return null;
+      const price = peTtm * epsAsc.slice(i - 3, i + 1).reduce((sum, e) => sum + e.v, 0);
+      const fcfPerShare = margin * sales;
+      if (!(price > 0) || !fcfPerShare) return null;
+      return { label: quarterLabelFromEndDate(x.period), value: price / (4 * fcfPerShare) };
+    })
+    .filter((p) => p && p.label && Number.isFinite(p.value))
+    .slice(-QUARTERS_OF_HISTORY);
   return {
-    pfcf: { ttm: quarterSeries(q.pfcfTTM), yearly: yearSeries(a.pfcf) },
+    pfcf: { ttm: quarterSeries(q.pfcfTTM), quarterly: pfcfQuarterly, yearly: yearSeries(a.pfcf) },
     pe: { ttm: quarterSeries(q.peTTM), quarterly: peQuarterly, yearly: yearSeries(a.pe) },
   };
 }
@@ -2192,6 +2211,10 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
     const emptyBoth = (freshSeries, existingSeries) => !freshSeries?.length && thin(existingSeries);
     const needs = {
       pfcfTtm: emptyBoth(fresh.ttm, existingCacheEntry?.ttm),
+      // Not where the foreign pipeline has a quarterly series from the
+      // filings themselves (PAC): the app shows whichever is more current,
+      // and an estimate must not displace it. Unknown -> no fallback.
+      pfcfQuarterly: emptyBoth(fresh.quarterly, existingCacheEntry?.quarterly) && !!FOREIGN_QUARTERLY_PFCF && !FOREIGN_QUARTERLY_PFCF.has(symbol),
       pfcfYearly: emptyBoth(fresh.yearly, existingCacheEntry?.yearly),
       peTtm: emptyBoth(freshPe.ttm, existingCacheEntry?.pe?.ttm),
       peQuarterly: emptyBoth(freshPe.quarterly, existingCacheEntry?.pe?.quarterly),
@@ -2202,6 +2225,7 @@ async function processTicker(symbol, finnhubKey, twelveDataKey, metricsDataset, 
       const fallback = await providerRatioFallback(symbol, finnhubKey).catch(() => null);
       if (fallback) {
         if (needs.pfcfTtm) fresh.ttm = fallback.pfcf.ttm;
+        if (needs.pfcfQuarterly) fresh.quarterly = fallback.pfcf.quarterly;
         if (needs.pfcfYearly) fresh.yearly = fallback.pfcf.yearly;
         if (needs.peTtm) freshPe.ttm = fallback.pe.ttm;
         if (needs.peQuarterly) freshPe.quarterly = fallback.pe.quarterly;
@@ -2306,6 +2330,9 @@ async function main() {
     .then((d) => (Array.isArray(d?.foreignFilers) ? new Set(d.foreignFilers.map((f) => f.symbol)) : null))
     .catch(() => null);
   if (!FOREIGN_FILERS && RECOMPUTE_METRICS.size) console.log('::warning::Foreign-filer list unavailable -- no ticker is recomputed this run.');
+  FOREIGN_QUARTERLY_PFCF = await fetchJson(`${GIST_FOREIGN_FILER_LIST_URL.replace('foreignFilerList.json', 'foreignPfcfCache.json')}?${cacheBust}`)
+    .then((d) => new Set(Object.entries(d?.trends || {}).filter(([, e]) => e?.quarterly?.length).map(([sym]) => sym)))
+    .catch(() => null);
 
   const cache = existingTrendCache.trends || {};
   // A real scalar pfcfRatio does NOT mean the Quarterly/Yearly/TTM trend
